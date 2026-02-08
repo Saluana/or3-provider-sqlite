@@ -5,6 +5,27 @@
  * At standalone type-check time, we just re-export from the global declaration
  * in nuxt-env.d.ts. At runtime, Nuxt replaces #imports with real auto-imports.
  */
-export const useRuntimeConfig: () => Record<string, any> = () => {
+export interface RuntimeConfigLike {
+    auth?: {
+        enabled?: boolean;
+    };
+    public: {
+        auth: {
+            enabled?: boolean;
+        };
+        sync: {
+            provider?: string;
+        };
+        storage: {
+            provider?: string;
+        };
+        limits: {
+            enabled?: boolean;
+            maxConversations: number;
+        };
+    };
+}
+
+export const useRuntimeConfig: () => RuntimeConfigLike = () => {
     throw new Error('#imports shim — should never run at runtime');
 };

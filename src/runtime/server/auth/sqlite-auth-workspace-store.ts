@@ -7,9 +7,10 @@
 import type { AuthWorkspaceStore } from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
 import { getRawDb, getSqliteDb } from '../db/kysely';
+import { randomUUID } from 'node:crypto';
 
 function uid(): string {
-    return crypto.randomUUID();
+    return randomUUID();
 }
 
 function nowEpoch(): number {
@@ -108,7 +109,7 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
     ): Promise<{ workspaceId: string; workspaceName: string }> {
         const db = this.db;
 
-        // Check if user has any workspace memberships
+        // Check if user has workspace memberships
         const membership = await db
             .selectFrom('workspace_members')
             .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')

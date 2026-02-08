@@ -4,6 +4,7 @@
  * Uses in-memory SQLite for fast isolated tests.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteAuthWorkspaceStore } from '../server/auth/sqlite-auth-workspace-store';
@@ -237,7 +238,7 @@ describe('SqliteAuthWorkspaceStore', () => {
             await db
                 .insertInto('workspace_members')
                 .values({
-                    id: crypto.randomUUID(),
+                    id: randomUUID(),
                     workspace_id: workspaceId,
                     user_id: viewer,
                     role: 'viewer',
@@ -296,7 +297,7 @@ describe('SqliteAuthWorkspaceStore', () => {
             await db
                 .insertInto('workspace_members')
                 .values({
-                    id: crypto.randomUUID(),
+                    id: randomUUID(),
                     workspace_id: sharedWs,
                     user_id: member,
                     role: 'editor',
@@ -344,7 +345,7 @@ describe('SqliteAuthWorkspaceStore', () => {
             await db
                 .insertInto('workspace_members')
                 .values({
-                    id: crypto.randomUUID(),
+                    id: randomUUID(),
                     workspace_id: workspaceId,
                     user_id: editor,
                     role: 'editor',
@@ -365,7 +366,7 @@ describe('SqliteAuthWorkspaceStore', () => {
                 providerUserId: 'user-1',
             });
 
-            const { workspaceId: ws1 } = await store.createWorkspace({
+            await store.createWorkspace({
                 userId,
                 name: 'WS 1',
             });

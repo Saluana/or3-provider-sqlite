@@ -14,12 +14,12 @@ import type {
     PushResult,
     SyncChange,
 } from '~~/shared/sync/types';
+import { randomUUID } from 'node:crypto';
 import { getSqliteDb, getRawDb } from '../db/kysely';
 import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
-import type { Or3SqliteDb } from '../db/schema';
 
 function uid(): string {
-    return crypto.randomUUID();
+    return randomUUID();
 }
 
 function nowEpoch(): number {

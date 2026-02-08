@@ -1,6 +1,7 @@
 /**
  * Integration tests for SQLite provider wiring across store + sync adapter.
  */
+import { randomUUID } from 'node:crypto';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import type { H3Event } from 'h3';
 import { getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
@@ -33,12 +34,12 @@ describe('sqlite provider integration', () => {
         });
         const { workspaceId } = await store.getOrCreateDefaultWorkspace(userId);
 
-        const opId = crypto.randomUUID();
+        const opId = randomUUID();
         const push = await adapter.push(stubEvent, {
             scope: { workspaceId },
             ops: [
                 {
-                    id: crypto.randomUUID(),
+                    id: randomUUID(),
                     tableName: 'threads',
                     operation: 'put',
                     pk: 'thread-1',
@@ -114,14 +115,14 @@ describe('sqlite provider integration', () => {
         const { workspaceId } = await store.getOrCreateDefaultWorkspace(userId);
 
         const ops = Array.from({ length: 3 }, (_, index) => ({
-            id: crypto.randomUUID(),
+            id: randomUUID(),
             tableName: 'threads',
             operation: 'put' as const,
             pk: `thread-${index}`,
             payload: { id: `thread-${index}`, title: `Thread ${index}` },
             stamp: {
                 deviceId: 'cursor-device',
-                opId: crypto.randomUUID(),
+                opId: randomUUID(),
                 hlc: `2025-01-01T00:00:0${index}.000Z-0000`,
                 clock: index + 1,
             },

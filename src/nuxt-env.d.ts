@@ -6,13 +6,15 @@
  * without needing the full Nuxt type-generation chain.
  */
 
+import type { RuntimeConfigLike } from './shims/imports';
+
 declare global {
     /** Define a Nitro server plugin. */
     const defineNitroPlugin: (handler: (nitro: unknown) => void | Promise<void>) => void;
     /** Define a Nitro event handler. */
     const defineEventHandler: typeof import('h3')['defineEventHandler'];
     /** Nuxt runtime config composable (auto-imported). */
-    const useRuntimeConfig: typeof import('nuxt/app')['useRuntimeConfig'];
+    const useRuntimeConfig: () => RuntimeConfigLike;
 }
 
 export {};

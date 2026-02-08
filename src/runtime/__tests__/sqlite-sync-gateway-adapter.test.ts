@@ -4,6 +4,7 @@
  * Covers push idempotency, LWW, pull pagination, cursor updates, and GC.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
@@ -21,14 +22,14 @@ let adapter: SqliteSyncGatewayAdapter;
 
 function makeOp(overrides: Partial<PendingOp> & { tableName: string; pk: string }): PendingOp {
     return {
-        id: crypto.randomUUID(),
+        id: randomUUID(),
         tableName: overrides.tableName,
         operation: overrides.operation ?? 'put',
         pk: overrides.pk,
         payload: overrides.payload ?? { id: overrides.pk, title: 'test' },
         stamp: {
             deviceId: overrides.stamp?.deviceId ?? DEVICE_A,
-            opId: overrides.stamp?.opId ?? crypto.randomUUID(),
+            opId: overrides.stamp?.opId ?? randomUUID(),
             hlc: overrides.stamp?.hlc ?? '2025-01-01T00:00:00.000Z-0000',
             clock: overrides.stamp?.clock ?? 1,
         },
@@ -119,7 +120,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
 
         it('treats duplicate op_id inside the same batch as idempotent', async () => {
-            const sharedOpId = crypto.randomUUID();
+            const sharedOpId = randomUUID();
             const first = makeOp({
                 tableName: 'threads',
                 pk: 't-dup',
@@ -158,13 +159,13 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads',
                 pk: 't-1',
                 payload: { id: 't-1', title: 'first' },
-                stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: crypto.randomUUID() },
+                stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
             const op2 = makeOp({
                 tableName: 'threads',
                 pk: 't-1',
                 payload: { id: 't-1', title: 'second' },
-                stamp: { clock: 2, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: crypto.randomUUID() },
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() },
             });
 
             await adapter.push(stubEvent, makeBatch([op1]));
@@ -185,13 +186,13 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads',
                 pk: 't-1',
                 payload: { id: 't-1', title: 'first' },
-                stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0001', deviceId: DEVICE_A, opId: crypto.randomUUID() },
+                stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0001', deviceId: DEVICE_A, opId: randomUUID() },
             });
             const op2 = makeOp({
                 tableName: 'threads',
                 pk: 't-1',
                 payload: { id: 't-1', title: 'second' },
-                stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0002', deviceId: DEVICE_B, opId: crypto.randomUUID() },
+                stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0002', deviceId: DEVICE_B, opId: randomUUID() },
             });
 
             await adapter.push(stubEvent, makeBatch([op1]));
@@ -210,13 +211,13 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads',
                 pk: 't-1',
                 payload: { id: 't-1', title: 'newer' },
-                stamp: { clock: 5, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: crypto.randomUUID() },
+                stamp: { clock: 5, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
             const op2 = makeOp({
                 tableName: 'threads',
                 pk: 't-1',
                 payload: { id: 't-1', title: 'older' },
-                stamp: { clock: 3, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: crypto.randomUUID() },
+                stamp: { clock: 3, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() },
             });
 
             await adapter.push(stubEvent, makeBatch([op1]));
@@ -245,7 +246,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads',
                 pk: 't-1',
                 operation: 'delete',
-                stamp: { clock: 2, hlc: '2025-01-01T00:00:01.000Z-0000', deviceId: DEVICE_A, opId: crypto.randomUUID() },
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:01.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
             await adapter.push(stubEvent, makeBatch([delOp]));
 
@@ -282,7 +283,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                             clock: 2,
                             hlc: '2025-01-01T00:00:01.000Z-0000',
                             deviceId: DEVICE_A,
-                            opId: crypto.randomUUID(),
+                            opId: randomUUID(),
                         },
                     }),
                 ])
@@ -299,7 +300,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                             clock: 3,
                             hlc: '2025-01-01T00:00:02.000Z-0000',
                             deviceId: DEVICE_B,
-                            opId: crypto.randomUUID(),
+                            opId: randomUUID(),
                         },
                     }),
                 ])
@@ -592,7 +593,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads',
                 pk: 't-1',
                 operation: 'delete',
-                stamp: { clock: 2, hlc: '2025-01-01T00:00:01.000Z-0000', deviceId: DEVICE_A, opId: crypto.randomUUID() },
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:01.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
             await adapter.push(stubEvent, makeBatch([delOp]));
 

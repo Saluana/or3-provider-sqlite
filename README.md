@@ -98,7 +98,7 @@ bun run build       # build for distribution
 
 ## Compatibility
 
-- Works with any auth provider (`basic-auth`, `clerk`, or custom)
+- Works with multiple auth providers (`basic-auth`, `clerk`, or custom)
 - Replaces `or3-provider-convex` for sync + workspace store functionality
 - Does NOT provide storage — pair with `or3-provider-fs` for file storage
 
