@@ -2,7 +2,7 @@
  * Nitro plugin: registers SQLite AuthWorkspaceStore + SyncGatewayAdapter.
  *
  * Runs migrations on first load, then registers both adapters.
- * Skips registration when auth is disabled (local-only mode).
+ * Skips registration when auth/sync are disabled or active sync provider is not sqlite.
  */
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
@@ -13,10 +13,16 @@ import { runMigrations } from '../db/migrate';
 import { useRuntimeConfig } from '#imports';
 
 const SQLITE_PROVIDER_ID = 'sqlite';
+type RuntimeConfigWithSync = {
+    auth?: { enabled?: boolean };
+    sync?: { enabled?: boolean; provider?: string };
+};
 
 export default defineNitroPlugin(async () => {
-    const config = useRuntimeConfig();
+    const config = useRuntimeConfig() as RuntimeConfigWithSync;
     if (!config.auth?.enabled) return;
+    if (!config.sync?.enabled) return;
+    if (config.sync?.provider !== SQLITE_PROVIDER_ID) return;
 
     // Initialize DB and run migrations
     const db = getSqliteDb();
