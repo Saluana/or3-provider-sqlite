@@ -1,11 +1,44 @@
 {
-  "name": "or3-provider-sqlite",
-  "module": "index.ts",
-  "type": "module",
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  }
+    "name": "or3-provider-sqlite",
+    "version": "0.0.1",
+    "description": "SQLite sync and workspace store provider for OR3 Chat — lightweight self-hosted backend via Kysely.",
+    "license": "MIT",
+    "type": "module",
+    "exports": {
+        ".": {
+            "types": "./dist/types.d.mts",
+            "import": "./dist/module.mjs"
+        },
+        "./nuxt": {
+            "types": "./dist/types.d.mts",
+            "import": "./dist/module.mjs"
+        }
+    },
+    "main": "./dist/module.mjs",
+    "types": "./dist/types.d.mts",
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "nuxt-module-build build",
+        "type-check": "tsc --noEmit",
+        "test": "vitest run"
+    },
+    "dependencies": {
+        "better-sqlite3": "^12.6.2",
+        "kysely": "^0.28.11"
+    },
+    "peerDependencies": {
+        "@nuxt/kit": "^3.0.0 || ^4.0.0",
+        "nuxt": "^3.0.0 || ^4.0.0"
+    },
+    "devDependencies": {
+        "@nuxt/module-builder": "^1.0.2",
+        "@types/better-sqlite3": "^7.6.13",
+        "@types/node": "^25.2.2",
+        "h3": "^2.0.1",
+        "pathe": "^2.0.3",
+        "typescript": "^5.9.3",
+        "vitest": "^4.0.18"
+    }
 }
