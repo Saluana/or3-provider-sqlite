@@ -4,6 +4,7 @@
     "description": "SQLite sync and workspace store provider for OR3 Chat — lightweight self-hosted backend via Kysely.",
     "license": "MIT",
     "type": "module",
+    "sideEffects": false,
     "exports": {
         ".": {
             "types": "./dist/types.d.mts",
@@ -20,10 +21,14 @@
         "dist"
     ],
     "scripts": {
+        "prepack": "bun run build",
         "build": "nuxt-module-build build",
         "lint": "eslint src --max-warnings 0",
         "type-check": "tsc --noEmit",
         "test": "vitest run"
+    },
+    "publishConfig": {
+        "access": "public"
     },
     "dependencies": {
         "better-sqlite3": "^12.6.2",
