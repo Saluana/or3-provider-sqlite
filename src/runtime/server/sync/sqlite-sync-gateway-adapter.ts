@@ -73,7 +73,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
         // Use raw better-sqlite3 transaction for BEGIN IMMEDIATE semantics
         const raw = getRawDb();
-        const db = this.db;
         const now = nowEpoch();
 
         const results: PushResult['results'] = [];
@@ -100,8 +99,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 }
             }
 
-            // Count new ops (non-idempotent)
-            const newOps = ops.filter((op) => !existingOps.has(op.stamp.opId));
+            // Deduplicate op_ids inside the same batch so repeats are idempotent.
+            const uniqueNewOpIds = new Set<string>();
+            for (const op of ops) {
+                if (existingOps.has(op.stamp.opId)) continue;
+                uniqueNewOpIds.add(op.stamp.opId);
+            }
 
             // Allocate contiguous server_version block
             let baseVersion: number;
@@ -113,15 +116,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 baseVersion = counterRow.value;
                 raw.prepare(
                     'UPDATE server_version_counter SET value = ? WHERE workspace_id = ?'
-                ).run(baseVersion + newOps.length, workspaceId);
+                ).run(baseVersion + uniqueNewOpIds.size, workspaceId);
             } else {
                 baseVersion = 0;
                 raw.prepare(
                     'INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)'
-                ).run(workspaceId, newOps.length);
+                ).run(workspaceId, uniqueNewOpIds.size);
             }
 
-            finalServerVersion = baseVersion + newOps.length;
+            finalServerVersion = baseVersion + uniqueNewOpIds.size;
 
             // Prepared statements for hot-path inserts/upserts
             const insertChangeLog = raw.prepare(`
@@ -129,7 +132,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
 
+            const assignedVersions = new Map<string, number>();
             let versionOffset = 0;
+            for (const op of ops) {
+                if (existingOps.has(op.stamp.opId)) continue;
+                if (assignedVersions.has(op.stamp.opId)) continue;
+                versionOffset++;
+                assignedVersions.set(op.stamp.opId, baseVersion + versionOffset);
+            }
+
+            const processedNew = new Set<string>();
 
             for (const op of ops) {
                 const opId = op.stamp.opId;
@@ -145,8 +157,21 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     continue;
                 }
 
-                const serverVersion = baseVersion + versionOffset + 1;
-                versionOffset++;
+                const serverVersion = assignedVersions.get(opId);
+                if (serverVersion === undefined) {
+                    throw new Error(`Missing server version allocation for op_id ${opId}`);
+                }
+
+                // Duplicate op_id in the same batch: mirror first occurrence.
+                if (processedNew.has(opId)) {
+                    results.push({
+                        opId,
+                        success: true,
+                        serverVersion,
+                    });
+                    continue;
+                }
+                processedNew.add(opId);
 
                 const materializedTable = SYNCED_TABLE_MAP[op.tableName];
                 if (!materializedTable) {
@@ -159,7 +184,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     continue;
                 }
 
-                const pkField = op.tableName === 'file_meta' ? 'hash' : 'id';
                 const pkValue = op.pk;
 
                 // Write change_log
@@ -280,10 +304,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     raw.prepare(
                         `INSERT INTO tombstones (id, workspace_id, table_name, pk, deleted_at, clock, server_version, created_at)
                          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT(id) DO UPDATE SET
+                         ON CONFLICT(workspace_id, table_name, pk) DO UPDATE SET
                            deleted_at = excluded.deleted_at,
                            clock = excluded.clock,
-                           server_version = excluded.server_version`
+                           server_version = excluded.server_version
+                         WHERE excluded.clock > tombstones.clock
+                            OR (
+                                excluded.clock = tombstones.clock
+                                AND excluded.server_version > tombstones.server_version
+                            )`
                     ).run(
                         uid(),
                         workspaceId,

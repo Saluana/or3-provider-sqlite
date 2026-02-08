@@ -117,6 +117,39 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(result.results[0]!.serverVersion).toBe(1); // idempotent
             expect(result.results[1]!.serverVersion).toBe(2); // new
         });
+
+        it('treats duplicate op_id inside the same batch as idempotent', async () => {
+            const sharedOpId = crypto.randomUUID();
+            const first = makeOp({
+                tableName: 'threads',
+                pk: 't-dup',
+                stamp: {
+                    clock: 1,
+                    hlc: '2025-01-01T00:00:00.000Z-0000',
+                    deviceId: DEVICE_A,
+                    opId: sharedOpId,
+                },
+            });
+            const second = makeOp({
+                tableName: 'threads',
+                pk: 't-dup',
+                stamp: {
+                    clock: 1,
+                    hlc: '2025-01-01T00:00:00.000Z-0001',
+                    deviceId: DEVICE_A,
+                    opId: sharedOpId,
+                },
+            });
+
+            const result = await adapter.push(stubEvent, makeBatch([first, second]));
+
+            expect(result.results.length).toBe(2);
+            expect(result.results[0]!.success).toBe(true);
+            expect(result.results[1]!.success).toBe(true);
+            expect(result.results[0]!.serverVersion).toBe(1);
+            expect(result.results[1]!.serverVersion).toBe(1);
+            expect(result.serverVersion).toBe(1);
+        });
     });
 
     describe('LWW', () => {
@@ -230,6 +263,93 @@ describe('SqliteSyncGatewayAdapter', () => {
                 .get('t-1') as { deleted: number };
 
             expect(row.deleted).toBe(1);
+        });
+
+        it('keeps a single tombstone row per (workspace, table, pk)', async () => {
+            await adapter.push(
+                stubEvent,
+                makeBatch([makeOp({ tableName: 'threads', pk: 't-repeat' })])
+            );
+
+            await adapter.push(
+                stubEvent,
+                makeBatch([
+                    makeOp({
+                        tableName: 'threads',
+                        pk: 't-repeat',
+                        operation: 'delete',
+                        stamp: {
+                            clock: 2,
+                            hlc: '2025-01-01T00:00:01.000Z-0000',
+                            deviceId: DEVICE_A,
+                            opId: crypto.randomUUID(),
+                        },
+                    }),
+                ])
+            );
+
+            await adapter.push(
+                stubEvent,
+                makeBatch([
+                    makeOp({
+                        tableName: 'threads',
+                        pk: 't-repeat',
+                        operation: 'delete',
+                        stamp: {
+                            clock: 3,
+                            hlc: '2025-01-01T00:00:02.000Z-0000',
+                            deviceId: DEVICE_B,
+                            opId: crypto.randomUUID(),
+                        },
+                    }),
+                ])
+            );
+
+            const raw = getRawDb();
+            const rows = raw
+                .prepare(
+                    `SELECT COUNT(*) as cnt, MAX(clock) as max_clock
+                     FROM tombstones
+                     WHERE workspace_id = ? AND table_name = ? AND pk = ?`
+                )
+                .get(WORKSPACE_ID, 'threads', 't-repeat') as {
+                cnt: number;
+                max_clock: number;
+            };
+
+            expect(rows.cnt).toBe(1);
+            expect(rows.max_clock).toBe(3);
+        });
+    });
+
+    describe('workspace isolation', () => {
+        it('allows same record id in different workspaces', async () => {
+            const sharedPk = 'shared-id';
+            const opA = makeOp({ tableName: 'threads', pk: sharedPk });
+            const opB = makeOp({ tableName: 'threads', pk: sharedPk });
+
+            const resultA = await adapter.push(stubEvent, {
+                scope: { workspaceId: 'ws-A' },
+                ops: [opA],
+            });
+            const resultB = await adapter.push(stubEvent, {
+                scope: { workspaceId: 'ws-B' },
+                ops: [opB],
+            });
+
+            expect(resultA.results[0]!.success).toBe(true);
+            expect(resultB.results[0]!.success).toBe(true);
+
+            const raw = getRawDb();
+            const count = raw
+                .prepare(
+                    `SELECT COUNT(*) as cnt
+                     FROM s_threads
+                     WHERE id = ? AND workspace_id IN ('ws-A', 'ws-B')`
+                )
+                .get(sharedPk) as { cnt: number };
+
+            expect(count.cnt).toBe(2);
         });
     });
 

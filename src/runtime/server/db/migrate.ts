@@ -6,10 +6,12 @@ import { type Kysely, type Migration, type MigrationProvider, Migrator } from 'k
 import type { Or3SqliteDb } from './schema';
 import * as m001 from './migrations/001_init';
 import * as m002 from './migrations/002_sync_tables';
+import * as m003 from './migrations/003_sync_hardening';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
     '002_sync_tables': m002,
+    '003_sync_hardening': m003,
 };
 
 class StaticMigrationProvider implements MigrationProvider {

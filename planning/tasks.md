@@ -114,11 +114,11 @@ artifact_id: 4497f9a5-bc30-46b1-8a42-f96a9dcfae16
 
 ### 6.2 Integration
 
-- [ ] Test `/api/sync/push` through `/api/sync/pull` cycle
+- [x] Test `/api/sync/push` through `/api/sync/pull` cycle
   - Requirements: 6.2
-- [ ] Test `/api/sync/update-cursor` behavior
+- [x] Test `/api/sync/update-cursor` behavior
   - Requirements: 6.2
-- [ ] Test `/api/workspaces/*` CRUD through sqlite store
+- [x] Test `/api/workspaces/*` CRUD through sqlite store
   - Requirements: 6.2
 
 ### 6.3 Package validation
@@ -138,4 +138,3 @@ artifact_id: 4497f9a5-bc30-46b1-8a42-f96a9dcfae16
   - Requirements: 7.2
 - [x] Add compatibility note vs Convex behavior
   - Requirements: 4.1, 4.2
-

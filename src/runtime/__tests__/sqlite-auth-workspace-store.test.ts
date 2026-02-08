@@ -76,6 +76,36 @@ describe('SqliteAuthWorkspaceStore', () => {
 
             expect(a.userId).not.toBe(b.userId);
         });
+
+        it('is idempotent under concurrent calls for the same provider identity', async () => {
+            const calls = await Promise.all(
+                Array.from({ length: 10 }, () =>
+                    store.getOrCreateUser({
+                        provider: 'basic-auth',
+                        providerUserId: 'concurrent-user',
+                    })
+                )
+            );
+
+            const ids = new Set(calls.map((c) => c.userId));
+            expect(ids.size).toBe(1);
+
+            const db = getSqliteDb();
+            const authCount = await db
+                .selectFrom('auth_accounts')
+                .select((eb) => eb.fn.countAll<number>().as('count'))
+                .where('provider', '=', 'basic-auth')
+                .where('provider_user_id', '=', 'concurrent-user')
+                .executeTakeFirstOrThrow();
+
+            const userCount = await db
+                .selectFrom('users')
+                .select((eb) => eb.fn.countAll<number>().as('count'))
+                .executeTakeFirstOrThrow();
+
+            expect(authCount.count).toBe(1);
+            expect(userCount.count).toBe(1);
+        });
     });
 
     describe('getOrCreateDefaultWorkspace', () => {
@@ -247,6 +277,54 @@ describe('SqliteAuthWorkspaceStore', () => {
             expect(workspaces[0]!.id).toBe(ws2);
         });
 
+        it('re-homes active workspace for all affected members', async () => {
+            const { userId: owner } = await store.getOrCreateUser({
+                provider: 'basic-auth',
+                providerUserId: 'owner',
+            });
+            const { userId: member } = await store.getOrCreateUser({
+                provider: 'basic-auth',
+                providerUserId: 'member',
+            });
+
+            const { workspaceId: sharedWs } = await store.createWorkspace({
+                userId: owner,
+                name: 'Shared',
+            });
+
+            const db = getSqliteDb();
+            await db
+                .insertInto('workspace_members')
+                .values({
+                    id: crypto.randomUUID(),
+                    workspace_id: sharedWs,
+                    user_id: member,
+                    role: 'editor',
+                    created_at: Math.floor(Date.now() / 1000),
+                })
+                .execute();
+
+            const { workspaceId: ownerFallback } = await store.createWorkspace({
+                userId: owner,
+                name: 'Owner Fallback',
+            });
+            const { workspaceId: memberFallback } = await store.createWorkspace({
+                userId: member,
+                name: 'Member Fallback',
+            });
+
+            await store.setActiveWorkspace({ userId: owner, workspaceId: sharedWs });
+            await store.setActiveWorkspace({ userId: member, workspaceId: sharedWs });
+
+            await store.removeWorkspace({ userId: owner, workspaceId: sharedWs });
+
+            const ownerWorkspaces = await store.listUserWorkspaces(owner);
+            const memberWorkspaces = await store.listUserWorkspaces(member);
+
+            expect(ownerWorkspaces.find((w) => w.isActive)?.id).toBe(ownerFallback);
+            expect(memberWorkspaces.find((w) => w.isActive)?.id).toBe(memberFallback);
+        });
+
         it('rejects remove from non-owner', async () => {
             const { userId: owner } = await store.getOrCreateUser({
                 provider: 'basic-auth',
@@ -320,6 +398,24 @@ describe('SqliteAuthWorkspaceStore', () => {
 
             await expect(
                 store.setActiveWorkspace({ userId: userB, workspaceId })
+            ).rejects.toThrow('not a member');
+        });
+
+        it('rejects setting a deleted workspace as active', async () => {
+            const { userId } = await store.getOrCreateUser({
+                provider: 'basic-auth',
+                providerUserId: 'user-active-delete',
+            });
+
+            const { workspaceId } = await store.createWorkspace({
+                userId,
+                name: 'To Delete',
+            });
+
+            await store.removeWorkspace({ userId, workspaceId });
+
+            await expect(
+                store.setActiveWorkspace({ userId, workspaceId })
             ).rejects.toThrow('not a member');
         });
     });

@@ -6,7 +6,7 @@
  */
 import type { AuthWorkspaceStore } from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
-import { getSqliteDb } from '../db/kysely';
+import { getRawDb, getSqliteDb } from '../db/kysely';
 
 function uid(): string {
     return crypto.randomUUID();
@@ -27,48 +27,78 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         email?: string;
         displayName?: string;
     }): Promise<{ userId: string }> {
-        const db = this.db;
+        // Ensure singleton is initialized before raw access.
+        this.db;
+        const raw = getRawDb();
 
-        // Check if auth account already exists
-        const existing = await db
-            .selectFrom('auth_accounts')
-            .select('user_id')
-            .where('provider', '=', input.provider)
-            .where('provider_user_id', '=', input.providerUserId)
-            .executeTakeFirst();
+        const userId = raw
+            .transaction(() => {
+                const existing = raw
+                    .prepare(
+                        `SELECT user_id
+                         FROM auth_accounts
+                         WHERE provider = ? AND provider_user_id = ?`
+                    )
+                    .get(input.provider, input.providerUserId) as
+                    | { user_id: string }
+                    | undefined;
 
-        if (existing) {
-            return { userId: existing.user_id };
-        }
+                if (existing) {
+                    return existing.user_id;
+                }
 
-        // Create user + auth account in transaction
-        const userId = uid();
-        const accountId = uid();
-        const now = nowEpoch();
+                const createdUserId = uid();
+                const now = nowEpoch();
 
-        await db.transaction().execute(async (tx) => {
-            await tx
-                .insertInto('users')
-                .values({
-                    id: userId,
-                    email: input.email ?? null,
-                    display_name: input.displayName ?? null,
-                    active_workspace_id: null,
-                    created_at: now,
-                })
-                .execute();
+                raw.prepare(
+                    `INSERT INTO users (id, email, display_name, active_workspace_id, created_at)
+                     VALUES (?, ?, ?, NULL, ?)`
+                ).run(
+                    createdUserId,
+                    input.email ?? null,
+                    input.displayName ?? null,
+                    now
+                );
 
-            await tx
-                .insertInto('auth_accounts')
-                .values({
-                    id: accountId,
-                    user_id: userId,
-                    provider: input.provider,
-                    provider_user_id: input.providerUserId,
-                    created_at: now,
-                })
-                .execute();
-        });
+                try {
+                    raw.prepare(
+                        `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id, created_at)
+                         VALUES (?, ?, ?, ?, ?)`
+                    ).run(
+                        uid(),
+                        createdUserId,
+                        input.provider,
+                        input.providerUserId,
+                        now
+                    );
+                    return createdUserId;
+                } catch (error) {
+                    // If another request won the unique race, return that user.
+                    raw.prepare(
+                        `DELETE FROM users
+                         WHERE id = ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM auth_accounts WHERE user_id = ?
+                           )`
+                    ).run(createdUserId, createdUserId);
+
+                    const winner = raw
+                        .prepare(
+                            `SELECT user_id
+                             FROM auth_accounts
+                             WHERE provider = ? AND provider_user_id = ?`
+                        )
+                        .get(input.provider, input.providerUserId) as
+                        | { user_id: string }
+                        | undefined;
+
+                    if (winner) {
+                        return winner.user_id;
+                    }
+                    throw error;
+                }
+            })
+            .immediate();
 
         return { userId };
     }
@@ -301,19 +331,19 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                 .where('id', '=', input.workspaceId)
                 .execute();
 
-            // If this was the user's active workspace, re-home to another
-            const user = await tx
+            // Re-home every user currently pointing at this workspace.
+            const affectedUsers = await tx
                 .selectFrom('users')
-                .select('active_workspace_id')
-                .where('id', '=', input.userId)
-                .executeTakeFirst();
+                .select('id')
+                .where('active_workspace_id', '=', input.workspaceId)
+                .execute();
 
-            if (user?.active_workspace_id === input.workspaceId) {
+            for (const affectedUser of affectedUsers) {
                 const next = await tx
                     .selectFrom('workspace_members')
                     .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
                     .select('workspaces.id')
-                    .where('workspace_members.user_id', '=', input.userId)
+                    .where('workspace_members.user_id', '=', affectedUser.id)
                     .where('workspaces.deleted', '=', 0)
                     .where('workspaces.id', '!=', input.workspaceId)
                     .executeTakeFirst();
@@ -321,7 +351,7 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                 await tx
                     .updateTable('users')
                     .set({ active_workspace_id: next?.id ?? null })
-                    .where('id', '=', input.userId)
+                    .where('id', '=', affectedUser.id)
                     .execute();
             }
         });
@@ -336,9 +366,11 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         // Verify membership
         const member = await db
             .selectFrom('workspace_members')
-            .select('id')
-            .where('workspace_id', '=', input.workspaceId)
-            .where('user_id', '=', input.userId)
+            .innerJoin('workspaces', 'workspaces.id', 'workspace_members.workspace_id')
+            .select('workspace_members.id')
+            .where('workspace_members.workspace_id', '=', input.workspaceId)
+            .where('workspace_members.user_id', '=', input.userId)
+            .where('workspaces.deleted', '=', 0)
             .executeTakeFirst();
 
         if (!member) {

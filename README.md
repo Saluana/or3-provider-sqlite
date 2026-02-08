@@ -25,9 +25,11 @@ export default ['or3-provider-sqlite/nuxt'];
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `OR3_SQLITE_DB_PATH` | No | `:memory:` | Path to SQLite database file |
+| `OR3_SQLITE_DB_PATH` | Yes (non-test) | None | Path to SQLite database file |
 | `OR3_SQLITE_PRAGMA_JOURNAL_MODE` | No | `WAL` | SQLite journal mode |
 | `OR3_SQLITE_PRAGMA_SYNCHRONOUS` | No | `NORMAL` | SQLite synchronous pragma |
+| `OR3_SQLITE_ALLOW_IN_MEMORY` | No | `false` | Allow `:memory:` in non-test environments (ephemeral data) |
+| `OR3_SQLITE_STRICT` | No | `false` | Fail startup if `:memory:` is used |
 
 ### Production example
 

@@ -109,12 +109,20 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         .columns(['workspace_id', 'server_version'])
         .execute();
 
+    await db.schema
+        .createIndex('idx_tombstones_ws_table_pk')
+        .ifNotExists()
+        .on('tombstones')
+        .columns(['workspace_id', 'table_name', 'pk'])
+        .unique()
+        .execute();
+
     // Synced entity tables (materialized views of latest state)
     for (const tableName of SYNCED_TABLES) {
         await db.schema
             .createTable(tableName)
             .ifNotExists()
-            .addColumn('id', 'text', (col) => col.primaryKey())
+            .addColumn('id', 'text', (col) => col.notNull())
             .addColumn('workspace_id', 'text', (col) => col.notNull())
             .addColumn('data_json', 'text', (col) => col.notNull())
             .addColumn('clock', 'integer', (col) => col.notNull().defaultTo(0))
@@ -127,6 +135,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
             .addColumn('updated_at', 'integer', (col) =>
                 col.notNull().defaultTo(sql`(unixepoch())`)
             )
+            .addPrimaryKeyConstraint(`${tableName}_pk`, ['workspace_id', 'id'])
             .execute();
 
         await db.schema
