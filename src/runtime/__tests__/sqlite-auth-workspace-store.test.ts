@@ -146,6 +146,33 @@ describe('SqliteAuthWorkspaceStore', () => {
             const active = workspaces.find((w) => w.isActive);
             expect(active?.id).toBe(workspaceId);
         });
+
+        it('returns the currently active workspace when multiple memberships exist', async () => {
+            const { userId } = await store.getOrCreateUser({
+                provider: 'basic-auth',
+                providerUserId: 'user-1',
+            });
+
+            const { workspaceId: ws1 } = await store.createWorkspace({
+                userId,
+                name: 'WS 1',
+            });
+            const { workspaceId: ws2 } = await store.createWorkspace({
+                userId,
+                name: 'WS 2',
+            });
+
+            await store.setActiveWorkspace({ userId, workspaceId: ws2 });
+
+            const resolved = await store.getOrCreateDefaultWorkspace(userId);
+            expect(resolved.workspaceId).toBe(ws2);
+            expect(resolved.workspaceName).toBe('WS 2');
+
+            const workspaces = await store.listUserWorkspaces(userId);
+            const active = workspaces.find((workspace) => workspace.isActive);
+            expect(active?.id).toBe(ws2);
+            expect(workspaces.some((workspace) => workspace.id === ws1)).toBe(true);
+        });
     });
 
     describe('getWorkspaceRole', () => {

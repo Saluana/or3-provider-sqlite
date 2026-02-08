@@ -41,7 +41,7 @@
         "@typescript-eslint/eslint-plugin": "^8.41.0",
         "@typescript-eslint/parser": "^8.41.0",
         "eslint": "^9.34.0",
-        "h3": "^2.0.1-rc.14",
+        "h3": "^1.15.4",
         "pathe": "^2.0.3",
         "typescript": "^5.9.3",
         "vitest": "^4.0.18"

@@ -109,6 +109,33 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
     ): Promise<{ workspaceId: string; workspaceName: string }> {
         const db = this.db;
 
+        // Prefer the user's current active workspace when it is valid.
+        const activeMembership = await db
+            .selectFrom('users')
+            .innerJoin('workspaces', 'workspaces.id', 'users.active_workspace_id')
+            .innerJoin(
+                'workspace_members',
+                (join) =>
+                    join
+                        .onRef(
+                            'workspace_members.workspace_id',
+                            '=',
+                            'workspaces.id'
+                        )
+                        .onRef('workspace_members.user_id', '=', 'users.id')
+            )
+            .select(['workspaces.id', 'workspaces.name'])
+            .where('users.id', '=', userId)
+            .where('workspaces.deleted', '=', 0)
+            .executeTakeFirst();
+
+        if (activeMembership) {
+            return {
+                workspaceId: activeMembership.id,
+                workspaceName: activeMembership.name,
+            };
+        }
+
         // Check if user has workspace memberships
         const membership = await db
             .selectFrom('workspace_members')
@@ -119,15 +146,15 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
             ])
             .where('workspace_members.user_id', '=', userId)
             .where('workspaces.deleted', '=', 0)
+            .orderBy('workspace_members.created_at', 'asc')
             .executeTakeFirst();
 
         if (membership) {
-            // Ensure active_workspace_id is set
+            // Repair stale/missing active workspace pointer.
             await db
                 .updateTable('users')
                 .set({ active_workspace_id: membership.id })
                 .where('id', '=', userId)
-                .where('active_workspace_id', 'is', null)
                 .execute();
 
             return { workspaceId: membership.id, workspaceName: membership.name };
