@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 
 describe('sqlite db config guards', () => {
@@ -32,5 +32,20 @@ describe('sqlite db config guards', () => {
         process.env.NODE_ENV = 'production';
 
         expect(() => getSqliteDb()).not.toThrow();
+    });
+
+    it('warns when falling back to :memory: in non-test mode', () => {
+        delete process.env.OR3_SQLITE_DB_PATH;
+        process.env.OR3_SQLITE_ALLOW_IN_MEMORY = 'true';
+        process.env.VITEST = '';
+        process.env.NODE_ENV = 'production';
+        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        getSqliteDb();
+
+        expect(warnSpy).toHaveBeenCalledWith(
+            '[or3-sqlite] OR3_SQLITE_ALLOW_IN_MEMORY=true enabled. Data will be lost on process restart.'
+        );
+        warnSpy.mockRestore();
     });
 });

@@ -48,56 +48,55 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                     return existing.user_id;
                 }
 
-                const createdUserId = uid();
+                const candidateUserId = uid();
                 const now = nowEpoch();
 
                 raw.prepare(
-                    `INSERT INTO users (id, email, display_name, active_workspace_id, created_at)
+                    `INSERT OR IGNORE INTO users (id, email, display_name, active_workspace_id, created_at)
                      VALUES (?, ?, ?, NULL, ?)`
                 ).run(
-                    createdUserId,
+                    candidateUserId,
                     input.email ?? null,
                     input.displayName ?? null,
                     now
                 );
 
-                try {
-                    raw.prepare(
-                        `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id, created_at)
-                         VALUES (?, ?, ?, ?, ?)`
-                    ).run(
-                        uid(),
-                        createdUserId,
-                        input.provider,
-                        input.providerUserId,
-                        now
-                    );
-                    return createdUserId;
-                } catch (error) {
-                    // If another request won the unique race, return that user.
+                raw.prepare(
+                    `INSERT OR IGNORE INTO auth_accounts (id, user_id, provider, provider_user_id, created_at)
+                     VALUES (?, ?, ?, ?, ?)`
+                ).run(
+                    uid(),
+                    candidateUserId,
+                    input.provider,
+                    input.providerUserId,
+                    now
+                );
+
+                const winner = raw
+                    .prepare(
+                        `SELECT user_id
+                         FROM auth_accounts
+                         WHERE provider = ? AND provider_user_id = ?`
+                    )
+                    .get(input.provider, input.providerUserId) as
+                    | { user_id: string }
+                    | undefined;
+
+                if (!winner) {
+                    throw new Error('Failed to resolve auth account after get-or-create attempt');
+                }
+
+                if (winner.user_id !== candidateUserId) {
                     raw.prepare(
                         `DELETE FROM users
                          WHERE id = ?
                            AND NOT EXISTS (
                                SELECT 1 FROM auth_accounts WHERE user_id = ?
                            )`
-                    ).run(createdUserId, createdUserId);
-
-                    const winner = raw
-                        .prepare(
-                            `SELECT user_id
-                             FROM auth_accounts
-                             WHERE provider = ? AND provider_user_id = ?`
-                        )
-                        .get(input.provider, input.providerUserId) as
-                        | { user_id: string }
-                        | undefined;
-
-                    if (winner) {
-                        return winner.user_id;
-                    }
-                    throw error;
+                    ).run(candidateUserId, candidateUserId);
                 }
+
+                return winner.user_id;
             })
             .immediate();
 
