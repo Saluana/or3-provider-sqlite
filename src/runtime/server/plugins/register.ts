@@ -5,9 +5,17 @@
  * Skips registration when auth/sync are disabled or active sync provider is not sqlite.
  */
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
+import { registerProviderAdminAdapter } from '~~/server/admin/providers/registry';
+import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
 import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
+import {
+    createSqliteAdminUserStore,
+    createSqliteWorkspaceAccessStore,
+    createSqliteWorkspaceSettingsStore,
+} from '../admin/stores/sqlite-store';
+import { sqliteSyncAdminAdapter } from '../admin/adapters/sync-sqlite';
 import { getSqliteDb } from '../db/kysely';
 import { runMigrations } from '../db/migrate';
 import { useRuntimeConfig } from '#imports';
@@ -39,4 +47,20 @@ export default defineNitroPlugin(async () => {
         order: 100,
         create: createSqliteSyncGatewayAdapter,
     });
+
+    registerAdminStoreProvider({
+        id: SQLITE_PROVIDER_ID,
+        createWorkspaceAccessStore: createSqliteWorkspaceAccessStore,
+        createWorkspaceSettingsStore: createSqliteWorkspaceSettingsStore,
+        createAdminUserStore: createSqliteAdminUserStore,
+        getCapabilities: () => ({
+            supportsServerSideAdmin: true,
+            supportsUserSearch: true,
+            supportsWorkspaceList: true,
+            supportsWorkspaceManagement: true,
+            supportsDeploymentAdminGrants: true,
+        }),
+    });
+
+    registerProviderAdminAdapter(sqliteSyncAdminAdapter);
 });

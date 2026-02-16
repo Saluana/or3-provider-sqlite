@@ -40,6 +40,22 @@ export interface WorkspaceMembersTable {
     created_at: Generated<number>;
 }
 
+export interface AuthInvitesTable {
+    id: string;
+    workspace_id: string;
+    email: string;
+    role: string; // 'owner' | 'editor' | 'viewer'
+    status: string; // 'pending' | 'accepted' | 'revoked' | 'expired'
+    invited_by_user_id: string;
+    token_hash: string;
+    expires_at: number;
+    accepted_at: number | null;
+    accepted_user_id: string | null;
+    revoked_at: number | null;
+    created_at: Generated<number>;
+    updated_at: Generated<number>;
+}
+
 // ─── Sync Infrastructure Tables ───
 
 export interface ServerVersionCounterTable {
@@ -100,11 +116,26 @@ export interface SyncedEntityTable {
 
 // ─── Database Interface ───
 
+export interface AdminUsersTable {
+    user_id: string;
+    created_at: number;
+    created_by_user_id: string | null;
+}
+
+export interface AdminWorkspaceSettingsTable {
+    id: string;
+    workspace_id: string;
+    key: string;
+    value: string;
+    updated_at: number;
+}
+
 export interface Or3SqliteDb {
     users: UsersTable;
     auth_accounts: AuthAccountsTable;
     workspaces: WorkspacesTable;
     workspace_members: WorkspaceMembersTable;
+    auth_invites: AuthInvitesTable;
     server_version_counter: ServerVersionCounterTable;
     change_log: ChangeLogTable;
     device_cursors: DeviceCursorsTable;
@@ -117,6 +148,8 @@ export interface Or3SqliteDb {
     s_kv: SyncedEntityTable;
     s_file_meta: SyncedEntityTable;
     s_notifications: SyncedEntityTable;
+    admin_users: AdminUsersTable;
+    admin_workspace_settings: AdminWorkspaceSettingsTable;
 }
 
 // ─── Convenience types ───
