@@ -395,6 +395,46 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(result.nextCursor).toBe(3);
         });
 
+        it('uses safe default limit when limit is undefined or NaN', async () => {
+            const ops = Array.from({ length: 3 }, (_, i) =>
+                makeOp({ tableName: 'threads', pk: `t-default-${i}` })
+            );
+            await adapter.push(stubEvent, makeBatch(ops));
+
+            const undefinedLimit = await adapter.pull(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID },
+                cursor: 0,
+                limit: undefined as unknown as number,
+            });
+            const nanLimit = await adapter.pull(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID },
+                cursor: 0,
+                limit: Number.NaN,
+            });
+
+            expect(undefinedLimit.changes.length).toBe(3);
+            expect(undefinedLimit.hasMore).toBe(false);
+            expect(nanLimit.changes.length).toBe(3);
+            expect(nanLimit.hasMore).toBe(false);
+        });
+
+        it('clamps non-positive limits to 1', async () => {
+            const ops = Array.from({ length: 5 }, (_, i) =>
+                makeOp({ tableName: 'threads', pk: `t-min-${i}` })
+            );
+            await adapter.push(stubEvent, makeBatch(ops));
+
+            const result = await adapter.pull(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID },
+                cursor: 0,
+                limit: 0,
+            });
+
+            expect(result.changes.length).toBe(1);
+            expect(result.hasMore).toBe(true);
+            expect(result.nextCursor).toBe(1);
+        });
+
         it('filters by table', async () => {
             const ops = [
                 makeOp({ tableName: 'threads', pk: 't-1' }),
@@ -442,6 +482,48 @@ describe('SqliteSyncGatewayAdapter', () => {
 
             expect(result.changes[0]!.payload).toEqual({ id: 't-1', title: 'Hello' });
             expect(result.changes[0]!.stamp.opId).toBe(op.stamp.opId);
+        });
+    });
+
+    describe('workspace scope authorization', () => {
+        it('rejects access when resolved session workspace differs from sync scope', async () => {
+            const scopedEvent = {
+                context: {
+                    __or3_session_context_test: {
+                        authenticated: true,
+                        workspace: { id: 'ws-allowed' },
+                    },
+                },
+            } as unknown as H3Event;
+
+            await expect(
+                adapter.pull(scopedEvent, {
+                    scope: { workspaceId: 'ws-other' },
+                    cursor: 0,
+                    limit: 10,
+                })
+            ).rejects.toMatchObject({ statusCode: 403 });
+        });
+
+        it('allows access when resolved session workspace matches sync scope', async () => {
+            const scopedEvent = {
+                context: {
+                    __or3_session_context_test: {
+                        authenticated: true,
+                        workspace: { id: WORKSPACE_ID },
+                    },
+                },
+            } as unknown as H3Event;
+
+            await adapter.push(scopedEvent, makeBatch([makeOp({ tableName: 'threads', pk: 't-auth' })]));
+            const result = await adapter.pull(scopedEvent, {
+                scope: { workspaceId: WORKSPACE_ID },
+                cursor: 0,
+                limit: 10,
+            });
+
+            expect(result.changes.length).toBe(1);
+            expect(result.changes[0]!.pk).toBe('t-auth');
         });
     });
 

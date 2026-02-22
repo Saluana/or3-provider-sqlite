@@ -6,6 +6,7 @@
  * (BEGIN IMMEDIATE prevents concurrent server_version races).
  */
 import type { H3Event } from 'h3';
+import { createError } from 'h3';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import type {
     PullRequest,
@@ -18,12 +19,59 @@ import { randomUUID } from 'node:crypto';
 import { getSqliteDb, getRawDb } from '../db/kysely';
 import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 
+const DEFAULT_PULL_LIMIT = 100;
+const MAX_PULL_LIMIT = 1000;
+const SESSION_CONTEXT_KEY_PREFIX = '__or3_session_context_';
+
 function uid(): string {
     return randomUUID();
 }
 
 function nowEpoch(): number {
     return Math.floor(Date.now() / 1000);
+}
+
+function resolvePullLimit(limit: number | undefined): number {
+    if (typeof limit !== 'number' || !Number.isFinite(limit)) return DEFAULT_PULL_LIMIT;
+    return Math.max(1, Math.min(Math.floor(limit), MAX_PULL_LIMIT));
+}
+
+async function assertWorkspaceScopeAuthorized(
+    event: H3Event,
+    workspaceId: string
+): Promise<void> {
+    if (!workspaceId.trim()) {
+        throw createError({
+            statusCode: 400,
+            statusMessage: 'workspaceId is required',
+        });
+    }
+
+    const context = (event as { context?: Record<string, unknown> }).context;
+    let activeWorkspaceId: string | null = null;
+    if (context && typeof context === 'object') {
+        for (const [key, value] of Object.entries(context)) {
+            if (!key.startsWith(SESSION_CONTEXT_KEY_PREFIX)) continue;
+            const workspaceIdCandidate = (value as { workspace?: { id?: unknown } })
+                .workspace?.id;
+            if (
+                typeof workspaceIdCandidate === 'string' &&
+                workspaceIdCandidate.trim().length > 0
+            ) {
+                activeWorkspaceId = workspaceIdCandidate;
+                break;
+            }
+        }
+    }
+
+    // Defense in depth: API routes already enforce auth/can(), but reject
+    // mismatched workspace scopes if a resolved session is present.
+    if (activeWorkspaceId && activeWorkspaceId !== workspaceId) {
+        throw createError({
+            statusCode: 403,
+            statusMessage: 'Forbidden',
+        });
+    }
 }
 
 /**
@@ -48,9 +96,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         return getSqliteDb();
     }
 
-    async push(_event: H3Event, input: PushBatch): Promise<PushResult> {
+    async push(event: H3Event, input: PushBatch): Promise<PushResult> {
         const { scope, ops } = input;
         const workspaceId = scope.workspaceId;
+        await assertWorkspaceScopeAuthorized(event, workspaceId);
 
         if (!ops.length) {
             return { results: [], serverVersion: 0 };
@@ -339,10 +388,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         return { results, serverVersion: finalServerVersion };
     }
 
-    async pull(_event: H3Event, input: PullRequest): Promise<PullResponse> {
+    async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
         const db = this.db;
         const { scope, cursor, limit, tables } = input;
-        const fetchLimit = Math.min(limit, 1000);
+        await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
+        const fetchLimit = resolvePullLimit(limit);
 
         let query = db
             .selectFrom('change_log')
@@ -382,9 +432,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     }
 
     async updateCursor(
-        _event: H3Event,
+        event: H3Event,
         input: { scope: { workspaceId: string }; deviceId: string; version: number }
     ): Promise<void> {
+        await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
         const raw = getRawDb();
         const now = nowEpoch();
 
@@ -399,9 +450,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     }
 
     async gcTombstones(
-        _event: H3Event,
+        event: H3Event,
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
+        await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
         const raw = getRawDb();
         const workspaceId = input.scope.workspaceId;
 
@@ -425,9 +477,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     }
 
     async gcChangeLog(
-        _event: H3Event,
+        event: H3Event,
         input: { scope: { workspaceId: string }; retentionSeconds: number }
     ): Promise<void> {
+        await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
         const raw = getRawDb();
         const workspaceId = input.scope.workspaceId;
 
