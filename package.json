@@ -13,6 +13,10 @@
         "./nuxt": {
             "types": "./dist/types.d.mts",
             "import": "./dist/module.mjs"
+        },
+        "./webhooks/sqlite-store": {
+            "types": "./dist/runtime/server/webhooks/sqlite-webhook-store.d.ts",
+            "import": "./dist/runtime/server/webhooks/sqlite-webhook-store.js"
         }
     },
     "main": "./dist/module.mjs",

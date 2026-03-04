@@ -9,6 +9,7 @@ import type { H3Event } from 'h3';
 import { createError } from 'h3';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 import type {
+    PendingOp,
     PullRequest,
     PullResponse,
     PushBatch,
@@ -18,10 +19,16 @@ import type {
 import { randomUUID } from 'node:crypto';
 import { getSqliteDb, getRawDb } from '../db/kysely';
 import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
+import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 
 const DEFAULT_PULL_LIMIT = 100;
 const MAX_PULL_LIMIT = 1000;
 const SESSION_CONTEXT_KEY_PREFIX = '__or3_session_context_';
+
+type HookEmission = {
+    hookName: string;
+    payload: Record<string, unknown>;
+};
 
 function uid(): string {
     return randomUUID();
@@ -74,6 +81,169 @@ async function assertWorkspaceScopeAuthorized(
     }
 }
 
+function resolveSessionUserId(event: H3Event): string | undefined {
+    const context = (event as { context?: Record<string, unknown> }).context;
+    if (!context || typeof context !== 'object') {
+        return undefined;
+    }
+
+    for (const [key, value] of Object.entries(context)) {
+        if (!key.startsWith(SESSION_CONTEXT_KEY_PREFIX)) continue;
+        const userId = (value as { user?: { id?: unknown } }).user?.id;
+        if (typeof userId === 'string' && userId.trim().length > 0) {
+            return userId;
+        }
+    }
+
+    return undefined;
+}
+
+function toWebhookEntityPayload(input: {
+    op: PendingOp;
+    workspaceId: string;
+    now: number;
+    userId?: string;
+    deleted?: boolean;
+}): Record<string, unknown> {
+    const base =
+        input.op.payload && typeof input.op.payload === 'object'
+            ? { ...(input.op.payload as Record<string, unknown>) }
+            : {};
+
+    if (typeof base.id !== 'string' || base.id.length === 0) {
+        base.id = input.op.pk;
+    }
+    if (
+        typeof base.workspace_id !== 'string' ||
+        base.workspace_id.length === 0
+    ) {
+        base.workspace_id = input.workspaceId;
+    }
+    if (
+        input.userId &&
+        (typeof base.user_id !== 'string' || base.user_id.length === 0)
+    ) {
+        base.user_id = input.userId;
+    }
+    if (input.deleted) {
+        base.deleted = true;
+    }
+    if (typeof base.updated_at !== 'number') {
+        base.updated_at = input.now;
+    }
+
+    return base;
+}
+
+function resolveHookEmission(input: {
+    op: PendingOp;
+    workspaceId: string;
+    now: number;
+    userId?: string;
+    wasExisting: boolean;
+    applied: boolean;
+}): HookEmission | null {
+    if (!input.applied) {
+        return null;
+    }
+
+    const { op } = input;
+    if (op.tableName === 'threads') {
+        if (op.operation === 'delete') {
+            return {
+                hookName: 'db.threads.delete:action:soft:after',
+                payload: toWebhookEntityPayload({
+                    op,
+                    workspaceId: input.workspaceId,
+                    now: input.now,
+                    userId: input.userId,
+                    deleted: true,
+                }),
+            };
+        }
+
+        return {
+            hookName: input.wasExisting
+                ? 'db.threads.update:action:after'
+                : 'db.threads.create:action:after',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    if (op.tableName === 'messages') {
+        if (op.operation === 'delete') {
+            return {
+                hookName: 'db.messages.delete:action:soft:after',
+                payload: toWebhookEntityPayload({
+                    op,
+                    workspaceId: input.workspaceId,
+                    now: input.now,
+                    userId: input.userId,
+                    deleted: true,
+                }),
+            };
+        }
+
+        return {
+            hookName: input.wasExisting
+                ? 'db.messages.update:action:after'
+                : 'db.messages.create:action:after',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    if (op.tableName === 'documents' || op.tableName === 'posts') {
+        if (op.operation === 'delete') {
+            return {
+                hookName: 'db.documents.delete:action:soft:after',
+                payload: toWebhookEntityPayload({
+                    op,
+                    workspaceId: input.workspaceId,
+                    now: input.now,
+                    userId: input.userId,
+                    deleted: true,
+                }),
+            };
+        }
+
+        return {
+            hookName: input.wasExisting
+                ? 'db.documents.update:action:after'
+                : 'db.documents.create:action:after',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    if (op.tableName === 'notifications' && op.operation === 'put') {
+        return {
+            hookName: 'notify:action:push',
+            payload: toWebhookEntityPayload({
+                op,
+                workspaceId: input.workspaceId,
+                now: input.now,
+                userId: input.userId,
+            }),
+        };
+    }
+
+    return null;
+}
+
 /**
  * LWW comparison: incoming wins if clock is higher,
  * or clock is equal and hlc is lexicographically greater.
@@ -123,9 +293,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         // Use raw better-sqlite3 transaction for BEGIN IMMEDIATE semantics
         const raw = getRawDb();
         const now = nowEpoch();
+        const userId = resolveSessionUserId(event);
 
         const results: PushResult['results'] = [];
         let finalServerVersion = 0;
+        const hookEmissions: HookEmission[] = [];
 
         const runTx = raw.transaction(() => {
             // Check for existing op_ids (idempotency)
@@ -264,6 +436,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         .get(pkValue, workspaceId) as
                         | { clock: number; hlc: string }
                         | undefined;
+                    let applied = false;
 
                     if (!existing) {
                         // Insert new row
@@ -280,6 +453,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                             now,
                             now
                         );
+                        applied = true;
                     } else if (
                         incomingWinsLww(
                             op.stamp.clock,
@@ -301,8 +475,21 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                             pkValue,
                             workspaceId
                         );
+                        applied = true;
                     }
                     // else: existing wins, no update
+
+                    const emission = resolveHookEmission({
+                        op,
+                        workspaceId,
+                        now,
+                        userId,
+                        wasExisting: Boolean(existing),
+                        applied,
+                    });
+                    if (emission) {
+                        hookEmissions.push(emission);
+                    }
                 } else if (op.operation === 'delete') {
                     // Mark deleted in materialized table
                     const existing = raw
@@ -312,6 +499,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         .get(pkValue, workspaceId) as
                         | { clock: number; hlc: string }
                         | undefined;
+                    let applied = false;
 
                     if (!existing) {
                         // Insert as deleted
@@ -327,6 +515,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                             now,
                             now
                         );
+                        applied = true;
                     } else if (
                         incomingWinsLww(
                             op.stamp.clock,
@@ -347,6 +536,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                             pkValue,
                             workspaceId
                         );
+                        applied = true;
                     }
 
                     // Upsert tombstone
@@ -372,6 +562,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         serverVersion,
                         now
                     );
+
+                    const emission = resolveHookEmission({
+                        op,
+                        workspaceId,
+                        now,
+                        userId,
+                        wasExisting: Boolean(existing),
+                        applied,
+                    });
+                    if (emission) {
+                        hookEmissions.push(emission);
+                    }
                 }
 
                 results.push({
@@ -384,6 +586,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
         // Run with IMMEDIATE to prevent concurrent version allocation races
         runTx.immediate();
+
+        for (const emission of hookEmissions) {
+            await emitWebhookSystemHook(emission.hookName, emission.payload);
+        }
 
         return { results, serverVersion: finalServerVersion };
     }

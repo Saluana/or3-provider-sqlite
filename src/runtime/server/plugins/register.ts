@@ -8,8 +8,10 @@ import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
 import { registerProviderAdminAdapter } from '~~/server/admin/providers/registry';
 import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
+import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
 import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
+import { createSqliteWebhookStore } from '../webhooks/sqlite-webhook-store';
 import {
     createSqliteAdminUserStore,
     createSqliteWorkspaceAccessStore,
@@ -46,6 +48,12 @@ export default defineNitroPlugin(async () => {
         id: SQLITE_PROVIDER_ID,
         order: 100,
         create: createSqliteSyncGatewayAdapter,
+    });
+
+    registerWebhookStore({
+        id: SQLITE_PROVIDER_ID,
+        order: 100,
+        create: createSqliteWebhookStore,
     });
 
     registerAdminStoreProvider({
