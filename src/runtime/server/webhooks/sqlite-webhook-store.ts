@@ -398,11 +398,16 @@ class SqliteWebhookStore implements WebhookStore {
 
         let rows: WebhookRow[];
         if (!workspaceId) {
+            if (scope === 'user') {
+                return [];
+            }
+
             rows = this.db
                 .prepare(
                     `
                     SELECT * FROM webhook_registrations
                     WHERE scope = ? AND enabled = 1 AND ${eventQuery}
+                      AND workspace_id IS NULL
                 `
                 )
                 .all(scope, eventType) as WebhookRow[];
