@@ -141,7 +141,7 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
 
     async getOrCreateDefaultWorkspace(
         userId: string
-    ): Promise<{ workspaceId: string; workspaceName: string }> {
+    ): Promise<{ workspaceId: string; workspaceName: string; created?: boolean }> {
         const db = this.db;
 
         // Prefer the user's current active workspace when it is valid.
@@ -168,6 +168,7 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
             return {
                 workspaceId: activeMembership.id,
                 workspaceName: activeMembership.name,
+                created: false,
             };
         }
 
@@ -192,7 +193,11 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                 .where('id', '=', userId)
                 .execute();
 
-            return { workspaceId: membership.id, workspaceName: membership.name };
+            return {
+                workspaceId: membership.id,
+                workspaceName: membership.name,
+                created: false,
+            };
         }
 
         // Create default workspace
@@ -233,7 +238,7 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                 .execute();
         });
 
-        return { workspaceId, workspaceName: name };
+        return { workspaceId, workspaceName: name, created: true };
     }
 
     async getWorkspaceRole(input: {
