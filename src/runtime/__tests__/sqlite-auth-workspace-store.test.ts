@@ -9,6 +9,24 @@ import { getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely
 import { runMigrations } from '../server/db/migrate';
 import { SqliteAuthWorkspaceStore } from '../server/auth/sqlite-auth-workspace-store';
 
+type InviteProvisionStep =
+    | 'invite_validated'
+    | 'user_created'
+    | 'membership_created'
+    | 'invite_consumed';
+
+class FailureInjectingSqliteAuthWorkspaceStore extends SqliteAuthWorkspaceStore {
+    constructor(private readonly failureStep: InviteProvisionStep) {
+        super();
+    }
+
+    protected override onInviteProvisionStep(step: InviteProvisionStep): void {
+        if (step === this.failureStep) {
+            throw new Error(`injected failure after ${step}`);
+        }
+    }
+}
+
 let store: SqliteAuthWorkspaceStore;
 
 beforeEach(async () => {
@@ -446,5 +464,100 @@ describe('SqliteAuthWorkspaceStore', () => {
                 store.setActiveWorkspace({ userId, workspaceId })
             ).rejects.toThrow('not a member');
         });
+    });
+
+    describe('atomic invite acceptance', () => {
+        async function createPendingInvite(input?: {
+            email?: string;
+            tokenHash?: string;
+            expiresAt?: number;
+        }) {
+            const { userId: ownerUserId } = await store.getOrCreateUser({
+                provider: 'basic-auth',
+                providerUserId: `owner-${randomUUID()}`,
+                email: 'owner@example.com',
+            });
+            const { workspaceId } = await store.createWorkspace({
+                userId: ownerUserId,
+                name: 'Invited Workspace',
+            });
+            const email = input?.email ?? 'invitee@example.com';
+            const tokenHash = input?.tokenHash ?? `token-${randomUUID()}`;
+            const { inviteId } = await store.createInvite({
+                workspaceId,
+                email,
+                role: 'editor',
+                invitedByUserId: ownerUserId,
+                expiresAt: input?.expiresAt ?? Math.floor(Date.now() / 1000) + 3600,
+                tokenHash,
+            });
+            return { workspaceId, inviteId, email, tokenHash };
+        }
+
+        it('creates user and membership and consumes the invite in one transaction', async () => {
+            const invite = await createPendingInvite();
+
+            const result = await store.acceptInviteAndProvisionUser({
+                provider: 'basic-auth',
+                providerUserId: 'new-provider-user',
+                email: ' Invitee@Example.com ',
+                displayName: 'Invitee',
+                workspaceId: invite.workspaceId,
+                tokenHash: invite.tokenHash,
+            });
+
+            expect(result).toMatchObject({
+                ok: true,
+                role: 'editor',
+                createdUser: true,
+            });
+            if (!result.ok) throw new Error('Expected successful invite acceptance');
+            await expect(store.getWorkspaceRole({
+                userId: result.userId,
+                workspaceId: invite.workspaceId,
+            })).resolves.toBe('editor');
+            const [persisted] = await store.listInvites({
+                workspaceId: invite.workspaceId,
+                status: 'accepted',
+            });
+            expect(persisted).toMatchObject({
+                id: invite.inviteId,
+                acceptedUserId: result.userId,
+            });
+        });
+
+        for (const step of [
+            'invite_validated',
+            'user_created',
+            'membership_created',
+            'invite_consumed',
+        ] as const) {
+            it(`rolls back all provisioning when failure is injected after ${step}`, async () => {
+                const invite = await createPendingInvite();
+                const failingStore = new FailureInjectingSqliteAuthWorkspaceStore(step);
+
+                await expect(failingStore.acceptInviteAndProvisionUser({
+                    provider: 'basic-auth',
+                    providerUserId: `failed-${step}`,
+                    email: invite.email,
+                    displayName: 'Must Roll Back',
+                    workspaceId: invite.workspaceId,
+                    tokenHash: invite.tokenHash,
+                })).rejects.toThrow(`injected failure after ${step}`);
+
+                await expect(store.getUser({
+                    provider: 'basic-auth',
+                    providerUserId: `failed-${step}`,
+                })).resolves.toBeNull();
+                const [pending] = await store.listInvites({
+                    workspaceId: invite.workspaceId,
+                    status: 'pending',
+                });
+                expect(pending).toMatchObject({
+                    id: invite.inviteId,
+                    acceptedUserId: null,
+                });
+            });
+        }
     });
 });

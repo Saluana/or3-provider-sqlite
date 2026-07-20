@@ -9,7 +9,7 @@ export interface RuntimeConfigLike {
     auth?: {
         enabled?: boolean;
     };
-    sync?: {
+    sync: {
         provider?: string;
         enabled?: boolean;
     };

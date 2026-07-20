@@ -82,6 +82,7 @@ export interface DeviceCursorsTable {
     id: string;
     workspace_id: string;
     device_id: string;
+    owner_user_id: string | null;
     last_seen_version: number;
     updated_at: Generated<number>;
 }
@@ -93,6 +94,8 @@ export interface TombstonesTable {
     pk: string;
     deleted_at: number;
     clock: number;
+    hlc: string;
+    op_id: string;
     server_version: number;
     created_at: Generated<number>;
 }
@@ -109,9 +112,46 @@ export interface SyncedEntityTable {
     clock: number;
     hlc: string;
     device_id: string;
+    op_id: string;
     deleted: Generated<number>;
     created_at: Generated<number>;
     updated_at: Generated<number>;
+}
+
+export interface SyncSnapshotsTable {
+    id: string;
+    workspace_id: string;
+    high_watermark: number;
+    tables_json: string;
+    created_at: number;
+    expires_at: number;
+}
+
+export interface SyncSnapshotItemsTable {
+    snapshot_id: string;
+    table_name: string;
+    pk: string;
+    kind: string; // 'row' | 'tombstone'
+    payload_json: string | null;
+    clock: number;
+    hlc: string;
+    op_id: string;
+    server_deleted_at: number | null;
+}
+
+export interface UploadIntentsTable {
+    id: string;
+    workspace_id: string;
+    hash: string;
+    mime_type: string;
+    size_bytes: number;
+    reserved_bytes: number;
+    expires_at: number;
+    status: 'active' | 'consumed' | 'cancelled' | 'expired';
+    storage_id: string | null;
+    created_at: number;
+    consumed_at: number | null;
+    cancelled_at: number | null;
 }
 
 // ─── Database Interface ───
@@ -140,6 +180,9 @@ export interface Or3SqliteDb {
     change_log: ChangeLogTable;
     device_cursors: DeviceCursorsTable;
     tombstones: TombstonesTable;
+    sync_snapshots: SyncSnapshotsTable;
+    sync_snapshot_items: SyncSnapshotItemsTable;
+    upload_intents: UploadIntentsTable;
     // Synced entity tables
     s_threads: SyncedEntityTable;
     s_messages: SyncedEntityTable;

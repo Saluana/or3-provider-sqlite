@@ -11,6 +11,18 @@ import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-ada
 
 const stubEvent = {} as H3Event;
 
+function makeAuthenticatedEvent(userId: string, workspaceId: string): H3Event {
+    return {
+        context: {
+            __or3_session_context_test: {
+                authenticated: true,
+                user: { id: userId },
+                workspace: { id: workspaceId },
+            },
+        },
+    } as unknown as H3Event;
+}
+
 describe('sqlite provider integration', () => {
     let store: SqliteAuthWorkspaceStore;
     let adapter: SqliteSyncGatewayAdapter;
@@ -136,7 +148,7 @@ describe('sqlite provider integration', () => {
             ops,
         });
 
-        await adapter.updateCursor(stubEvent, {
+        await adapter.updateCursor(makeAuthenticatedEvent(userId, workspaceId), {
             scope: { workspaceId },
             deviceId: 'cursor-device',
             version: 2,

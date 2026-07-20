@@ -5,7 +5,7 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 ## What it provides
 
 - **AuthWorkspaceStore** (`sqlite`) — user identity mapping, workspace CRUD, role resolution
-- **SyncGatewayAdapter** (`sqlite`) — push/pull sync with LWW conflict resolution, cursor tracking, GC
+- **SyncGatewayAdapter** (`sqlite`) — push/pull sync, consistent materialized snapshot pages, LWW conflict resolution, and cursor tracking
 
 ## Install
 
@@ -54,10 +54,12 @@ Registration is skipped when `auth.enabled` is `false` (local-only mode).
 
 ### Schema
 
-Two migrations create all tables:
+Ordered migrations create and evolve all tables:
 
 - **001_init**: `users`, `auth_accounts`, `workspaces`, `workspace_members`
 - **002_sync_tables**: `server_version_counter`, `change_log`, `device_cursors`, `tombstones`, plus materialized entity tables (`s_threads`, `s_messages`, etc.)
+- **003–005**: workspace-scoped sync keys, invitations, and admin stores
+- **006_sync_snapshots**: winning operation IDs plus immutable snapshot headers/items
 
 All tables use snake_case aligned with the sync wire format.
 
@@ -65,8 +67,9 @@ All tables use snake_case aligned with the sync wire format.
 
 - **Push**: validates ops → checks `op_id` idempotency → allocates contiguous `server_version` block → applies LWW to materialized tables → writes change_log → upserts tombstones for deletes
 - **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination and optional table filtering
+- **Snapshot**: captures canonical live rows and current tombstones with one `highWatermark` under `BEGIN IMMEDIATE`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`
 - **Cursor**: forward-only per-device cursor tracking
-- **GC**: tombstone and change_log cleanup respects min device cursor + retention window
+- **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
 
 LWW conflict resolution: incoming wins when `clock` is higher, or when clocks are equal and `hlc` is lexicographically greater.
 

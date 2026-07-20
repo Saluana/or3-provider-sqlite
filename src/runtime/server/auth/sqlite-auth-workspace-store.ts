@@ -4,7 +4,11 @@
  * Maps provider identity -> internal user and manages workspace CRUD.
  * Uses Kysely for all queries. No Convex or Clerk SDK imports.
  */
-import type { AuthWorkspaceStore } from '~~/server/auth/store/types';
+import type {
+    AuthWorkspaceStore,
+    InviteProvisionResult,
+    InviteValidationResult,
+} from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
 import { getRawDb, getSqliteDb } from '../db/kysely';
 import { randomUUID } from 'node:crypto';
@@ -25,6 +29,14 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
     private get db() {
         return getSqliteDb();
     }
+
+    protected onInviteProvisionStep(
+        _step:
+            | 'invite_validated'
+            | 'user_created'
+            | 'membership_created'
+            | 'invite_consumed'
+    ): void {}
 
     async getOrCreateUser(input: {
         provider: string;
@@ -563,6 +575,158 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
             .execute();
 
         void input.revokedByUserId;
+    }
+
+    async validateInvite(input: {
+        workspaceId: string;
+        email: string;
+        tokenHash: string;
+    }): Promise<InviteValidationResult> {
+        this.db;
+        const raw = getRawDb();
+        const now = nowEpoch();
+        const invite = raw
+            .prepare(
+                `SELECT role, status, email, expires_at
+                 FROM auth_invites
+                 WHERE workspace_id = ? AND token_hash = ?
+                 LIMIT 1`
+            )
+            .get(input.workspaceId, input.tokenHash) as
+            | {
+                  role: WorkspaceRole;
+                  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+                  email: string;
+                  expires_at: number;
+              }
+            | undefined;
+
+        if (!invite) return { ok: false, reason: 'not_found' };
+        if (invite.email !== normalizeEmail(input.email)) {
+            return { ok: false, reason: 'email_mismatch' };
+        }
+        if (invite.status === 'accepted') return { ok: false, reason: 'already_used' };
+        if (invite.status === 'revoked') return { ok: false, reason: 'revoked' };
+        if (invite.status === 'expired' || invite.expires_at <= now) {
+            return { ok: false, reason: 'expired' };
+        }
+        return { ok: true, role: invite.role };
+    }
+
+    async acceptInviteAndProvisionUser(input: {
+        provider: string;
+        providerUserId: string;
+        email: string;
+        displayName?: string;
+        workspaceId: string;
+        tokenHash: string;
+    }): Promise<InviteProvisionResult> {
+        this.db;
+        const raw = getRawDb();
+        const now = nowEpoch();
+        const normalizedEmail = normalizeEmail(input.email);
+
+        return raw
+            .transaction(() => {
+                const invite = raw
+                    .prepare(
+                        `SELECT id, role, status, email, expires_at
+                         FROM auth_invites
+                         WHERE workspace_id = ? AND token_hash = ?
+                         LIMIT 1`
+                    )
+                    .get(input.workspaceId, input.tokenHash) as
+                    | {
+                          id: string;
+                          role: WorkspaceRole;
+                          status: 'pending' | 'accepted' | 'revoked' | 'expired';
+                          email: string;
+                          expires_at: number;
+                      }
+                    | undefined;
+
+                if (!invite) return { ok: false as const, reason: 'not_found' as const };
+                if (invite.email !== normalizedEmail) {
+                    return { ok: false as const, reason: 'email_mismatch' as const };
+                }
+                if (invite.status === 'accepted') {
+                    return { ok: false as const, reason: 'already_used' as const };
+                }
+                if (invite.status === 'revoked') {
+                    return { ok: false as const, reason: 'revoked' as const };
+                }
+                if (invite.status === 'expired' || invite.expires_at <= now) {
+                    return { ok: false as const, reason: 'expired' as const };
+                }
+                this.onInviteProvisionStep('invite_validated');
+
+                const existingAccount = raw
+                    .prepare(
+                        `SELECT user_id
+                         FROM auth_accounts
+                         WHERE provider = ? AND provider_user_id = ?
+                         LIMIT 1`
+                    )
+                    .get(input.provider, input.providerUserId) as
+                    | { user_id: string }
+                    | undefined;
+
+                const userId = existingAccount?.user_id ?? uid();
+                const createdUser = !existingAccount;
+                if (createdUser) {
+                    raw.prepare(
+                        `INSERT INTO users (id, email, display_name, active_workspace_id, created_at)
+                         VALUES (?, ?, ?, NULL, ?)`
+                    ).run(userId, normalizedEmail, input.displayName ?? null, now);
+                    raw.prepare(
+                        `INSERT INTO auth_accounts (id, user_id, provider, provider_user_id, created_at)
+                         VALUES (?, ?, ?, ?, ?)`
+                    ).run(uid(), userId, input.provider, input.providerUserId, now);
+                }
+                this.onInviteProvisionStep('user_created');
+
+                const existingMembership = raw
+                    .prepare(
+                        `SELECT id FROM workspace_members
+                         WHERE workspace_id = ? AND user_id = ?
+                         LIMIT 1`
+                    )
+                    .get(input.workspaceId, userId) as { id: string } | undefined;
+                if (existingMembership) {
+                    raw.prepare('UPDATE workspace_members SET role = ? WHERE id = ?').run(
+                        invite.role,
+                        existingMembership.id
+                    );
+                } else {
+                    raw.prepare(
+                        `INSERT INTO workspace_members (id, workspace_id, user_id, role, created_at)
+                         VALUES (?, ?, ?, ?, ?)`
+                    ).run(uid(), input.workspaceId, userId, invite.role, now);
+                }
+                raw.prepare('UPDATE users SET active_workspace_id = ? WHERE id = ?').run(
+                    input.workspaceId,
+                    userId
+                );
+                this.onInviteProvisionStep('membership_created');
+
+                const consumed = raw.prepare(
+                    `UPDATE auth_invites
+                     SET status = 'accepted', accepted_at = ?, accepted_user_id = ?, updated_at = ?
+                     WHERE id = ? AND status = 'pending'`
+                ).run(now, userId, now, invite.id);
+                if (consumed.changes !== 1) {
+                    throw new Error('Invite state changed during atomic acceptance');
+                }
+                this.onInviteProvisionStep('invite_consumed');
+
+                return {
+                    ok: true as const,
+                    userId,
+                    role: invite.role,
+                    createdUser,
+                };
+            })
+            .immediate();
     }
 
     async consumeInvite(input: {
