@@ -68,6 +68,74 @@ describe('sqlite admin stores', () => {
         expect(value).toBe('true');
     });
 
+    it('prevents removing or demoting the last owner', async () => {
+        const authStore = new SqliteAuthWorkspaceStore();
+        const accessStore = createSqliteWorkspaceAccessStore();
+        const { userId: ownerUserId } = await authStore.getOrCreateUser({
+            provider: 'basic-auth',
+            providerUserId: 'only-owner',
+            email: 'only-owner@example.com',
+        });
+        const { workspaceId } = await authStore.createWorkspace({
+            userId: ownerUserId,
+            name: 'Protected Workspace',
+        });
+
+        await expect(
+            accessStore.setMemberRole({
+                workspaceId,
+                userId: ownerUserId,
+                role: 'viewer',
+            })
+        ).rejects.toThrow(/last workspace owner/i);
+        await expect(
+            accessStore.removeMember({
+                workspaceId,
+                userId: ownerUserId,
+            })
+        ).rejects.toThrow(/last workspace owner/i);
+
+        const members = await accessStore.listMembers({ workspaceId });
+        expect(members).toEqual([
+            expect.objectContaining({
+                userId: ownerUserId,
+                role: 'owner',
+            }),
+        ]);
+    });
+
+    it('transfers primary ownership when the current owner is demoted', async () => {
+        const authStore = new SqliteAuthWorkspaceStore();
+        const accessStore = createSqliteWorkspaceAccessStore();
+        const { userId: ownerUserId } = await authStore.getOrCreateUser({
+            provider: 'basic-auth',
+            providerUserId: 'original-owner',
+            email: 'original-owner@example.com',
+        });
+        const { workspaceId } = await authStore.createWorkspace({
+            userId: ownerUserId,
+            name: 'Transfer Workspace',
+        });
+        await accessStore.upsertMember({
+            workspaceId,
+            emailOrProviderId: 'replacement-owner@example.com',
+            role: 'owner',
+        });
+        const replacement = (
+            await accessStore.listMembers({ workspaceId })
+        ).find((member) => member.email === 'replacement-owner@example.com');
+        expect(replacement).toBeDefined();
+
+        await accessStore.setMemberRole({
+            workspaceId,
+            userId: ownerUserId,
+            role: 'editor',
+        });
+
+        const workspace = await accessStore.getWorkspace({ workspaceId });
+        expect(workspace?.ownerUserId).toBe(replacement?.userId);
+    });
+
     it('grants and revokes deployment admin users', async () => {
         const authStore = new SqliteAuthWorkspaceStore();
         const adminStore = createSqliteAdminUserStore();

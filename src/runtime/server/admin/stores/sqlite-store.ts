@@ -148,6 +148,22 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             }
         }
 
+        const existingMembership = await this.db
+            .selectFrom('workspace_members')
+            .select('role')
+            .where('workspace_id', '=', input.workspaceId)
+            .where('user_id', '=', userId)
+            .executeTakeFirst();
+
+        if (existingMembership) {
+            await this.setMemberRole({
+                workspaceId: input.workspaceId,
+                userId,
+                role: input.role,
+            });
+            return;
+        }
+
         await this.db
             .insertInto('workspace_members')
             .values({
@@ -157,9 +173,6 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
                 role: input.role,
                 created_at: now,
             })
-            .onConflict((oc) =>
-                oc.columns(['workspace_id', 'user_id']).doUpdateSet({ role: input.role })
-            )
             .execute();
     }
 
@@ -168,25 +181,114 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
         userId: string;
         role: Role;
     }) {
-        const result = await this.db
-            .updateTable('workspace_members')
-            .set({ role: input.role })
-            .where('workspace_id', '=', input.workspaceId)
-            .where('user_id', '=', input.userId)
-            .executeTakeFirst();
+        await this.db.transaction().execute(async (tx) => {
+            const member = await tx
+                .selectFrom('workspace_members')
+                .select('role')
+                .where('workspace_id', '=', input.workspaceId)
+                .where('user_id', '=', input.userId)
+                .executeTakeFirst();
+            if (!member) {
+                throw new Error('Workspace member not found');
+            }
 
-        const updated = Number(result.numUpdatedRows ?? 0);
-        if (updated === 0) {
-            throw new Error('Workspace member not found');
-        }
+            if (member.role === 'owner' && input.role !== 'owner') {
+                const owners = await tx
+                    .selectFrom('workspace_members')
+                    .select('user_id')
+                    .where('workspace_id', '=', input.workspaceId)
+                    .where('role', '=', 'owner')
+                    .execute();
+                if (owners.length <= 1) {
+                    throw new Error(
+                        'Cannot demote the last workspace owner. Transfer ownership first.'
+                    );
+                }
+
+                const workspace = await tx
+                    .selectFrom('workspaces')
+                    .select('owner_user_id')
+                    .where('id', '=', input.workspaceId)
+                    .executeTakeFirst();
+                if (workspace?.owner_user_id === input.userId) {
+                    const replacement = owners.find(
+                        (owner) => owner.user_id !== input.userId
+                    );
+                    if (!replacement) {
+                        throw new Error(
+                            'Cannot demote the last workspace owner. Transfer ownership first.'
+                        );
+                    }
+                    await tx
+                        .updateTable('workspaces')
+                        .set({ owner_user_id: replacement.user_id })
+                        .where('id', '=', input.workspaceId)
+                        .execute();
+                }
+            }
+
+            await tx
+                .updateTable('workspace_members')
+                .set({ role: input.role })
+                .where('workspace_id', '=', input.workspaceId)
+                .where('user_id', '=', input.userId)
+                .execute();
+        });
     }
 
     async removeMember(input: { workspaceId: string; userId: string }) {
-        await this.db
-            .deleteFrom('workspace_members')
-            .where('workspace_id', '=', input.workspaceId)
-            .where('user_id', '=', input.userId)
-            .execute();
+        await this.db.transaction().execute(async (tx) => {
+            const member = await tx
+                .selectFrom('workspace_members')
+                .select('role')
+                .where('workspace_id', '=', input.workspaceId)
+                .where('user_id', '=', input.userId)
+                .executeTakeFirst();
+            if (!member) {
+                throw new Error('Workspace member not found');
+            }
+
+            if (member.role === 'owner') {
+                const owners = await tx
+                    .selectFrom('workspace_members')
+                    .select('user_id')
+                    .where('workspace_id', '=', input.workspaceId)
+                    .where('role', '=', 'owner')
+                    .execute();
+                if (owners.length <= 1) {
+                    throw new Error(
+                        'Cannot remove the last workspace owner. Transfer ownership first.'
+                    );
+                }
+
+                const workspace = await tx
+                    .selectFrom('workspaces')
+                    .select('owner_user_id')
+                    .where('id', '=', input.workspaceId)
+                    .executeTakeFirst();
+                if (workspace?.owner_user_id === input.userId) {
+                    const replacement = owners.find(
+                        (owner) => owner.user_id !== input.userId
+                    );
+                    if (!replacement) {
+                        throw new Error(
+                            'Cannot remove the last workspace owner. Transfer ownership first.'
+                        );
+                    }
+                    await tx
+                        .updateTable('workspaces')
+                        .set({ owner_user_id: replacement.user_id })
+                        .where('id', '=', input.workspaceId)
+                        .execute();
+                }
+            }
+
+            await tx
+                .deleteFrom('workspace_members')
+                .where('workspace_id', '=', input.workspaceId)
+                .where('user_id', '=', input.userId)
+                .execute();
+        });
     }
 
     async listWorkspaces(input: {
