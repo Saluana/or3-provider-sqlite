@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-sqlite",
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "SQLite sync and workspace store provider for OR3 Chat — lightweight self-hosted backend via Kysely.",
     "license": "MIT",
     "type": "module",

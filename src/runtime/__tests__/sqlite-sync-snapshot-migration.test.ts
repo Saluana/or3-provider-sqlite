@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { H3Event } from 'h3';
+import type { Kysely } from 'kysely';
 import {
     _resetForTest,
     destroySqliteDb,
@@ -44,11 +45,12 @@ describe('SQLite sync snapshot migration', () => {
 
     it('backfills stable revision IDs for pre-snapshot live rows and tombstones', async () => {
         const db = getSqliteDb({ path: ':memory:' });
-        await m001.up(db as any);
-        await m002.up(db as any);
-        await m003.up(db as any);
-        await m004.up(db as any);
-        await m005.up(db as any);
+        const migrationDb = db as unknown as Kysely<unknown>;
+        await m001.up(migrationDb);
+        await m002.up(migrationDb);
+        await m003.up(migrationDb);
+        await m004.up(migrationDb);
+        await m005.up(db);
 
         const raw = getRawDb();
         raw.prepare(`
@@ -138,7 +140,7 @@ describe('SQLite sync snapshot migration', () => {
             2
         );
 
-        await m006.up(db as any);
+        await m006.up(migrationDb);
 
         expect(
             raw.prepare('SELECT op_id FROM s_threads WHERE workspace_id = ?')
