@@ -7,6 +7,7 @@ import {
     createSqliteWorkspaceAccessStore,
     createSqliteWorkspaceSettingsStore,
 } from '../server/admin/stores/sqlite-store';
+import { verifyAdminStoreProviderContract } from '~~/shared/testing/contracts/admin';
 
 describe('sqlite admin stores', () => {
     beforeEach(async () => {
@@ -17,6 +18,22 @@ describe('sqlite admin stores', () => {
 
     afterEach(async () => {
         await destroySqliteDb();
+    });
+
+    it('implements the complete shared admin provider contract', () => {
+        expect(() => verifyAdminStoreProviderContract({
+            name: 'sqlite',
+            workspaceAccess: createSqliteWorkspaceAccessStore(),
+            workspaceSettings: createSqliteWorkspaceSettingsStore(),
+            adminUsers: createSqliteAdminUserStore(),
+            capabilities: {
+                supportsServerSideAdmin: true,
+                supportsUserSearch: true,
+                supportsWorkspaceList: true,
+                supportsWorkspaceManagement: true,
+                supportsDeploymentAdminGrants: true,
+            },
+        })).not.toThrow();
     });
 
     it('lists and manages workspace membership', async () => {
@@ -66,6 +83,55 @@ describe('sqlite admin stores', () => {
         await settingsStore.set(workspaceId, 'guest_access_enabled', 'true');
         const value = await settingsStore.get(workspaceId, 'guest_access_enabled');
         expect(value).toBe('true');
+
+        await settingsStore.set(workspaceId, 'guest_access_enabled', 'false');
+        expect(await settingsStore.get(workspaceId, 'guest_access_enabled')).toBe('false');
+        expect(await settingsStore.get(workspaceId, 'missing')).toBeNull();
+    });
+
+    it('supports workspace create, soft-delete, restore, search, and member removal', async () => {
+        const authStore = new SqliteAuthWorkspaceStore();
+        const accessStore = createSqliteWorkspaceAccessStore();
+        const { userId } = await authStore.getOrCreateUser({
+            provider: 'basic-auth',
+            providerUserId: 'lifecycle-owner',
+            email: 'lifecycle-owner@example.com',
+        });
+        const { workspaceId } = await accessStore.createWorkspace({
+            name: 'Lifecycle Contract',
+            description: 'contract sentinel',
+            ownerUserId: userId,
+        });
+        await accessStore.upsertMember({
+            workspaceId,
+            emailOrProviderId: 'temporary@example.com',
+            role: 'viewer',
+        });
+        const temporary = (await accessStore.listMembers({ workspaceId }))
+            .find((member) => member.email === 'temporary@example.com');
+        expect(temporary).toBeDefined();
+
+        await accessStore.setMemberRole({
+            workspaceId,
+            userId: temporary!.userId,
+            role: 'editor',
+        });
+        expect(await accessStore.searchUsers({ query: 'temporary', limit: 5 }))
+            .toEqual([expect.objectContaining({ userId: temporary!.userId })]);
+        await accessStore.removeMember({ workspaceId, userId: temporary!.userId });
+        expect(await accessStore.listMembers({ workspaceId }))
+            .not.toEqual(expect.arrayContaining([expect.objectContaining({ userId: temporary!.userId })]));
+
+        await accessStore.softDeleteWorkspace({ workspaceId, deletedAt: 1234 });
+        expect(await accessStore.getWorkspace({ workspaceId }))
+            .toMatchObject({ deleted: true, deletedAt: 1234 });
+        expect((await accessStore.listWorkspaces({
+            page: 1, perPage: 20, includeDeleted: false,
+        })).items).toEqual([]);
+
+        await accessStore.restoreWorkspace({ workspaceId });
+        expect(await accessStore.getWorkspace({ workspaceId }))
+            .toMatchObject({ deleted: false });
     });
 
     it('prevents removing or demoting the last owner', async () => {
@@ -147,11 +213,13 @@ describe('sqlite admin stores', () => {
         });
 
         await adminStore.grantAdmin({ userId });
+        await adminStore.grantAdmin({ userId });
         expect(await adminStore.isAdmin({ userId })).toBe(true);
 
         const admins = await adminStore.listAdmins();
         expect(admins.some((admin) => admin.userId === userId)).toBe(true);
 
+        await adminStore.revokeAdmin({ userId });
         await adminStore.revokeAdmin({ userId });
         expect(await adminStore.isAdmin({ userId })).toBe(false);
     });
