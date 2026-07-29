@@ -9,6 +9,7 @@ import { registerProviderAdminAdapter } from '~~/server/admin/providers/registry
 import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
+import { registerConnectStore } from '~~/server/connect/store/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
 import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
 import { createSqliteWebhookStore } from '../webhooks/sqlite-webhook-store';
@@ -18,6 +19,7 @@ import {
     createSqliteWorkspaceSettingsStore,
 } from '../admin/stores/sqlite-store';
 import { sqliteSyncAdminAdapter } from '../admin/adapters/sync-sqlite';
+import { createSqliteConnectStore } from '../connect/sqlite-connect-store';
 import { getSqliteDb } from '../db/kysely';
 import { runMigrations } from '../db/migrate';
 import { useRuntimeConfig } from '#imports';
@@ -26,13 +28,19 @@ const SQLITE_PROVIDER_ID = 'sqlite';
 type RuntimeConfigWithSync = {
     auth?: { enabled?: boolean };
     sync?: { enabled?: boolean; provider?: string };
+    connect?: { enabled?: boolean; provider?: string };
 };
 
 export default defineNitroPlugin(async () => {
     const config = useRuntimeConfig() as RuntimeConfigWithSync;
     if (!config.auth?.enabled) return;
-    if (!config.sync?.enabled) return;
-    if (config.sync?.provider !== SQLITE_PROVIDER_ID) return;
+    const syncSelected =
+        config.sync?.enabled === true &&
+        config.sync?.provider === SQLITE_PROVIDER_ID;
+    const connectSelected =
+        config.connect?.enabled === true &&
+        config.connect?.provider === SQLITE_PROVIDER_ID;
+    if (!syncSelected && !connectSelected) return;
 
     // Initialize DB and run migrations
     const db = getSqliteDb();
@@ -44,11 +52,21 @@ export default defineNitroPlugin(async () => {
         create: createSqliteAuthWorkspaceStore,
     });
 
-    registerSyncGatewayAdapter({
-        id: SQLITE_PROVIDER_ID,
-        order: 100,
-        create: createSqliteSyncGatewayAdapter,
-    });
+    if (syncSelected) {
+        registerSyncGatewayAdapter({
+            id: SQLITE_PROVIDER_ID,
+            order: 100,
+            create: createSqliteSyncGatewayAdapter,
+        });
+    }
+
+    if (connectSelected) {
+        registerConnectStore({
+            id: SQLITE_PROVIDER_ID,
+            order: 100,
+            create: createSqliteConnectStore,
+        });
+    }
 
     registerWebhookStore({
         id: SQLITE_PROVIDER_ID,

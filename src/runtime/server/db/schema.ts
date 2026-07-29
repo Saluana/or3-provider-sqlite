@@ -156,6 +156,44 @@ export interface UploadIntentsTable {
 
 // ─── Database Interface ───
 
+export interface ConnectDeviceAuthorizationsTable {
+    id: string;
+    device_code_hash: string;
+    user_code_hash: string;
+    user_code_display: string;
+    status: 'pending' | 'approved' | 'denied' | 'consumed' | 'expired';
+    host_json: string;
+    approved_user_id: string | null;
+    approved_workspace_id: string | null;
+    environment_id: string | null;
+    credential_ciphertext: string | null;
+    expires_at: number;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface ConnectEnvironmentsTable {
+    id: string;
+    user_id: string;
+    workspace_id: string;
+    name: string;
+    platform: string;
+    architecture: string;
+    host_id: string | null;
+    signing_public_key: string | null;
+    noise_public_key: string | null;
+    hostname: string;
+    tunnel_id: string;
+    dns_record_id: string;
+    control_token_hash: string;
+    access_credential_ciphertext: string;
+    status: 'active' | 'revoked' | 'error';
+    last_seen_at: number | null;
+    created_at: number;
+    updated_at: number;
+    revoked_at: number | null;
+}
+
 export interface AdminUsersTable {
     user_id: string;
     created_at: number;
@@ -183,6 +221,8 @@ export interface Or3SqliteDb {
     sync_snapshots: SyncSnapshotsTable;
     sync_snapshot_items: SyncSnapshotItemsTable;
     upload_intents: UploadIntentsTable;
+    connect_device_authorizations: ConnectDeviceAuthorizationsTable;
+    connect_environments: ConnectEnvironmentsTable;
     // Synced entity tables
     s_threads: SyncedEntityTable;
     s_messages: SyncedEntityTable;

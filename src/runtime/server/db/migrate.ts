@@ -12,6 +12,7 @@ import * as m005 from './migrations/005_admin_stores';
 import * as m006 from './migrations/006_sync_snapshots';
 import * as m007 from './migrations/007_device_cursor_ownership';
 import * as m008 from './migrations/008_upload_intents';
+import * as m009 from './migrations/009_or3_connect';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -35,6 +36,8 @@ const REQUIRED_SCHEMA_TABLES = [
     'sync_snapshots',
     'sync_snapshot_items',
     'upload_intents',
+    'connect_device_authorizations',
+    'connect_environments',
 ] as const;
 
 const migrations: Record<string, Migration> = {
@@ -46,6 +49,7 @@ const migrations: Record<string, Migration> = {
     '006_sync_snapshots': m006,
     '007_device_cursor_ownership': m007,
     '008_upload_intents': m008,
+    '009_or3_connect': m009,
 };
 
 class StaticMigrationProvider implements MigrationProvider {
