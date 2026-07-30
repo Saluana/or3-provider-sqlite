@@ -7,15 +7,19 @@ export async function up(db: Kysely<unknown>): Promise<void> {
             id TEXT PRIMARY KEY,
             device_code_hash TEXT NOT NULL UNIQUE,
             user_code_hash TEXT NOT NULL,
-            user_code_display TEXT NOT NULL,
             status TEXT NOT NULL CHECK (
-                status IN ('pending', 'approved', 'denied', 'consumed', 'expired')
+                status IN (
+                    'pending', 'provisioning', 'approved', 'delivering',
+                    'denied', 'consumed', 'expired'
+                )
             ),
             host_json TEXT NOT NULL,
             approved_user_id TEXT,
             approved_workspace_id TEXT,
             environment_id TEXT,
             credential_ciphertext TEXT,
+            credential_delivery_started_at INTEGER,
+            credential_redeliver_until INTEGER,
             expires_at INTEGER NOT NULL,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
@@ -29,6 +33,10 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         CREATE INDEX connect_authorizations_user_code
         ON connect_device_authorizations(user_code_hash, created_at)
     `.execute(db);
+    await sql`
+        CREATE INDEX connect_authorizations_environment
+        ON connect_device_authorizations(environment_id)
+    `.execute(db);
 
     await sql`
         CREATE TABLE connect_environments (
@@ -41,12 +49,24 @@ export async function up(db: Kysely<unknown>): Promise<void> {
             host_id TEXT,
             signing_public_key TEXT,
             noise_public_key TEXT,
+            authorization_id TEXT,
             hostname TEXT NOT NULL,
             tunnel_id TEXT NOT NULL,
             dns_record_id TEXT NOT NULL,
             control_token_hash TEXT NOT NULL UNIQUE,
             access_credential_ciphertext TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'error')),
+            tunnel_secret_ciphertext TEXT,
+            status TEXT NOT NULL CHECK (
+                status IN (
+                    'provisioning', 'active', 'revoking', 'revoked', 'error'
+                )
+            ),
+            lifecycle_attempts INTEGER NOT NULL DEFAULT 0,
+            lifecycle_next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            lifecycle_claim_token TEXT,
+            lifecycle_claimed_until INTEGER,
+            provisioning_deadline_at INTEGER,
+            lifecycle_error TEXT,
             last_seen_at INTEGER,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -60,6 +80,12 @@ export async function up(db: Kysely<unknown>): Promise<void> {
     await sql`
         CREATE INDEX connect_environments_workspace_status
         ON connect_environments(workspace_id, status, updated_at)
+    `.execute(db);
+    await sql`
+        CREATE INDEX connect_environments_lifecycle_due
+        ON connect_environments(
+            status, lifecycle_next_attempt_at, lifecycle_claimed_until
+        )
     `.execute(db);
 }
 

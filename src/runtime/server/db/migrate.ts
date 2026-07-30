@@ -13,6 +13,12 @@ import * as m006 from './migrations/006_sync_snapshots';
 import * as m007 from './migrations/007_device_cursor_ownership';
 import * as m008 from './migrations/008_upload_intents';
 import * as m009 from './migrations/009_or3_connect';
+import * as m010 from './migrations/010_connect_user_code_hmac';
+import * as m011 from './migrations/011_connect_environment_scope_indexes';
+import * as m012 from './migrations/012_connect_credential_redelivery';
+import * as m013 from './migrations/013_connect_environment_lifecycle';
+import * as m014 from './migrations/014_connect_retention_activation';
+import * as m015 from './migrations/015_rate_limits';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -38,6 +44,7 @@ const REQUIRED_SCHEMA_TABLES = [
     'upload_intents',
     'connect_device_authorizations',
     'connect_environments',
+    'rate_limits',
 ] as const;
 
 const migrations: Record<string, Migration> = {
@@ -50,6 +57,12 @@ const migrations: Record<string, Migration> = {
     '007_device_cursor_ownership': m007,
     '008_upload_intents': m008,
     '009_or3_connect': m009,
+    '010_connect_user_code_hmac': m010,
+    '011_connect_environment_scope_indexes': m011,
+    '012_connect_credential_redelivery': m012,
+    '013_connect_environment_lifecycle': m013,
+    '014_connect_retention_activation': m014,
+    '015_rate_limits': m015,
 };
 
 class StaticMigrationProvider implements MigrationProvider {

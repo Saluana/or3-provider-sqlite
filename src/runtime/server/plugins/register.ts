@@ -10,6 +10,7 @@ import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { registerConnectStore } from '~~/server/connect/store/registry';
+import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
 import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
 import { createSqliteWebhookStore } from '../webhooks/sqlite-webhook-store';
@@ -22,6 +23,7 @@ import { sqliteSyncAdminAdapter } from '../admin/adapters/sync-sqlite';
 import { createSqliteConnectStore } from '../connect/sqlite-connect-store';
 import { getSqliteDb } from '../db/kysely';
 import { runMigrations } from '../db/migrate';
+import { sqliteRateLimitProvider } from '../rate-limit/sqlite-provider';
 import { useRuntimeConfig } from '#imports';
 
 const SQLITE_PROVIDER_ID = 'sqlite';
@@ -42,15 +44,15 @@ export default defineNitroPlugin(async () => {
         config.connect?.provider === SQLITE_PROVIDER_ID;
     if (!syncSelected && !connectSelected) return;
 
-    // Initialize DB and run migrations
+    // Initialize the DB before publishing provider factories.
     const db = getSqliteDb();
-    await runMigrations(db);
 
     registerAuthWorkspaceStore({
         id: SQLITE_PROVIDER_ID,
         order: 100,
         create: createSqliteAuthWorkspaceStore,
     });
+    registerRateLimitProvider(SQLITE_PROVIDER_ID, sqliteRateLimitProvider);
 
     if (syncSelected) {
         registerSyncGatewayAdapter({
@@ -89,4 +91,8 @@ export default defineNitroPlugin(async () => {
     });
 
     registerProviderAdminAdapter(sqliteSyncAdminAdapter);
+
+    // Nitro 2 invokes plugins synchronously, so registration must happen before
+    // the first await for strict provider validation to observe this provider.
+    await runMigrations(db);
 });
