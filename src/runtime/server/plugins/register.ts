@@ -4,6 +4,7 @@
  * Runs migrations on first load, then registers both adapters.
  * Skips registration when auth/sync are disabled or active sync provider is not sqlite.
  */
+import { defineNitroPlugin } from 'nitropack/runtime/plugin';
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
 import { registerProviderAdminAdapter } from '~~/server/admin/providers/registry';
 import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';

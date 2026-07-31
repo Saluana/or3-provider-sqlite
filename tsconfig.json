@@ -13,7 +13,7 @@
         "noUncheckedIndexedAccess": true,
         "types": ["node"],
         "paths": {
-            "h3": ["../or3-chat/node_modules/h3"],
+            "h3": ["./node_modules/h3"],
             "~~/*": ["../or3-chat/*"],
             "~~": ["../or3-chat"],
             "~/*": ["../or3-chat/app/*"],
