@@ -6,6 +6,7 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 
 - **AuthWorkspaceStore** (`sqlite`) — user identity mapping, workspace CRUD, role resolution
 - **SyncGatewayAdapter** (`sqlite`) — push/pull sync, consistent materialized snapshot pages, LWW conflict resolution, and cursor tracking
+- **ConnectStore** (`sqlite`) — durable, atomic device enrollment and connected-computer records for OR3 Connect
 
 ## Install
 
@@ -39,6 +40,15 @@ OR3_SQLITE_PRAGMA_JOURNAL_MODE=WAL
 OR3_SQLITE_PRAGMA_SYNCHRONOUS=NORMAL
 ```
 
+OR3 Connect uses this same database by default:
+
+```bash
+OR3_CONNECT_ENABLED=true
+OR3_CONNECT_PROVIDER=sqlite
+```
+
+No Convex deployment or second database is required.
+
 ## How it works
 
 ### Registration
@@ -48,7 +58,8 @@ On server startup, the Nitro plugin:
 1. Initializes the SQLite database (creates file if needed)
 2. Runs schema migrations automatically
 3. Registers `AuthWorkspaceStore` with ID `sqlite`
-4. Registers `SyncGatewayAdapter` with ID `sqlite`
+4. Registers `SyncGatewayAdapter` when SQLite sync is selected
+5. Registers `ConnectStore` when SQLite Connect persistence is selected
 
 Registration is skipped when `auth.enabled` is `false` (local-only mode).
 
@@ -60,6 +71,7 @@ Ordered migrations create and evolve all tables:
 - **002_sync_tables**: `server_version_counter`, `change_log`, `device_cursors`, `tombstones`, plus materialized entity tables (`s_threads`, `s_messages`, etc.)
 - **003–005**: workspace-scoped sync keys, invitations, and admin stores
 - **006_sync_snapshots**: winning operation IDs plus immutable snapshot headers/items
+- **009_or3_connect**: single-use device authorizations and connected computers
 
 All tables use snake_case aligned with the sync wire format.
 
@@ -103,6 +115,7 @@ bun run build       # build for distribution
 
 - Works with multiple auth providers (`basic-auth`, `clerk`, or custom)
 - Replaces `or3-provider-convex` for sync + workspace store functionality
+- Provides OR3 Connect persistence without Convex
 - Does NOT provide storage — pair with `or3-provider-fs` for file storage
 
 ### Known differences vs Convex

@@ -156,6 +156,73 @@ export interface UploadIntentsTable {
 
 // ─── Database Interface ───
 
+export interface ConnectDeviceAuthorizationsTable {
+    id: string;
+    device_code_hash: string;
+    user_code_hash: string;
+    status:
+        | 'pending'
+        | 'provisioning'
+        | 'approved'
+        | 'delivering'
+        | 'denied'
+        | 'consumed'
+        | 'expired';
+    host_json: string;
+    approved_user_id: string | null;
+    approved_workspace_id: string | null;
+    environment_id: string | null;
+    credential_ciphertext: string | null;
+    credential_delivery_started_at: number | null;
+    credential_redeliver_until: number | null;
+    expires_at: number;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface ConnectEnvironmentsTable {
+    id: string;
+    user_id: string;
+    workspace_id: string;
+    name: string;
+    platform: string;
+    architecture: string;
+    host_id: string | null;
+    signing_public_key: string | null;
+    noise_public_key: string | null;
+    authorization_id: string | null;
+    hostname: string;
+    tunnel_id: string;
+    dns_record_id: string;
+    control_token_hash: string;
+    access_credential_ciphertext: string;
+    tunnel_secret_ciphertext: string | null;
+    driver: 'intern' | 'runs' | null;
+    runtime: 'intern' | 'openclaw' | 'hermes' | null;
+    base_path: '/' | '/or3/' | null;
+    status: 'provisioning' | 'active' | 'revoking' | 'revoked' | 'error';
+    lifecycle_attempts: number;
+    lifecycle_next_attempt_at: number;
+    lifecycle_claim_token: string | null;
+    lifecycle_claimed_until: number | null;
+    provisioning_deadline_at: number | null;
+    activation_deadline_at: number | null;
+    activation_claimed_at: number | null;
+    relay_authenticator: string | null;
+    lifecycle_error: string | null;
+    last_seen_at: number | null;
+    created_at: number;
+    updated_at: number;
+    revoked_at: number | null;
+}
+
+export interface RateLimitsTable {
+    key: string;
+    count: number;
+    window_started_at: number;
+    expires_at: number;
+}
+
 export interface AdminUsersTable {
     user_id: string;
     created_at: number;
@@ -183,6 +250,9 @@ export interface Or3SqliteDb {
     sync_snapshots: SyncSnapshotsTable;
     sync_snapshot_items: SyncSnapshotItemsTable;
     upload_intents: UploadIntentsTable;
+    connect_device_authorizations: ConnectDeviceAuthorizationsTable;
+    connect_environments: ConnectEnvironmentsTable;
+    rate_limits: RateLimitsTable;
     // Synced entity tables
     s_threads: SyncedEntityTable;
     s_messages: SyncedEntityTable;
