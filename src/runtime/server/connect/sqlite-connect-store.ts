@@ -48,6 +48,9 @@ interface EnvironmentRow {
     name: string;
     platform: string;
     architecture: string;
+    driver: 'intern' | 'runs' | null;
+    runtime: 'intern' | 'openclaw' | 'hermes' | null;
+    base_path: '/' | '/or3/' | null;
     host_id: string | null;
     signing_public_key: string | null;
     noise_public_key: string | null;
@@ -71,7 +74,8 @@ interface EnvironmentRow {
 }
 
 const ENVIRONMENT_COLUMNS = `
-    id, user_id, workspace_id, name, platform, architecture, host_id,
+    id, user_id, workspace_id, name, platform, architecture, driver, runtime,
+    base_path, host_id,
     signing_public_key, noise_public_key, authorization_id, hostname,
     tunnel_id, dns_record_id, control_token_hash, access_credential_ciphertext,
     tunnel_secret_ciphertext, status, lifecycle_attempts,
@@ -315,10 +319,14 @@ class SqliteConnectStore implements ConnectStore {
             db.prepare(
                 `INSERT INTO connect_environments (
                     id, user_id, workspace_id, name, platform, architecture,
+                    driver, runtime, base_path,
                     host_id, signing_public_key, noise_public_key, hostname,
                     tunnel_id, dns_record_id, control_token_hash,
                     access_credential_ciphertext, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'active', ?, ?
+                )`
             ).run(
                 environment.id,
                 input.userId,
@@ -326,6 +334,9 @@ class SqliteConnectStore implements ConnectStore {
                 environment.name,
                 environment.platform,
                 environment.architecture,
+                environment.driver ?? null,
+                environment.runtime ?? null,
+                environment.base_path ?? null,
                 environment.host_id ?? null,
                 environment.signing_public_key ?? null,
                 environment.noise_public_key ?? null,
@@ -429,6 +440,7 @@ class SqliteConnectStore implements ConnectStore {
             db.prepare(
                 `INSERT INTO connect_environments (
                     id, user_id, workspace_id, name, platform, architecture,
+                    driver, runtime, base_path,
                     host_id, signing_public_key, noise_public_key,
                     authorization_id, hostname, tunnel_id, dns_record_id,
                     control_token_hash, access_credential_ciphertext,
@@ -438,7 +450,7 @@ class SqliteConnectStore implements ConnectStore {
                     activation_deadline_at, activation_claimed_at,
                     created_at, updated_at
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, ?,
                     'provisioning', 0, ?, ?, ?, ?, ?, NULL, ?, ?
                 )`
             ).run(
@@ -448,6 +460,9 @@ class SqliteConnectStore implements ConnectStore {
                 environment.name,
                 environment.platform,
                 environment.architecture,
+                environment.driver ?? null,
+                environment.runtime ?? null,
+                environment.base_path ?? null,
                 environment.host_id ?? null,
                 environment.signing_public_key ?? null,
                 environment.noise_public_key ?? null,
@@ -1123,6 +1138,9 @@ function toEnvironmentRecord(row: EnvironmentRow): ConnectEnvironmentRecord {
         name: row.name,
         platform: row.platform,
         architecture: row.architecture,
+        driver: row.driver ?? undefined,
+        runtime: row.runtime ?? undefined,
+        base_path: row.base_path ?? undefined,
         host_id: row.host_id ?? undefined,
         signing_public_key: row.signing_public_key ?? undefined,
         noise_public_key: row.noise_public_key ?? undefined,

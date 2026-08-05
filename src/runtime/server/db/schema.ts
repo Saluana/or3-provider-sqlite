@@ -197,6 +197,9 @@ export interface ConnectEnvironmentsTable {
     control_token_hash: string;
     access_credential_ciphertext: string;
     tunnel_secret_ciphertext: string | null;
+    driver: 'intern' | 'runs' | null;
+    runtime: 'intern' | 'openclaw' | 'hermes' | null;
+    base_path: '/' | '/or3/' | null;
     status: 'provisioning' | 'active' | 'revoking' | 'revoked' | 'error';
     lifecycle_attempts: number;
     lifecycle_next_attempt_at: number;

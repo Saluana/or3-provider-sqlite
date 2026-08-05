@@ -19,6 +19,7 @@ import {
     up as addEnvironmentLifecycle,
 } from '../server/db/migrations/013_connect_environment_lifecycle';
 import { up as addConnectRetention } from '../server/db/migrations/014_connect_retention_activation';
+import { up as addRuntimeBinding } from '../server/db/migrations/016_connect_runtime_binding';
 import { createSqliteConnectStore } from '../server/connect/sqlite-connect-store';
 
 const now = 1_800_000_000_000;
@@ -119,6 +120,46 @@ describe('SQLite Connect store', () => {
             )
         ).toBe(true);
         expect(await store.listEnvironments(scope)).toEqual([]);
+    });
+
+    it('round-trips the external runtime binding on an active environment', async () => {
+        const store = createSqliteConnectStore();
+        await store.createAuthorization({
+            deviceCodeHash: 'runtime-binding-device',
+            userCodeHash: 'runtime-binding-code',
+            host: {
+                ...host(),
+                runtime: 'openclaw',
+                runtime_version: '2026.7.1-2',
+                driver: 'runs',
+                base_path: '/or3/',
+            },
+            expiresAt: now + 60_000,
+            now,
+        });
+        const request = await store.getAuthorizationByUserHash(
+            'runtime-binding-code',
+            now
+        );
+        await store.approveAuthorization({
+            ...approval(request!._id, 'runtime-binding-environment'),
+            environment: {
+                ...approval(request!._id, 'runtime-binding-environment')
+                    .environment,
+                runtime: 'openclaw',
+                driver: 'runs',
+                base_path: '/or3/',
+            },
+        });
+
+        expect(await store.listEnvironments(scope)).toMatchObject([
+            {
+                id: 'runtime-binding-environment',
+                runtime: 'openclaw',
+                driver: 'runs',
+                base_path: '/or3/',
+            },
+        ]);
     });
 
     it('enforces the active environment limit atomically', async () => {
@@ -808,6 +849,7 @@ describe('SQLite Connect store', () => {
         await removeEnvironmentLifecycle(migrationDb);
         await addEnvironmentLifecycle(migrationDb);
         await addConnectRetention(migrationDb);
+        await addRuntimeBinding(migrationDb);
 
         const tables = await db.introspection.getTables();
         const environmentTable = tables.find(
