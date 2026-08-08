@@ -1,9 +1,9 @@
 /**
  * SQLite implementation of SyncGatewayAdapter.
  *
- * Handles push/pull/updateCursor/gc using Kysely + better-sqlite3.
- * Uses raw DB transactions via better-sqlite3 for push atomicity
- * (BEGIN IMMEDIATE prevents concurrent server_version races).
+ * Handles push/pull/updateCursor/gc using the selected native SQLite runtime.
+ * Local runtimes use raw BEGIN IMMEDIATE transactions; Cloudflare D1 uses
+ * native atomic batches for its asynchronous binding.
  */
 import type { H3Event } from 'h3';
 import { canRunSyncHistoryGc } from './history-gc-policy';
@@ -35,8 +35,8 @@ import type {
     SnapshotResponse,
     SyncChange,
 } from '~~/shared/sync/types';
-import { randomUUID } from 'node:crypto';
-import { getSqliteDb, getRawDb } from '../db/kysely';
+import { getSqliteDb, getRawDb, isD1Driver } from '../db/kysely';
+import { d1All, d1Batch, d1Run, type D1SqlStatement } from '../db/d1';
 import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 
@@ -94,7 +94,7 @@ type CanonicalStorageCursor = {
 };
 
 function uid(): string {
-    return randomUUID();
+    return globalThis.crypto.randomUUID();
 }
 
 function nowEpoch(): number {
@@ -491,6 +491,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             throw createError({ statusCode: 400, statusMessage: 'Invalid workspace quota' });
         }
         const hash = normalizeStorageHash(input.hash);
+        if (isD1Driver()) {
+            return this.reserveUploadIntentInD1(input, hash);
+        }
         const raw = getRawDb();
         raw.transaction(() => {
             const now = nowEpoch();
@@ -533,6 +536,27 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async consumeUploadIntent(event: H3Event, input: UploadIntentConsumptionRequest): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.workspaceId);
+        if (isD1Driver()) {
+            const now = nowEpoch();
+            const result = await d1Run(
+                `UPDATE upload_intents
+                 SET status = 'consumed', storage_id = ?, consumed_at = ?
+                 WHERE id = ? AND workspace_id = ? AND status = 'active' AND expires_at > ?
+                   AND hash = ? AND mime_type = ? AND size_bytes = ?`,
+                input.storageId,
+                now,
+                input.intentId,
+                input.workspaceId,
+                now,
+                normalizeStorageHash(input.hash),
+                input.mimeType,
+                input.sizeBytes
+            );
+            if ((result.meta?.changes ?? 0) !== 1) {
+                throw createError({ statusCode: 409, statusMessage: 'Upload intent expired, mismatched, or already consumed' });
+            }
+            return;
+        }
         const raw = getRawDb();
         const result = raw.prepare(`UPDATE upload_intents
             SET status = 'consumed', storage_id = ?, consumed_at = ?
@@ -550,6 +574,19 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         input: { workspaceId: string; intentId: string }
     ): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.workspaceId);
+        if (isD1Driver()) {
+            const result = await d1Run(
+                `UPDATE upload_intents SET status = 'cancelled', cancelled_at = ?
+                 WHERE id = ? AND workspace_id = ? AND status = 'active'`,
+                nowEpoch(),
+                input.intentId,
+                input.workspaceId
+            );
+            if ((result.meta?.changes ?? 0) !== 1) {
+                throw createError({ statusCode: 409, statusMessage: 'Upload intent is not active' });
+            }
+            return;
+        }
         const result = getRawDb().prepare(`UPDATE upload_intents
             SET status = 'cancelled', cancelled_at = ?
             WHERE id = ? AND workspace_id = ? AND status = 'active'`)
@@ -572,21 +609,24 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             throw createError({ statusCode: 400, statusMessage: 'Invalid storage hash' });
         }
         const after = decodeCanonicalStorageCursor(input.cursor, input.kind, hash);
-        const raw = getRawDb();
+        const raw = isD1Driver() ? null : getRawDb();
+        const all = async <T>(sql: string, ...parameters: unknown[]): Promise<T[]> =>
+            raw
+                ? raw.prepare(sql).all(...parameters) as T[]
+                : d1All<T>(sql, ...parameters);
 
         if (input.kind === 'active_reservations') {
             if (after.length > 1) {
                 throw createError({ statusCode: 400, statusMessage: 'Invalid canonical storage cursor' });
             }
             const now = input.now ?? nowEpoch();
-            const rows = raw.prepare(`SELECT id, hash, reserved_bytes, expires_at
+            const rows = await all<{
+                id: string; hash: string; reserved_bytes: number; expires_at: number;
+            }>(`SELECT id, hash, reserved_bytes, expires_at
                 FROM upload_intents
                 WHERE workspace_id = ? AND status = 'active' AND expires_at > ?
                   AND id > ? AND reserved_bytes > 0 AND (? IS NULL OR hash = ?)
-                ORDER BY id ASC LIMIT ?`)
-                .all(workspaceId, now, after[0] ?? '', hash ?? null, hash ?? null, limit + 1) as Array<{
-                    id: string; hash: string; reserved_bytes: number; expires_at: number;
-                }>;
+                ORDER BY id ASC LIMIT ?`, workspaceId, now, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
             const hasMore = rows.length > limit;
             const page = hasMore ? rows.slice(0, limit) : rows;
             const last = page[page.length - 1];
@@ -609,7 +649,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (after.length > 1) {
                 throw createError({ statusCode: 400, statusMessage: 'Invalid canonical storage cursor' });
             }
-            const rows = raw.prepare(`
+            const rows = await all<{
+                id: string;
+                data_json: string;
+                updated_at: number;
+            }>(`
                 SELECT id, data_json, updated_at
                 FROM s_file_meta
                 WHERE workspace_id = ?
@@ -624,11 +668,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   ) = ?)
                 ORDER BY id ASC
                 LIMIT ?
-            `).all(workspaceId, after[0] ?? '', hash ?? null, hash ?? null, limit + 1) as Array<{
-                id: string;
-                data_json: string;
-                updated_at: number;
-            }>;
+            `, workspaceId, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
 
             const hasMore = rows.length > limit;
             const page = hasMore ? rows.slice(0, limit) : rows;
@@ -673,7 +713,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             throw createError({ statusCode: 400, statusMessage: 'Invalid canonical storage cursor' });
         }
         const [afterTable = '', afterId = '', afterHash = ''] = after;
-        const rows = raw.prepare(`
+        const rows = await all<{
+            source_table: 'messages' | 'posts';
+            source_id: string;
+            raw_hash: string;
+            normalized_hash: string;
+        }>(`
             WITH reference_edges(source_table, source_id, raw_hash) AS (
                 SELECT 'messages', row.id, CAST(edge.value AS TEXT)
                 FROM s_messages AS row
@@ -717,7 +762,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
               )
             ORDER BY source_table ASC, source_id ASC, raw_hash ASC
             LIMIT ?
-        `).all(
+        `,
             workspaceId,
             workspaceId,
             hash ?? null,
@@ -729,12 +774,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             afterId,
             afterHash,
             limit + 1
-        ) as Array<{
-            source_table: 'messages' | 'posts';
-            source_id: string;
-            raw_hash: string;
-            normalized_hash: string;
-        }>;
+        );
 
         const hasMore = rows.length > limit;
         const page = hasMore ? rows.slice(0, limit) : rows;
@@ -812,6 +852,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             }
             uniqueOps.push(group.op);
             indicesByOpId.set(group.op.stamp.opId, group.indices);
+        }
+
+        if (isD1Driver()) {
+            return this.pushInD1({
+                event,
+                workspaceId,
+                uniqueOps,
+                resultSlots,
+                indicesByOpId,
+            });
         }
 
         // Use raw better-sqlite3 transaction for BEGIN IMMEDIATE semantics
@@ -1187,6 +1237,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const workspaceId = input.scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
         const pageSize = resolveSnapshotPageSize(input.pageSize);
+        if (isD1Driver()) {
+            return this.snapshotInD1(workspaceId, input, pageSize);
+        }
         const raw = getRawDb();
         const now = nowEpoch();
 
@@ -1455,7 +1508,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         input: { scope: { workspaceId: string }; deviceId: string; version: number }
     ): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
-        const raw = getRawDb();
         const now = nowEpoch();
         const deviceId = input.deviceId.trim();
         if (!deviceId || deviceId.length > 256) {
@@ -1469,6 +1521,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (!ownerUserId) {
             throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
         }
+        if (isD1Driver()) {
+            return this.updateCursorInD1(input.scope.workspaceId, deviceId, input.version, ownerUserId, now);
+        }
+        const raw = getRawDb();
         const update = raw.transaction(() => {
             const counter = raw.prepare(
                 'SELECT value FROM server_version_counter WHERE workspace_id = ?'
@@ -1517,6 +1573,38 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         if (!canRunSyncHistoryGc()) return;
         const cutoff = nowEpoch() - input.retentionSeconds;
+        if (isD1Driver()) {
+            await d1Batch([
+                {
+                    sql: `DELETE FROM device_cursors
+                     WHERE workspace_id = ? AND updated_at < ?`,
+                    parameters: [input.scope.workspaceId, cutoff],
+                },
+                {
+                    sql: `DELETE FROM tombstones
+                     WHERE workspace_id = ?
+                       AND created_at < ?
+                       AND (
+                           NOT EXISTS (
+                               SELECT 1 FROM device_cursors
+                               WHERE workspace_id = ?
+                           )
+                           OR server_version <= (
+                               SELECT MIN(last_seen_version)
+                               FROM device_cursors
+                               WHERE workspace_id = ?
+                           )
+                       )`,
+                    parameters: [
+                        input.scope.workspaceId,
+                        cutoff,
+                        input.scope.workspaceId,
+                        input.scope.workspaceId,
+                    ],
+                },
+            ]);
+            return;
+        }
         const raw = getRawDb();
         raw.transaction(() => {
             // A cursor that has not checked in for the entire retention window
@@ -1556,6 +1644,38 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         if (!canRunSyncHistoryGc()) return;
         const cutoff = nowEpoch() - input.retentionSeconds;
+        if (isD1Driver()) {
+            await d1Batch([
+                {
+                    sql: `DELETE FROM device_cursors
+                     WHERE workspace_id = ? AND updated_at < ?`,
+                    parameters: [input.scope.workspaceId, cutoff],
+                },
+                {
+                    sql: `DELETE FROM change_log
+                     WHERE workspace_id = ?
+                       AND created_at < ?
+                       AND (
+                           NOT EXISTS (
+                               SELECT 1 FROM device_cursors
+                               WHERE workspace_id = ?
+                           )
+                           OR server_version <= (
+                               SELECT MIN(last_seen_version)
+                               FROM device_cursors
+                               WHERE workspace_id = ?
+                           )
+                       )`,
+                    parameters: [
+                        input.scope.workspaceId,
+                        cutoff,
+                        input.scope.workspaceId,
+                        input.scope.workspaceId,
+                    ],
+                },
+            ]);
+            return;
+        }
         const raw = getRawDb();
         raw.transaction(() => {
             // See gcTombstones: inactive devices are snapshot-bootstrapped, so
@@ -1582,7 +1702,658 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         })();
     }
 
+    private async reserveUploadIntentInD1(
+        input: UploadIntentReservationRequest,
+        hash: string
+    ): Promise<void> {
+        const now = nowEpoch();
+        const liveRows = await d1All<{ id: string; data_json: string }>(
+            `SELECT id, data_json FROM s_file_meta
+             WHERE workspace_id = ? AND deleted = 0`,
+            input.workspaceId
+        );
+        let usedBytes = 0;
+        let alreadyStored = false;
+        for (const row of liveRows) {
+            const payload = JSON.parse(row.data_json) as Record<string, unknown>;
+            const size = payload.size_bytes ?? payload.sizeBytes;
+            if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+                throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
+            }
+            usedBytes += size;
+            if (normalizeStorageHash(row.id) === hash) alreadyStored = true;
+        }
+        const [totals] = await d1All<{
+            reserved_bytes: number;
+            same_hash: number | null;
+        }>(
+            `SELECT COALESCE(SUM(reserved_bytes), 0) AS reserved_bytes,
+                    MAX(CASE WHEN hash = ? AND reserved_bytes > 0 THEN 1 ELSE 0 END) AS same_hash
+             FROM upload_intents
+             WHERE workspace_id = ? AND status = 'active' AND expires_at > ?`,
+            hash,
+            input.workspaceId,
+            now
+        );
+        const reservedBytes = alreadyStored || totals?.same_hash === 1
+            ? 0
+            : input.sizeBytes;
+        if (
+            input.workspaceQuotaBytes !== undefined &&
+            usedBytes + (totals?.reserved_bytes ?? 0) + reservedBytes > input.workspaceQuotaBytes
+        ) {
+            throw createError({ statusCode: 413, statusMessage: 'Workspace storage quota exceeded' });
+        }
+        await d1Batch([
+            {
+                sql: `UPDATE upload_intents SET status = 'expired'
+                      WHERE workspace_id = ? AND status = 'active' AND expires_at <= ?`,
+                parameters: [input.workspaceId, now],
+            },
+            {
+                sql: `INSERT INTO upload_intents (
+                    id, workspace_id, hash, mime_type, size_bytes, reserved_bytes,
+                    expires_at, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+                parameters: [
+                    input.intentId,
+                    input.workspaceId,
+                    hash,
+                    input.mimeType,
+                    input.sizeBytes,
+                    reservedBytes,
+                    input.expiresAt,
+                    now,
+                ],
+            },
+        ]);
+    }
+
+    private async snapshotInD1(
+        workspaceId: string,
+        input: SnapshotRequest,
+        pageSize: number
+    ): Promise<SnapshotResponse> {
+        const now = nowEpoch();
+        let header: SnapshotHeaderRow;
+        let after: SnapshotPageToken['after'] | undefined;
+
+        if (input.pageToken) {
+            if (input.pageToken.length > 4096) {
+                throw createError({ statusCode: 400, statusMessage: 'Invalid snapshot page token' });
+            }
+            const token = decodeSnapshotPageToken(input.pageToken);
+            const [existing] = await d1All<SnapshotHeaderRow>(
+                `SELECT id, workspace_id, high_watermark, tables_json, expires_at
+                 FROM sync_snapshots WHERE id = ?`,
+                token.snapshotId
+            );
+            if (!existing || existing.expires_at <= now) {
+                if (existing) {
+                    await d1Run('DELETE FROM sync_snapshots WHERE id = ?', existing.id);
+                }
+                throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
+            }
+            if (existing.workspace_id !== workspaceId) {
+                throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
+            }
+            if (
+                input.tables &&
+                existing.tables_json !== JSON.stringify(normalizeSnapshotTables(input.tables))
+            ) {
+                throw createError({
+                    statusCode: 400,
+                    statusMessage: 'Snapshot table filter cannot change between pages',
+                });
+            }
+            header = existing;
+            after = token.after;
+        } else {
+            const tables = normalizeSnapshotTables(input.tables);
+            const snapshotId = uid();
+            const expiresAt = now + SNAPSHOT_TTL_SECONDS;
+            const tablesJson = JSON.stringify(tables);
+            const statements: D1SqlStatement[] = [
+                {
+                    sql: 'DELETE FROM sync_snapshots WHERE expires_at <= ?',
+                    parameters: [now],
+                },
+                {
+                    sql: `INSERT INTO sync_snapshots (
+                        id, workspace_id, high_watermark, tables_json, created_at, expires_at
+                    ) VALUES (
+                        ?, ?,
+                        COALESCE((
+                            SELECT value FROM server_version_counter WHERE workspace_id = ?
+                        ), 0),
+                        ?, ?, ?
+                    )`,
+                    parameters: [
+                        snapshotId,
+                        workspaceId,
+                        workspaceId,
+                        tablesJson,
+                        now,
+                        expiresAt,
+                    ],
+                },
+            ];
+            for (const tableName of tables) {
+                const materializedTable = SYNCED_TABLE_MAP[tableName];
+                if (!materializedTable) {
+                    throw new Error(`Missing materialized table for ${tableName}`);
+                }
+                statements.push(
+                    {
+                        sql: `INSERT INTO sync_snapshot_items (
+                            snapshot_id, table_name, pk, kind, payload_json,
+                            clock, hlc, op_id, server_deleted_at
+                        )
+                        SELECT
+                            ?, ?, id, 'row', data_json,
+                            clock,
+                            CASE WHEN hlc <> '' THEN hlc ELSE 'legacy:0' END,
+                            CASE
+                                WHEN op_id <> '' THEN op_id
+                                ELSE 'legacy:${tableName}:' || id || ':' || clock || ':' || hlc
+                            END,
+                            NULL
+                        FROM "${materializedTable}"
+                        WHERE workspace_id = ? AND deleted = 0`,
+                        parameters: [snapshotId, tableName, workspaceId],
+                    },
+                    {
+                        sql: `INSERT INTO sync_snapshot_items (
+                            snapshot_id, table_name, pk, kind, payload_json,
+                            clock, hlc, op_id, server_deleted_at
+                        )
+                        SELECT
+                            ?, ?, materialized.id, 'tombstone', NULL,
+                            materialized.clock,
+                            CASE
+                                WHEN materialized.hlc <> '' THEN materialized.hlc
+                                ELSE 'legacy:0'
+                            END,
+                            CASE
+                                WHEN materialized.op_id <> '' THEN materialized.op_id
+                                ELSE 'legacy:tombstone:${tableName}:' || materialized.id || ':' || materialized.clock
+                            END,
+                            MAX(0, COALESCE(
+                                (
+                                    SELECT tombstone.deleted_at
+                                    FROM tombstones AS tombstone
+                                    WHERE tombstone.workspace_id = materialized.workspace_id
+                                      AND tombstone.table_name = ?
+                                      AND tombstone.pk = materialized.id
+                                    LIMIT 1
+                                ),
+                                materialized.updated_at,
+                                materialized.created_at,
+                                0
+                            ))
+                        FROM "${materializedTable}" AS materialized
+                        WHERE materialized.workspace_id = ? AND materialized.deleted <> 0`,
+                        parameters: [snapshotId, tableName, tableName, workspaceId],
+                    },
+                    {
+                        sql: `INSERT INTO sync_snapshot_items (
+                            snapshot_id, table_name, pk, kind, payload_json,
+                            clock, hlc, op_id, server_deleted_at
+                        )
+                        SELECT
+                            ?, ?, tombstone.pk, 'tombstone', NULL,
+                            tombstone.clock,
+                            CASE WHEN tombstone.hlc <> '' THEN tombstone.hlc ELSE 'legacy:0' END,
+                            CASE
+                                WHEN tombstone.op_id <> '' THEN tombstone.op_id
+                                ELSE 'legacy:tombstone:${tableName}:' || tombstone.pk || ':' || tombstone.clock
+                            END,
+                            MAX(0, tombstone.deleted_at)
+                        FROM tombstones AS tombstone
+                        WHERE tombstone.workspace_id = ?
+                          AND tombstone.table_name = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM "${materializedTable}" AS materialized
+                              WHERE materialized.workspace_id = tombstone.workspace_id
+                                AND materialized.id = tombstone.pk
+                          )`,
+                        parameters: [snapshotId, tableName, workspaceId, tableName],
+                    }
+                );
+            }
+            await d1Batch(statements);
+            const [created] = await d1All<SnapshotHeaderRow>(
+                `SELECT id, workspace_id, high_watermark, tables_json, expires_at
+                 FROM sync_snapshots WHERE id = ?`,
+                snapshotId
+            );
+            if (!created) throw new Error('D1 did not create a sync snapshot.');
+            header = created;
+        }
+
+        const rows = after
+            ? await d1All<SnapshotItemRow>(
+                `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at
+                 FROM sync_snapshot_items
+                 WHERE snapshot_id = ?
+                   AND (
+                       table_name > ?
+                       OR (table_name = ? AND pk > ?)
+                       OR (table_name = ? AND pk = ? AND kind > ?)
+                   )
+                 ORDER BY table_name ASC, pk ASC, kind ASC
+                 LIMIT ?`,
+                header.id,
+                after.tableName,
+                after.tableName,
+                after.pk,
+                after.tableName,
+                after.pk,
+                after.kind,
+                pageSize + 1
+            )
+            : await d1All<SnapshotItemRow>(
+                `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at
+                 FROM sync_snapshot_items
+                 WHERE snapshot_id = ?
+                 ORDER BY table_name ASC, pk ASC, kind ASC
+                 LIMIT ?`,
+                header.id,
+                pageSize + 1
+            );
+        const hasMore = rows.length > pageSize;
+        const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
+        const items: SnapshotItem[] = pageRows.map((row) => {
+            const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
+            if (row.kind === 'row') {
+                return {
+                    kind: 'row',
+                    tableName: row.table_name,
+                    pk: row.pk,
+                    payload: JSON.parse(row.payload_json ?? 'null') as unknown,
+                    revision,
+                };
+            }
+            return {
+                kind: 'tombstone',
+                tableName: row.table_name,
+                pk: row.pk,
+                revision,
+                serverDeletedAt: row.server_deleted_at ?? 0,
+            };
+        });
+        const lastRow = pageRows.at(-1);
+        return {
+            workspaceId: header.workspace_id,
+            snapshotId: header.id,
+            highWatermark: header.high_watermark,
+            items,
+            nextPageToken: hasMore && lastRow
+                ? encodeSnapshotPageToken({
+                    version: 1,
+                    snapshotId: header.id,
+                    after: {
+                        tableName: lastRow.table_name,
+                        pk: lastRow.pk,
+                        kind: lastRow.kind,
+                    },
+                })
+                : null,
+        };
+    }
+
+    private async updateCursorInD1(
+        workspaceId: string,
+        deviceId: string,
+        version: number,
+        ownerUserId: string,
+        now: number
+    ): Promise<void> {
+        const [counter] = await d1All<{ value: number }>(
+            'SELECT value FROM server_version_counter WHERE workspace_id = ?',
+            workspaceId
+        );
+        if (version > (counter?.value ?? 0)) {
+            throw createError({ statusCode: 400, statusMessage: 'Cursor exceeds workspace version' });
+        }
+        const [existing] = await d1All<{
+            owner_user_id: string | null;
+            last_seen_version: number;
+        }>(
+            `SELECT owner_user_id, last_seen_version
+             FROM device_cursors WHERE workspace_id = ? AND device_id = ?`,
+            workspaceId,
+            deviceId
+        );
+        if (existing?.owner_user_id && existing.owner_user_id !== ownerUserId) {
+            throw createError({ statusCode: 403, statusMessage: 'Device cursor belongs to another user' });
+        }
+        if (existing && version < existing.last_seen_version) {
+            throw createError({ statusCode: 409, statusMessage: 'Device cursor cannot regress' });
+        }
+        const result = await d1Run(
+            `INSERT INTO device_cursors (
+                id, workspace_id, device_id, owner_user_id, last_seen_version, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(workspace_id, device_id) DO UPDATE SET
+                owner_user_id = COALESCE(device_cursors.owner_user_id, excluded.owner_user_id),
+                last_seen_version = excluded.last_seen_version,
+                updated_at = excluded.updated_at
+             WHERE (device_cursors.owner_user_id IS NULL OR device_cursors.owner_user_id = ?)
+               AND excluded.last_seen_version >= device_cursors.last_seen_version`,
+            uid(),
+            workspaceId,
+            deviceId,
+            ownerUserId,
+            version,
+            now,
+            ownerUserId
+        );
+        if ((result.meta?.changes ?? 0) !== 1) {
+            throw createError({ statusCode: 409, statusMessage: 'Device cursor changed concurrently' });
+        }
+    }
+
+    private async pushInD1(input: {
+        event: H3Event;
+        workspaceId: string;
+        uniqueOps: PendingOp[];
+        resultSlots: Array<PushResult['results'][number] | undefined>;
+        indicesByOpId: Map<string, number[]>;
+    }): Promise<PushResult> {
+        const { event, workspaceId, uniqueOps, resultSlots, indicesByOpId } = input;
+        const existingOps = new Map<string, number>();
+        const opIds = uniqueOps.map((op) => op.stamp.opId);
+        for (let offset = 0; offset < opIds.length; offset += 500) {
+            const chunk = opIds.slice(offset, offset + 500);
+            if (chunk.length === 0) continue;
+            const placeholders = chunk.map(() => '?').join(',');
+            const rows = await d1All<{ op_id: string; server_version: number }>(
+                `SELECT op_id, server_version FROM change_log WHERE op_id IN (${placeholders})`,
+                ...chunk
+            );
+            for (const row of rows) existingOps.set(row.op_id, row.server_version);
+        }
+
+        const newOps = uniqueOps.filter((op) => !existingOps.has(op.stamp.opId));
+        const versionOffsets = new Map<string, number>();
+        newOps.forEach((op, index) => {
+            versionOffsets.set(op.stamp.opId, index + 1);
+        });
+
+        const existingMaterializedKeys = new Set<string>();
+        const opsByTable = new Map<string, PendingOp[]>();
+        for (const op of newOps) {
+            const materializedTable = SYNCED_TABLE_MAP[op.tableName];
+            if (!materializedTable) continue;
+            const tableOps = opsByTable.get(materializedTable) ?? [];
+            tableOps.push(op);
+            opsByTable.set(materializedTable, tableOps);
+        }
+        for (const [materializedTable, tableOps] of opsByTable) {
+            const ids = [...new Set(tableOps.map((op) => op.pk))];
+            for (let offset = 0; offset < ids.length; offset += 500) {
+                const chunk = ids.slice(offset, offset + 500);
+                if (chunk.length === 0) continue;
+                const placeholders = chunk.map(() => '?').join(',');
+                const rows = await d1All<{ id: string }>(
+                    `SELECT id FROM "${materializedTable}"
+                     WHERE workspace_id = ? AND id IN (${placeholders})`,
+                    workspaceId,
+                    ...chunk
+                );
+                for (const row of rows) {
+                    existingMaterializedKeys.add(`${materializedTable}\u0000${row.id}`);
+                }
+            }
+        }
+
+        const now = nowEpoch();
+        const userId = resolveSessionUserId(event);
+        const statements: D1SqlStatement[] = [];
+        if (newOps.length > 0) {
+            // Allocate the block inside the same D1 batch as the mutations so
+            // a failed write rolls the counter back with the rest of the push.
+            statements.push(
+                {
+                    sql: `INSERT OR IGNORE INTO server_version_counter (workspace_id, value)
+                          VALUES (?, 0)`,
+                    parameters: [workspaceId],
+                },
+                {
+                    sql: 'UPDATE server_version_counter SET value = value + ? WHERE workspace_id = ?',
+                    parameters: [newOps.length, workspaceId],
+                }
+            );
+        }
+        const materializedStatementIndex = new Map<string, number>();
+        const materializedWasExisting = new Map<string, boolean>();
+        const seenMaterializedKeys = new Set<string>();
+        for (const op of newOps) {
+            const materializedTable = SYNCED_TABLE_MAP[op.tableName];
+            if (!materializedTable) continue;
+            const versionOffset = versionOffsets.get(op.stamp.opId);
+            if (versionOffset === undefined) continue;
+            const payloadJson = op.payload == null ? null : JSON.stringify(op.payload);
+            const materializedKey = `${materializedTable}\u0000${op.pk}`;
+            materializedWasExisting.set(
+                op.stamp.opId,
+                existingMaterializedKeys.has(materializedKey) ||
+                    seenMaterializedKeys.has(materializedKey)
+            );
+            seenMaterializedKeys.add(materializedKey);
+
+            statements.push({
+                sql: `INSERT OR IGNORE INTO change_log (
+                    id, workspace_id, server_version, table_name, pk, op,
+                    payload_json, clock, hlc, device_id, op_id, created_at
+                ) VALUES (
+                    ?, ?,
+                    (SELECT value - ? + ? FROM server_version_counter WHERE workspace_id = ?),
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )`,
+                parameters: [
+                    uid(),
+                    workspaceId,
+                    newOps.length,
+                    versionOffset,
+                    workspaceId,
+                    op.tableName,
+                    op.pk,
+                    op.operation,
+                    payloadJson,
+                    op.stamp.clock,
+                    op.stamp.hlc,
+                    op.stamp.deviceId,
+                    op.stamp.opId,
+                    now,
+                ],
+            });
+
+            materializedStatementIndex.set(op.stamp.opId, statements.length);
+            if (op.operation === 'put') {
+                statements.push({
+                    sql: `INSERT INTO "${materializedTable}" (
+                        id, workspace_id, data_json, clock, hlc, device_id,
+                        op_id, deleted, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    ON CONFLICT(workspace_id, id) DO UPDATE SET
+                        data_json = excluded.data_json,
+                        clock = excluded.clock,
+                        hlc = excluded.hlc,
+                        device_id = excluded.device_id,
+                        op_id = excluded.op_id,
+                        deleted = 0,
+                        updated_at = excluded.updated_at
+                    WHERE excluded.clock > "${materializedTable}".clock
+                       OR (
+                           excluded.clock = "${materializedTable}".clock
+                           AND excluded.hlc > "${materializedTable}".hlc
+                       )`,
+                    parameters: [
+                        op.pk,
+                        workspaceId,
+                        payloadJson ?? '{}',
+                        op.stamp.clock,
+                        op.stamp.hlc,
+                        op.stamp.deviceId,
+                        op.stamp.opId,
+                        now,
+                        now,
+                    ],
+                });
+            } else {
+                statements.push({
+                    sql: `INSERT INTO "${materializedTable}" (
+                        id, workspace_id, data_json, clock, hlc, device_id,
+                        op_id, deleted, created_at, updated_at
+                    ) VALUES (?, ?, '{}', ?, ?, ?, ?, 1, ?, ?)
+                    ON CONFLICT(workspace_id, id) DO UPDATE SET
+                        clock = excluded.clock,
+                        hlc = excluded.hlc,
+                        device_id = excluded.device_id,
+                        op_id = excluded.op_id,
+                        deleted = 1,
+                        updated_at = excluded.updated_at
+                    WHERE excluded.clock > "${materializedTable}".clock
+                       OR (
+                           excluded.clock = "${materializedTable}".clock
+                           AND excluded.hlc > "${materializedTable}".hlc
+                       )`,
+                    parameters: [
+                        op.pk,
+                        workspaceId,
+                        op.stamp.clock,
+                        op.stamp.hlc,
+                        op.stamp.deviceId,
+                        op.stamp.opId,
+                        now,
+                        now,
+                    ],
+                });
+                statements.push({
+                    sql: `INSERT INTO tombstones (
+                        id, workspace_id, table_name, pk, deleted_at, clock,
+                        hlc, op_id, server_version, created_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?,
+                        (SELECT value - ? + ? FROM server_version_counter WHERE workspace_id = ?),
+                        ?
+                    )
+                    ON CONFLICT(workspace_id, table_name, pk) DO UPDATE SET
+                        deleted_at = excluded.deleted_at,
+                        clock = excluded.clock,
+                        hlc = excluded.hlc,
+                        op_id = excluded.op_id,
+                        server_version = excluded.server_version
+                    WHERE excluded.clock > tombstones.clock
+                       OR (
+                           excluded.clock = tombstones.clock
+                           AND excluded.server_version > tombstones.server_version
+                       )`,
+                    parameters: [
+                        uid(),
+                        workspaceId,
+                        op.tableName,
+                        op.pk,
+                        now,
+                        op.stamp.clock,
+                        op.stamp.hlc,
+                        op.stamp.opId,
+                        newOps.length,
+                        versionOffset,
+                        workspaceId,
+                        now,
+                    ],
+                });
+            }
+        }
+
+        const finalVersionResultIndex = newOps.length > 0 ? statements.length : undefined;
+        if (finalVersionResultIndex !== undefined) {
+            statements.push({
+                sql: 'SELECT value FROM server_version_counter WHERE workspace_id = ?',
+                parameters: [workspaceId],
+            });
+        }
+        const batchResults = statements.length > 0 ? await d1Batch(statements) : [];
+        let finalServerVersion = 0;
+        if (finalVersionResultIndex !== undefined) {
+            const row = batchResults[finalVersionResultIndex]?.results?.[0] as
+                | { value?: number }
+                | undefined;
+            if (typeof row?.value !== 'number') {
+                throw new Error('D1 did not return a workspace version counter.');
+            }
+            finalServerVersion = row.value;
+        } else if (uniqueOps.length > 0) {
+            const [counter] = await d1All<{ value: number }>(
+                'SELECT value FROM server_version_counter WHERE workspace_id = ?',
+                workspaceId
+            );
+            finalServerVersion = counter?.value ?? 0;
+        }
+        const resolvedOps = new Map<string, number>();
+        for (let offset = 0; offset < opIds.length; offset += 500) {
+            const chunk = opIds.slice(offset, offset + 500);
+            if (chunk.length === 0) continue;
+            const placeholders = chunk.map(() => '?').join(',');
+            const rows = await d1All<{ op_id: string; server_version: number }>(
+                `SELECT op_id, server_version FROM change_log WHERE op_id IN (${placeholders})`,
+                ...chunk
+            );
+            for (const row of rows) resolvedOps.set(row.op_id, row.server_version);
+        }
+
+        const emissions: HookEmission[] = [];
+        for (const op of uniqueOps) {
+            const serverVersion = resolvedOps.get(op.stamp.opId);
+            if (serverVersion === undefined) {
+                throw new Error(`D1 failed to resolve sync operation ${op.stamp.opId}.`);
+            }
+            const result: PushResult['results'][number] = {
+                opId: op.stamp.opId,
+                success: true,
+                serverVersion,
+            };
+            for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
+                resultSlots[index] = result;
+            }
+
+            const materializedResult = batchResults[materializedStatementIndex.get(op.stamp.opId) ?? -1];
+            if ((materializedResult?.meta?.changes ?? 0) > 0) {
+                const emission = resolveHookEmission({
+                    op,
+                    workspaceId,
+                    now,
+                    userId,
+                    wasExisting:
+                        materializedWasExisting.get(op.stamp.opId) ?? false,
+                    applied: true,
+                });
+                if (emission) emissions.push(emission);
+            }
+        }
+
+        for (const emission of emissions) {
+            await emitWebhookSystemHook(emission.hookName, emission.payload);
+        }
+        return {
+            results: resultSlots.filter(
+                (result): result is PushResult['results'][number] => Boolean(result)
+            ),
+            serverVersion: finalServerVersion,
+        };
+    }
+
     async listWorkspaceIds(): Promise<string[]> {
+        if (isD1Driver()) {
+            const rows = await d1All<{ id: string }>(
+                'SELECT id FROM workspaces WHERE deleted = 0 ORDER BY id ASC'
+            );
+            return rows.map((row) => row.id);
+        }
         const raw = getRawDb();
         const rows = raw.prepare(
             'SELECT id FROM workspaces WHERE deleted = 0 ORDER BY id ASC'

@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { initializeSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import type {
@@ -75,7 +75,7 @@ function makeSessionEvent(userId: string, workspaceId = WORKSPACE_ID): H3Event {
 
 beforeEach(async () => {
     _resetForTest();
-    const db = getSqliteDb({ path: ':memory:' });
+    const db = await initializeSqliteDb({ path: ':memory:' });
     await runMigrations(db);
     adapter = new SqliteSyncGatewayAdapter();
 });

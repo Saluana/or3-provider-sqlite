@@ -3,7 +3,7 @@ import {
     _resetForTest,
     destroySqliteDb,
     getRawDb,
-    getSqliteDb,
+    initializeSqliteDb,
 } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 
@@ -17,7 +17,7 @@ afterEach(async () => {
 
 describe('SQLite migration integrity boundaries', () => {
     it('refuses to start from a database created by a newer migration set', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
         const raw = getRawDb();
         raw.prepare(
@@ -38,7 +38,7 @@ describe('SQLite migration integrity boundaries', () => {
     });
 
     it('fails closed when the migration ledger is current but required schema is missing', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
         const raw = getRawDb();
         raw.exec('DROP TABLE upload_intents');

@@ -5,7 +5,12 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import {
+    getSqliteDb,
+    initializeSqliteDb,
+    destroySqliteDb,
+    _resetForTest,
+} from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteAuthWorkspaceStore } from '../server/auth/sqlite-auth-workspace-store';
 
@@ -31,7 +36,7 @@ let store: SqliteAuthWorkspaceStore;
 
 beforeEach(async () => {
     _resetForTest();
-    const db = getSqliteDb({ path: ':memory:' });
+    const db = await initializeSqliteDb({ path: ':memory:' });
     await runMigrations(db);
     store = new SqliteAuthWorkspaceStore();
 });

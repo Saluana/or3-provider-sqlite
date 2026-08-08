@@ -1,13 +1,17 @@
-import { randomUUID } from 'node:crypto';
-import Database from 'better-sqlite3';
 import type {
     WebhookDeliveryLog,
     WebhookHealth,
     WebhookRegistration,
     WebhookStore,
 } from '~~/server/utils/webhooks/store/types';
+import {
+    getRawDb,
+    getSqliteDriver,
+    initializeSqliteDb,
+    type SqliteRawDatabase,
+} from '../db/kysely';
 
-type SqliteDatabase = InstanceType<typeof Database>;
+type SqliteDatabase = SqliteRawDatabase;
 
 type WebhookRow = {
     id: string;
@@ -45,43 +49,8 @@ type DeliveryLogRow = {
 
 export interface SqliteWebhookStoreOptions {
     database?: SqliteDatabase;
+    /** @deprecated Initialize the shared SQLite provider instead. */
     path?: string;
-}
-
-function envFlag(value: string | undefined): boolean {
-    if (!value) return false;
-    const normalized = value.trim().toLowerCase();
-    return normalized === '1' || normalized === 'true' || normalized === 'yes';
-}
-
-function resolveDatabasePath(): string {
-    const isTestEnv =
-        process.env.NODE_ENV === 'test' || envFlag(process.env.VITEST);
-    const allowInMemory = envFlag(process.env.OR3_SQLITE_ALLOW_IN_MEMORY);
-    const strictMode = envFlag(process.env.OR3_SQLITE_STRICT);
-    const configuredPath = process.env.OR3_SQLITE_DB_PATH;
-    const path = configuredPath ?? ':memory:';
-
-    if (!configuredPath && !isTestEnv && !allowInMemory) {
-        throw new Error(
-            'OR3_SQLITE_DB_PATH is required in non-test environments. ' +
-                'Set OR3_SQLITE_ALLOW_IN_MEMORY=true only if you intentionally want ephemeral storage.'
-        );
-    }
-
-    if (strictMode && path === ':memory:') {
-        throw new Error(
-            'OR3_SQLITE_STRICT=true forbids in-memory SQLite. Set OR3_SQLITE_DB_PATH to a persistent file path.'
-        );
-    }
-
-    if (!isTestEnv && path === ':memory:' && allowInMemory) {
-        console.warn(
-            '[webhooks:sqlite] OR3_SQLITE_ALLOW_IN_MEMORY=true enabled. Data will be lost on process restart.'
-        );
-    }
-
-    return path;
 }
 
 function parseStringArray(raw: string): string[] {
@@ -138,11 +107,13 @@ class SqliteWebhookStore implements WebhookStore {
     }
 
     private initialize(): void {
-        this.db.pragma('journal_mode = WAL');
-        this.db.pragma('synchronous = NORMAL');
-        this.db.pragma('foreign_keys = ON');
+        if (getSqliteDriver() !== 'turso') {
+            this.db.pragma?.('journal_mode = WAL');
+            this.db.pragma?.('synchronous = NORMAL');
+            this.db.pragma?.('foreign_keys = ON');
+        }
 
-        this.db.exec(`
+        this.db.exec?.(`
             CREATE TABLE IF NOT EXISTS webhook_registrations (
                 id TEXT PRIMARY KEY,
                 scope TEXT NOT NULL CHECK (scope IN ('user', 'admin')),
@@ -197,7 +168,7 @@ class SqliteWebhookStore implements WebhookStore {
                 ON webhook_custom_hooks (hook_name);
         `);
 
-        this.db.exec(`
+        this.db.exec?.(`
             INSERT OR IGNORE INTO webhook_custom_hooks (webhook_id, hook_name)
             SELECT wr.id, json_each.value
             FROM webhook_registrations AS wr,
@@ -220,7 +191,7 @@ class SqliteWebhookStore implements WebhookStore {
         const now = Date.now();
         const row: WebhookRegistration = {
             ...webhook,
-            id: randomUUID(),
+            id: globalThis.crypto.randomUUID(),
             health: 'unknown',
             created_at: now,
             updated_at: now,
@@ -500,7 +471,7 @@ class SqliteWebhookStore implements WebhookStore {
     ): Promise<WebhookDeliveryLog> {
         const row: WebhookDeliveryLog = {
             ...log,
-            id: randomUUID(),
+            id: globalThis.crypto.randomUUID(),
         };
 
         this.db
@@ -733,12 +704,145 @@ class SqliteWebhookStore implements WebhookStore {
     }
 }
 
+/**
+ * Webhook runtime plugins can resolve their store while the provider is still
+ * loading its native driver. All WebhookStore operations are asynchronous, so
+ * defer the synchronous store construction until that shared initialization
+ * completes instead of creating a second database connection.
+ */
+class LazySqliteWebhookStore implements WebhookStore {
+    constructor(private readonly store: Promise<SqliteWebhookStore>) {}
+
+    createWebhook(
+        webhook: Omit<
+            WebhookRegistration,
+            'id' | 'health' | 'created_at' | 'updated_at'
+        >
+    ) {
+        return this.store.then((store) => store.createWebhook(webhook));
+    }
+
+    updateWebhook(
+        webhookId: string,
+        patch: Partial<
+            Pick<
+                WebhookRegistration,
+                'url' | 'label' | 'events' | 'custom_hooks' | 'enabled' | 'workspace_id'
+            >
+        >
+    ) {
+        return this.store.then((store) => store.updateWebhook(webhookId, patch));
+    }
+
+    deleteWebhook(webhookId: string) {
+        return this.store.then((store) => store.deleteWebhook(webhookId));
+    }
+
+    getWebhook(webhookId: string) {
+        return this.store.then((store) => store.getWebhook(webhookId));
+    }
+
+    listWebhooks(userId: string, workspaceId: string) {
+        return this.store.then((store) => store.listWebhooks(userId, workspaceId));
+    }
+
+    listAdminWebhooks() {
+        return this.store.then((store) => store.listAdminWebhooks());
+    }
+
+    listWebhooksByEvent(
+        eventType: string,
+        scope: WebhookRegistration['scope'],
+        workspaceId?: string
+    ) {
+        return this.store.then((store) =>
+            store.listWebhooksByEvent(eventType, scope, workspaceId)
+        );
+    }
+
+    listWebhooksByCustomHook(
+        hookName: string
+    ) {
+        return this.store.then((store) => store.listWebhooksByCustomHook(hookName));
+    }
+
+    listActiveCustomHookNames() {
+        return this.store.then((store) => store.listActiveCustomHookNames());
+    }
+
+    updateWebhookHealth(
+        webhookId: string,
+        health: WebhookHealth
+    ) {
+        return this.store.then((store) => store.updateWebhookHealth(webhookId, health));
+    }
+
+    disableAllWebhooks(userId: string, workspaceId: string) {
+        return this.store.then((store) => store.disableAllWebhooks(userId, workspaceId));
+    }
+
+    createDeliveryLog(log: Omit<WebhookDeliveryLog, 'id'>) {
+        return this.store.then((store) => store.createDeliveryLog(log));
+    }
+
+    updateDeliveryLog(
+        logId: string,
+        patch: Partial<
+            Pick<
+                WebhookDeliveryLog,
+                | 'status'
+                | 'http_status'
+                | 'error_message'
+                | 'response_body'
+                | 'duration_ms'
+                | 'next_retry_at'
+                | 'attempt'
+            >
+        >
+    ) {
+        return this.store.then((store) => store.updateDeliveryLog(logId, patch));
+    }
+
+    getDeliveryLogs(webhookId: string, since: number) {
+        return this.store.then((store) => store.getDeliveryLogs(webhookId, since));
+    }
+
+    getRecentTerminalDeliveries(webhookId: string, limit: number) {
+        return this.store.then((store) =>
+            store.getRecentTerminalDeliveries(webhookId, limit)
+        );
+    }
+
+    claimPendingDeliveries(workerId: string, limit: number) {
+        return this.store.then((store) => store.claimPendingDeliveries(workerId, limit));
+    }
+
+    resetStaleInFlightDeliveries(olderThanMs: number) {
+        return this.store.then((store) =>
+            store.resetStaleInFlightDeliveries(olderThanMs)
+        );
+    }
+
+    cancelDeliveriesByWebhook(webhookId: string) {
+        return this.store.then((store) => store.cancelDeliveriesByWebhook(webhookId));
+    }
+
+    deleteDeliveryLogsByWebhook(webhookId: string) {
+        return this.store.then((store) => store.deleteDeliveryLogsByWebhook(webhookId));
+    }
+
+    purgeExpiredLogs(beforeTimestamp: number) {
+        return this.store.then((store) => store.purgeExpiredLogs(beforeTimestamp));
+    }
+}
+
 export function createSqliteWebhookStore(
     options: SqliteWebhookStoreOptions = {}
 ): WebhookStore {
-    const db =
-        options.database ??
-        new Database(options.path ?? resolveDatabasePath());
+    if (options.database) return new SqliteWebhookStore(options.database);
 
-    return new SqliteWebhookStore(db);
+    const dbOptions = options.path ? { path: options.path } : undefined;
+    return new LazySqliteWebhookStore(
+        initializeSqliteDb(dbOptions).then(() => new SqliteWebhookStore(getRawDb()))
+    );
 }

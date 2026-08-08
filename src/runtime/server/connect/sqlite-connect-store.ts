@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type {
     ConnectAuthorizationRecord,
     ConnectEnvironmentRecord,
@@ -118,7 +117,7 @@ class SqliteConnectStore implements ConnectStore {
                 ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`
             )
             .run(
-                randomUUID(),
+                globalThis.crypto.randomUUID(),
                 input.deviceCodeHash,
                 input.userCodeHash,
                 JSON.stringify(input.host),

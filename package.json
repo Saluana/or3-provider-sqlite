@@ -44,8 +44,11 @@
         "access": "public"
     },
     "dependencies": {
-        "better-sqlite3": "^12.6.2",
         "kysely": "^0.28.11"
+    },
+    "optionalDependencies": {
+        "better-sqlite3": "^12.6.2",
+        "libsql": "^0.5.29"
     },
     "peerDependencies": {
         "@nuxt/kit": "^3.0.0 || ^4.0.0",

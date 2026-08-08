@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import type {
     AdminUserInfo,
     AdminUserStore,
@@ -80,7 +79,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             if (existing) {
                 userId = existing.id;
             } else {
-                userId = randomUUID();
+                userId = globalThis.crypto.randomUUID();
                 await this.db
                     .insertInto('users')
                     .values({
@@ -120,7 +119,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             }
 
             if (!userId) {
-                userId = randomUUID();
+                userId = globalThis.crypto.randomUUID();
                 await this.db
                     .insertInto('users')
                     .values({
@@ -135,7 +134,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
                 await this.db
                     .insertInto('auth_accounts')
                     .values({
-                        id: randomUUID(),
+                        id: globalThis.crypto.randomUUID(),
                         user_id: userId,
                         provider: provider || 'custom',
                         provider_user_id: lookup,
@@ -167,7 +166,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
         await this.db
             .insertInto('workspace_members')
             .values({
-                id: randomUUID(),
+                id: globalThis.crypto.randomUUID(),
                 workspace_id: input.workspaceId,
                 user_id: userId,
                 role: input.role,
@@ -440,7 +439,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             throw new Error('Owner user not found');
         }
 
-        const workspaceId = randomUUID();
+        const workspaceId = globalThis.crypto.randomUUID();
         const now = nowEpoch();
 
         await this.db.transaction().execute(async (tx) => {
@@ -460,7 +459,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             await tx
                 .insertInto('workspace_members')
                 .values({
-                    id: randomUUID(),
+                    id: globalThis.crypto.randomUUID(),
                     workspace_id: workspaceId,
                     user_id: input.ownerUserId,
                     role: 'owner',
@@ -542,7 +541,7 @@ class SqliteWorkspaceSettingsStore implements WorkspaceSettingsStore {
         await this.db
             .insertInto('admin_workspace_settings')
             .values({
-                id: randomUUID(),
+                id: globalThis.crypto.randomUUID(),
                 workspace_id: workspaceId,
                 key,
                 value,

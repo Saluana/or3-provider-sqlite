@@ -5,7 +5,7 @@ import {
     _resetForTest,
     destroySqliteDb,
     getRawDb,
-    getSqliteDb,
+    initializeSqliteDb,
 } from '../server/db/kysely';
 import * as m001 from '../server/db/migrations/001_init';
 import * as m002 from '../server/db/migrations/002_sync_tables';
@@ -29,7 +29,7 @@ afterEach(async () => {
 
 describe('SQLite sync snapshot migration', () => {
     it('is repeatable and retains one ledger entry per schema migration', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
         const before = getRawDb().prepare(
             'SELECT name FROM kysely_migration ORDER BY name'
@@ -44,7 +44,7 @@ describe('SQLite sync snapshot migration', () => {
     });
 
     it('backfills stable revision IDs for pre-snapshot live rows and tombstones', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = await initializeSqliteDb({ path: ':memory:' });
         const migrationDb = db as unknown as Kysely<unknown>;
         await m001.up(migrationDb);
         await m002.up(migrationDb);

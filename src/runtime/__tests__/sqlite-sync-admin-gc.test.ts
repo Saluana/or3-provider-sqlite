@@ -8,7 +8,7 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import type { H3Event } from 'h3';
-import { getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { initializeSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import { sqliteSyncAdminAdapter } from '../server/admin/adapters/sync-sqlite';
@@ -73,7 +73,7 @@ describe('SQLite sync admin GC', () => {
     beforeEach(async () => {
         _resetForTest();
         _resetSyncMaintenanceStateForTest();
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
         adapter = new SqliteSyncGatewayAdapter();
     });

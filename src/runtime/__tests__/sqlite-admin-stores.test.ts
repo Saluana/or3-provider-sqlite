@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { initializeSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteAuthWorkspaceStore } from '../server/auth/sqlite-auth-workspace-store';
 import {
@@ -12,7 +12,7 @@ import { verifyAdminStoreProviderContract } from '~~/shared/testing/contracts/ad
 describe('sqlite admin stores', () => {
     beforeEach(async () => {
         _resetForTest();
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
     });
 

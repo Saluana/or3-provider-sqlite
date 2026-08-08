@@ -7,6 +7,7 @@ import type {
 import {
     destroySqliteDb,
     getSqliteDb,
+    initializeSqliteDb,
 } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { up as purgeLegacyUserCodes } from '../server/db/migrations/010_connect_user_code_hmac';
@@ -31,7 +32,7 @@ const scope = {
 
 describe('SQLite Connect store', () => {
     beforeEach(async () => {
-        await runMigrations(getSqliteDb({ path: ':memory:' }));
+        await runMigrations(await initializeSqliteDb({ path: ':memory:' }));
     });
 
     afterEach(async () => {
@@ -510,7 +511,7 @@ describe('SQLite Connect store', () => {
             now
         );
         await store.denyAuthorization(authorization!._id, now + 1);
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = getSqliteDb();
         await store.createAuthorization({
             deviceCodeHash: 'retention-environment-device',
             userCodeHash: 'retention-environment-code',
@@ -627,7 +628,7 @@ describe('SQLite Connect store', () => {
 
         const indexes = await sql<{ name: string }>`
             PRAGMA index_list(connect_environments)
-        `.execute(getSqliteDb({ path: ':memory:' }));
+        `.execute(getSqliteDb());
         expect(indexes.rows.map((index) => index.name)).toEqual(
             expect.arrayContaining([
                 'connect_environments_user_workspace_status_updated',
@@ -718,7 +719,7 @@ describe('SQLite Connect store', () => {
     });
 
     it('never creates or persists a readable user-code column', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = getSqliteDb();
         const columns = await db.introspection.getTables();
         const authorizationTable = columns.find(
             (table) => table.name === 'connect_device_authorizations'
@@ -747,7 +748,7 @@ describe('SQLite Connect store', () => {
     });
 
     it('purges in-flight records when upgrading a legacy plaintext schema', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = getSqliteDb();
         const legacyPhrase = 'LEGACY-RIVER-TREE-123';
         await sql`
             ALTER TABLE connect_device_authorizations
@@ -785,7 +786,7 @@ describe('SQLite Connect store', () => {
     });
 
     it('preserves approved credentials while adding redelivery columns', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = getSqliteDb();
         const migrationDb = db as unknown as Kysely<unknown>;
         await removeCredentialRedelivery(migrationDb);
         await sql`
@@ -825,7 +826,7 @@ describe('SQLite Connect store', () => {
     });
 
     it('preserves active environments while adding lifecycle columns', async () => {
-        const db = getSqliteDb({ path: ':memory:' });
+        const db = getSqliteDb();
         const store = createSqliteConnectStore();
         await store.createAuthorization({
             deviceCodeHash: 'lifecycle-upgrade-device',

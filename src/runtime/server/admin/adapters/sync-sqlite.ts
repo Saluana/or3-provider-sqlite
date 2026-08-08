@@ -16,6 +16,7 @@ import {
     SYNC_MAINTENANCE_RETENTION_SECONDS,
 } from '../../sync/maintenance-state';
 import { createSqliteSyncGatewayAdapter } from '../../sync/sqlite-sync-gateway-adapter';
+import { getSqliteDriver } from '../../db/kysely';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 
 const SQLITE_PROVIDER_ID = 'sqlite';
@@ -32,18 +33,28 @@ export const sqliteSyncAdminAdapter: ProviderAdminAdapter = {
     kind: 'sync',
 
     async getStatus(_event: H3Event, _ctx: ProviderStatusContext): Promise<ProviderAdminStatusResult> {
+        const driver = getSqliteDriver();
+        const isLocalDriver = driver === 'better-sqlite3' || driver === 'bun';
         const dbPath = process.env.OR3_SQLITE_DB_PATH;
         const warnings: ProviderAdminStatusResult['warnings'] = [];
 
-        if (!dbPath) {
+        if (isLocalDriver && !dbPath) {
             warnings.push({
                 level: 'warning',
                 message: 'OR3_SQLITE_DB_PATH is not set. SQLite may run in ephemeral mode.',
             });
-        } else if (dbPath === ':memory:') {
+        } else if (
+            isLocalDriver && dbPath === ':memory:'
+        ) {
             warnings.push({
                 level: 'warning',
                 message: 'SQLite is configured with :memory:. Data will not persist across restarts.',
+            });
+        }
+        if (driver === 'd1') {
+            warnings.push({
+                level: 'warning',
+                message: 'Cloudflare D1 does not provide server-side admin stores or persistent webhooks.',
             });
         }
 
@@ -61,9 +72,23 @@ export const sqliteSyncAdminAdapter: ProviderAdminAdapter = {
 
         return {
             details: {
-                dbPath: dbPath ?? ':memory:',
-                journalMode: process.env.OR3_SQLITE_PRAGMA_JOURNAL_MODE ?? 'WAL',
-                synchronous: process.env.OR3_SQLITE_PRAGMA_SYNCHRONOUS ?? 'NORMAL',
+                driver,
+                dbPath:
+                    isLocalDriver ? dbPath ?? ':memory:' : undefined,
+                tursoUrl:
+                    driver === 'turso'
+                        ? process.env.OR3_SQLITE_TURSO_URL
+                        : undefined,
+                d1Binding:
+                    driver === 'd1'
+                        ? process.env.OR3_SQLITE_D1_BINDING ?? 'DB'
+                        : undefined,
+                journalMode: isLocalDriver
+                    ? process.env.OR3_SQLITE_PRAGMA_JOURNAL_MODE ?? 'WAL'
+                    : undefined,
+                synchronous: isLocalDriver
+                    ? process.env.OR3_SQLITE_PRAGMA_SYNCHRONOUS ?? 'NORMAL'
+                    : undefined,
                 maintenance: {
                     ...maintenance,
                     backlog,

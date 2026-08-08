@@ -10,11 +10,11 @@ import type {
     InviteValidationResult,
 } from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
-import { getRawDb, getSqliteDb } from '../db/kysely';
-import { randomUUID } from 'node:crypto';
+import { getRawDb, getSqliteDb, isD1Driver } from '../db/kysely';
+import { d1All, d1Batch, d1Run } from '../db/d1';
 
 function uid(): string {
-    return randomUUID();
+    return globalThis.crypto.randomUUID();
 }
 
 function nowEpoch(): number {
@@ -44,6 +44,9 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         email?: string;
         displayName?: string;
     }): Promise<{ userId: string }> {
+        if (isD1Driver()) {
+            return this.getOrCreateUserInD1(input);
+        }
         // Ensure singleton is initialized before raw access.
         this.db;
         const raw = getRawDb();
@@ -218,7 +221,27 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         const now = nowEpoch();
         const name = 'My Workspace';
 
-        await db.transaction().execute(async (tx) => {
+        if (isD1Driver()) {
+            await d1Batch([
+                {
+                    sql: `INSERT INTO workspaces (
+                        id, name, description, owner_user_id, created_at, deleted, deleted_at
+                    ) VALUES (?, ?, NULL, ?, ?, 0, NULL)`,
+                    parameters: [workspaceId, name, userId, now],
+                },
+                {
+                    sql: `INSERT INTO workspace_members (
+                        id, workspace_id, user_id, role, created_at
+                    ) VALUES (?, ?, ?, 'owner', ?)`,
+                    parameters: [memberId, workspaceId, userId, now],
+                },
+                {
+                    sql: 'UPDATE users SET active_workspace_id = ? WHERE id = ?',
+                    parameters: [workspaceId, userId],
+                },
+            ]);
+        } else {
+            await db.transaction().execute(async (tx) => {
             await tx
                 .insertInto('workspaces')
                 .values({
@@ -248,7 +271,8 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                 .set({ active_workspace_id: workspaceId })
                 .where('id', '=', userId)
                 .execute();
-        });
+            });
+        }
 
         return { workspaceId, workspaceName: name, created: true };
     }
@@ -326,7 +350,29 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         const memberId = uid();
         const now = nowEpoch();
 
-        await db.transaction().execute(async (tx) => {
+        if (isD1Driver()) {
+            await d1Batch([
+                {
+                    sql: `INSERT INTO workspaces (
+                        id, name, description, owner_user_id, created_at, deleted, deleted_at
+                    ) VALUES (?, ?, ?, ?, ?, 0, NULL)`,
+                    parameters: [
+                        workspaceId,
+                        input.name,
+                        input.description ?? null,
+                        input.userId,
+                        now,
+                    ],
+                },
+                {
+                    sql: `INSERT INTO workspace_members (
+                        id, workspace_id, user_id, role, created_at
+                    ) VALUES (?, ?, ?, 'owner', ?)`,
+                    parameters: [memberId, workspaceId, input.userId, now],
+                },
+            ]);
+        } else {
+            await db.transaction().execute(async (tx) => {
             await tx
                 .insertInto('workspaces')
                 .values({
@@ -350,7 +396,8 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                     created_at: now,
                 })
                 .execute();
-        });
+            });
+        }
 
         return { workspaceId };
     }
@@ -402,6 +449,32 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         }
 
         const now = nowEpoch();
+
+        if (isD1Driver()) {
+            await d1Batch([
+                {
+                    sql: 'UPDATE workspaces SET deleted = 1, deleted_at = ? WHERE id = ?',
+                    parameters: [now, input.workspaceId],
+                },
+                {
+                    sql: `UPDATE users
+                        SET active_workspace_id = (
+                            SELECT workspace_members.workspace_id
+                            FROM workspace_members
+                            INNER JOIN workspaces
+                                ON workspaces.id = workspace_members.workspace_id
+                            WHERE workspace_members.user_id = users.id
+                              AND workspaces.deleted = 0
+                              AND workspaces.id <> ?
+                            ORDER BY workspace_members.created_at ASC
+                            LIMIT 1
+                        )
+                        WHERE active_workspace_id = ?`,
+                    parameters: [input.workspaceId, input.workspaceId],
+                },
+            ]);
+            return;
+        }
 
         await db.transaction().execute(async (tx) => {
             // Soft-delete
@@ -582,6 +655,9 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         email: string;
         tokenHash: string;
     }): Promise<InviteValidationResult> {
+        if (isD1Driver()) {
+            return this.validateInviteInD1(input);
+        }
         this.db;
         const raw = getRawDb();
         const now = nowEpoch();
@@ -621,6 +697,9 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         workspaceId: string;
         tokenHash: string;
     }): Promise<InviteProvisionResult> {
+        if (isD1Driver()) {
+            return this.acceptInviteAndProvisionUserInD1(input);
+        }
         this.db;
         const raw = getRawDb();
         const now = nowEpoch();
@@ -746,6 +825,9 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                   | 'token_mismatch';
           }
     > {
+        if (isD1Driver()) {
+            return this.consumeInviteInD1(input);
+        }
         // Ensure singleton initialized before raw transaction usage.
         this.db;
         const raw = getRawDb();
@@ -835,6 +917,313 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
                 return { ok: true as const, role: invite.role };
             })
             .immediate();
+    }
+
+    private async getOrCreateUserInD1(input: {
+        provider: string;
+        providerUserId: string;
+        email?: string;
+        displayName?: string;
+    }): Promise<{ userId: string }> {
+        const candidateUserId = uid();
+        const now = nowEpoch();
+        const results = await d1Batch([
+            {
+                sql: `INSERT OR IGNORE INTO users (
+                    id, email, display_name, active_workspace_id, created_at
+                ) VALUES (?, ?, ?, NULL, ?)`,
+                parameters: [
+                    candidateUserId,
+                    input.email ?? null,
+                    input.displayName ?? null,
+                    now,
+                ],
+            },
+            {
+                sql: `INSERT OR IGNORE INTO auth_accounts (
+                    id, user_id, provider, provider_user_id, created_at
+                ) VALUES (?, ?, ?, ?, ?)`,
+                parameters: [
+                    uid(),
+                    candidateUserId,
+                    input.provider,
+                    input.providerUserId,
+                    now,
+                ],
+            },
+            {
+                sql: `SELECT user_id
+                    FROM auth_accounts
+                    WHERE provider = ? AND provider_user_id = ?`,
+                parameters: [input.provider, input.providerUserId],
+            },
+        ]);
+        const winner = (results[2]?.results ?? [])[0] as
+            | { user_id?: string }
+            | undefined;
+        if (!winner?.user_id) {
+            throw new Error('Failed to resolve auth account after get-or-create attempt');
+        }
+        if (winner.user_id !== candidateUserId) {
+            await d1Run(
+                `DELETE FROM users
+                 WHERE id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM auth_accounts WHERE user_id = ?
+                   )`,
+                candidateUserId,
+                candidateUserId
+            );
+        }
+        return { userId: winner.user_id };
+    }
+
+    private async validateInviteInD1(input: {
+        workspaceId: string;
+        email: string;
+        tokenHash: string;
+    }): Promise<InviteValidationResult> {
+        const now = nowEpoch();
+        const [invite] = await d1All<{
+            role: WorkspaceRole;
+            status: 'pending' | 'accepted' | 'revoked' | 'expired';
+            email: string;
+            expires_at: number;
+        }>(
+            `SELECT role, status, email, expires_at
+             FROM auth_invites
+             WHERE workspace_id = ? AND token_hash = ?
+             LIMIT 1`,
+            input.workspaceId,
+            input.tokenHash
+        );
+
+        if (!invite) return { ok: false, reason: 'not_found' };
+        if (invite.email !== normalizeEmail(input.email)) {
+            return { ok: false, reason: 'email_mismatch' };
+        }
+        if (invite.status === 'accepted') return { ok: false, reason: 'already_used' };
+        if (invite.status === 'revoked') return { ok: false, reason: 'revoked' };
+        if (invite.status === 'expired' || invite.expires_at <= now) {
+            return { ok: false, reason: 'expired' };
+        }
+        return { ok: true, role: invite.role };
+    }
+
+    private async acceptInviteAndProvisionUserInD1(input: {
+        provider: string;
+        providerUserId: string;
+        email: string;
+        displayName?: string;
+        workspaceId: string;
+        tokenHash: string;
+    }): Promise<InviteProvisionResult> {
+        const now = nowEpoch();
+        const normalizedEmail = normalizeEmail(input.email);
+        const validation = await this.validateInviteInD1({
+            workspaceId: input.workspaceId,
+            email: normalizedEmail,
+            tokenHash: input.tokenHash,
+        });
+        if (!validation.ok) return validation;
+        this.onInviteProvisionStep('invite_validated');
+
+        const [existingAccount] = await d1All<{ user_id: string }>(
+            `SELECT user_id FROM auth_accounts
+             WHERE provider = ? AND provider_user_id = ?
+             LIMIT 1`,
+            input.provider,
+            input.providerUserId
+        );
+        const { userId } = await this.getOrCreateUserInD1({
+            provider: input.provider,
+            providerUserId: input.providerUserId,
+            email: normalizedEmail,
+            displayName: input.displayName,
+        });
+        const createdUser = !existingAccount;
+        this.onInviteProvisionStep('user_created');
+
+        const results = await d1Batch([
+            {
+                sql: `UPDATE auth_invites
+                    SET status = 'accepted', accepted_at = ?, accepted_user_id = ?, updated_at = ?
+                    WHERE workspace_id = ?
+                      AND token_hash = ?
+                      AND email = ?
+                      AND status = 'pending'
+                      AND expires_at > ?`,
+                parameters: [
+                    now,
+                    userId,
+                    now,
+                    input.workspaceId,
+                    input.tokenHash,
+                    normalizedEmail,
+                    now,
+                ],
+            },
+            {
+                sql: `INSERT INTO workspace_members (
+                    id, workspace_id, user_id, role, created_at
+                )
+                SELECT ?, ?, ?, role, ?
+                FROM auth_invites
+                WHERE workspace_id = ?
+                  AND token_hash = ?
+                  AND status = 'accepted'
+                  AND accepted_user_id = ?
+                ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role`,
+                parameters: [
+                    uid(),
+                    input.workspaceId,
+                    userId,
+                    now,
+                    input.workspaceId,
+                    input.tokenHash,
+                    userId,
+                ],
+            },
+            {
+                sql: `UPDATE users SET active_workspace_id = ?
+                    WHERE id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_members
+                          WHERE workspace_id = ? AND user_id = ?
+                      )`,
+                parameters: [input.workspaceId, userId, input.workspaceId, userId],
+            },
+        ]);
+        if ((results[0]?.meta?.changes ?? 0) !== 1) {
+            return this.inviteProvisionFailureInD1(input.workspaceId, normalizedEmail, input.tokenHash);
+        }
+        this.onInviteProvisionStep('membership_created');
+        this.onInviteProvisionStep('invite_consumed');
+        return { ok: true, userId, role: validation.role, createdUser };
+    }
+
+    private async consumeInviteInD1(input: {
+        workspaceId: string;
+        email: string;
+        tokenHash: string;
+        acceptedUserId: string;
+    }): Promise<
+        | { ok: true; role: WorkspaceRole }
+        | {
+              ok: false;
+              reason:
+                  | 'not_found'
+                  | 'expired'
+                  | 'revoked'
+                  | 'already_used'
+                  | 'token_mismatch';
+          }
+    > {
+        const now = nowEpoch();
+        const normalized = normalizeEmail(input.email);
+        await d1Run(
+            `UPDATE auth_invites SET status = 'expired', updated_at = ?
+             WHERE workspace_id = ?
+               AND status = 'pending'
+               AND expires_at <= ?`,
+            now,
+            input.workspaceId,
+            now
+        );
+        const [invite] = await d1All<{
+            id: string;
+            role: WorkspaceRole;
+            status: 'pending' | 'accepted' | 'revoked' | 'expired';
+            token_hash: string;
+            expires_at: number;
+        }>(
+            `SELECT * FROM auth_invites
+             WHERE workspace_id = ? AND email = ?
+             ORDER BY created_at ASC
+             LIMIT 1`,
+            input.workspaceId,
+            normalized
+        );
+        if (!invite) return { ok: false, reason: 'not_found' };
+        if (invite.status === 'revoked') return { ok: false, reason: 'revoked' };
+        if (invite.status === 'accepted') return { ok: false, reason: 'already_used' };
+        if (invite.status === 'expired' || invite.expires_at <= now) {
+            return { ok: false, reason: 'expired' };
+        }
+        if (invite.token_hash !== input.tokenHash) {
+            return { ok: false, reason: 'token_mismatch' };
+        }
+
+        const results = await d1Batch([
+            {
+                sql: `UPDATE auth_invites
+                    SET status = 'accepted', accepted_at = ?, accepted_user_id = ?, updated_at = ?
+                    WHERE id = ? AND status = 'pending' AND token_hash = ?`,
+                parameters: [
+                    now,
+                    input.acceptedUserId,
+                    now,
+                    invite.id,
+                    input.tokenHash,
+                ],
+            },
+            {
+                sql: `INSERT INTO workspace_members (
+                    id, workspace_id, user_id, role, created_at
+                )
+                SELECT ?, ?, ?, role, ?
+                FROM auth_invites
+                WHERE id = ?
+                  AND status = 'accepted'
+                  AND accepted_user_id = ?
+                ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role`,
+                parameters: [
+                    uid(),
+                    input.workspaceId,
+                    input.acceptedUserId,
+                    now,
+                    invite.id,
+                    input.acceptedUserId,
+                ],
+            },
+            {
+                sql: `UPDATE users SET active_workspace_id = ?
+                    WHERE id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM workspace_members
+                          WHERE workspace_id = ? AND user_id = ?
+                      )`,
+                parameters: [
+                    input.workspaceId,
+                    input.acceptedUserId,
+                    input.workspaceId,
+                    input.acceptedUserId,
+                ],
+            },
+        ]);
+        if ((results[0]?.meta?.changes ?? 0) !== 1) {
+            const [latest] = await d1All<{
+                status: 'pending' | 'accepted' | 'revoked' | 'expired';
+            }>('SELECT status FROM auth_invites WHERE id = ?', invite.id);
+            if (!latest) return { ok: false, reason: 'not_found' };
+            if (latest.status === 'revoked') return { ok: false, reason: 'revoked' };
+            if (latest.status === 'accepted') return { ok: false, reason: 'already_used' };
+            return { ok: false, reason: 'expired' };
+        }
+        return { ok: true, role: invite.role };
+    }
+
+    private async inviteProvisionFailureInD1(
+        workspaceId: string,
+        email: string,
+        tokenHash: string
+    ): Promise<InviteProvisionResult> {
+        const validation = await this.validateInviteInD1({
+            workspaceId,
+            email,
+            tokenHash,
+        });
+        return validation.ok ? { ok: false, reason: 'already_used' } : validation;
     }
 }
 
