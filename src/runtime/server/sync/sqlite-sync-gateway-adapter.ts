@@ -8,10 +8,19 @@
 import type { H3Event } from 'h3';
 import { canRunSyncHistoryGc } from './history-gc-policy';
 import { createError } from 'h3';
+import {
+    beginSyncMaintenanceRun,
+    completeSyncMaintenanceRun,
+    computeSyncMaintenanceBacklog,
+    failSyncMaintenanceRun,
+    getSyncMaintenanceState,
+    SYNC_MAINTENANCE_RETENTION_SECONDS,
+} from './maintenance-state';
 import type {
     CanonicalStorageQueryRequest,
     CanonicalStorageQueryResponse,
     SyncGatewayAdapter,
+    SyncMaintenanceState,
     UploadIntentConsumptionRequest,
     UploadIntentReservationRequest,
 } from '~~/server/sync/gateway/types';
@@ -1510,15 +1519,28 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const cutoff = nowEpoch() - input.retentionSeconds;
         const raw = getRawDb();
         raw.transaction(() => {
+            // A cursor that has not checked in for the entire retention window
+            // is no longer a retention blocker. Its client will take the
+            // snapshot-v1 bootstrap path before applying new history.
+            raw.prepare(
+                `DELETE FROM device_cursors
+                 WHERE workspace_id = ? AND updated_at < ?`
+            ).run(input.scope.workspaceId, cutoff);
             const cursor = raw.prepare(
                 `SELECT MIN(last_seen_version) AS min_version
                  FROM device_cursors WHERE workspace_id = ?`
             ).get(input.scope.workspaceId) as { min_version: number | null };
-            if (cursor.min_version === null) return;
-            raw.prepare(
-                `DELETE FROM tombstones
-                 WHERE workspace_id = ? AND created_at < ? AND server_version <= ?`
-            ).run(input.scope.workspaceId, cutoff, cursor.min_version);
+            if (cursor.min_version === null) {
+                raw.prepare(
+                    `DELETE FROM tombstones
+                     WHERE workspace_id = ? AND created_at < ?`
+                ).run(input.scope.workspaceId, cutoff);
+            } else {
+                raw.prepare(
+                    `DELETE FROM tombstones
+                     WHERE workspace_id = ? AND created_at < ? AND server_version <= ?`
+                ).run(input.scope.workspaceId, cutoff, cursor.min_version);
+            }
         })();
     }
 
@@ -1536,16 +1558,53 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const cutoff = nowEpoch() - input.retentionSeconds;
         const raw = getRawDb();
         raw.transaction(() => {
+            // See gcTombstones: inactive devices are snapshot-bootstrapped, so
+            // they must not pin historical rows forever.
+            raw.prepare(
+                `DELETE FROM device_cursors
+                 WHERE workspace_id = ? AND updated_at < ?`
+            ).run(input.scope.workspaceId, cutoff);
             const cursor = raw.prepare(
                 `SELECT MIN(last_seen_version) AS min_version
                  FROM device_cursors WHERE workspace_id = ?`
             ).get(input.scope.workspaceId) as { min_version: number | null };
-            if (cursor.min_version === null) return;
-            raw.prepare(
-                `DELETE FROM change_log
-                 WHERE workspace_id = ? AND created_at < ? AND server_version <= ?`
-            ).run(input.scope.workspaceId, cutoff, cursor.min_version);
+            if (cursor.min_version === null) {
+                raw.prepare(
+                    `DELETE FROM change_log
+                     WHERE workspace_id = ? AND created_at < ?`
+                ).run(input.scope.workspaceId, cutoff);
+            } else {
+                raw.prepare(
+                    `DELETE FROM change_log
+                     WHERE workspace_id = ? AND created_at < ? AND server_version <= ?`
+                ).run(input.scope.workspaceId, cutoff, cursor.min_version);
+            }
         })();
+    }
+
+    async listWorkspaceIds(): Promise<string[]> {
+        const raw = getRawDb();
+        const rows = raw.prepare(
+            'SELECT id FROM workspaces WHERE deleted = 0 ORDER BY id ASC'
+        ).all() as Array<{ id: string }>;
+        return rows.map((row) => row.id);
+    }
+
+    getMaintenanceState(): SyncMaintenanceState {
+        return getSyncMaintenanceState();
+    }
+
+    beginMaintenanceRun(): void {
+        beginSyncMaintenanceRun();
+    }
+
+    completeMaintenanceRun(input: { lastRun: string }): void {
+        const backlog = computeSyncMaintenanceBacklog(SYNC_MAINTENANCE_RETENTION_SECONDS, true);
+        completeSyncMaintenanceRun({ lastRun: input.lastRun, backlog });
+    }
+
+    failMaintenanceRun(error: string): void {
+        failSyncMaintenanceRun(error);
     }
 }
 

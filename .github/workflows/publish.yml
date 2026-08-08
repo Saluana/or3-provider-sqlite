@@ -11,7 +11,7 @@ permissions:
   id-token: write
 
 jobs:
-  publish:
+  qualify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,9 +27,37 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Verify release version
         run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$(node -p "require('./package.json').version")" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match package version v$(node -p "require('./package.json').version")."
-            exit 1
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test "$GITHUB_REF_NAME" = "v$version" || {
+              echo "Tag $GITHUB_REF_NAME does not match package version v$version." >&2
+              exit 1
+            }
+            output="$(npm view "$(node -p "require('./package.json').name")@$version" version 2>&1)" || status=$?
+            if [[ "${status:-0}" -eq 0 ]]; then
+              echo "$(node -p "require('./package.json').name")@$version already exists; choose a new version." >&2
+              exit 1
+            fi
+            grep -Eq 'E404|404 Not Found|not found' <<<"$output" || { echo "$output" >&2; exit "${status}"; }
           fi
+      - run: bun run type-check:standalone
+      - run: bun run test
       - run: bun run build
-      - run: npm publish --access public
+      - name: Validate package archive
+        run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
+      - name: Publish immutable package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: npm publish --access public --provenance
+      - name: Verify exact npm propagation
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          for attempt in {1..8}; do
+            if [[ "$(npm view "$name@$version" version 2>/dev/null || true)" == "$version" ]]; then exit 0; fi
+            sleep 5
+          done
+          echo "Timed out waiting for $name@$version to become visible on npm." >&2
+          exit 1

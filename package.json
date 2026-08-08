@@ -34,10 +34,11 @@
     ],
     "scripts": {
         "prepack": "bun run build",
-        "build": "nuxt-module-build build",
-        "lint": "eslint src --max-warnings 0",
-        "type-check": "tsc --noEmit",
-        "test": "vitest run"
+    "build": "nuxt-module-build build",
+    "lint": "eslint src --max-warnings 0",
+    "type-check": "tsc --noEmit",
+    "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
+    "test": "vitest run"
     },
     "publishConfig": {
         "access": "public"

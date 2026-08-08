@@ -1242,6 +1242,50 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(remaining.cnt).toBe(3); // nothing deleted
         });
 
+        it('gcChangeLog collects old history when no active device cursor exists', async () => {
+            await adapter.push(stubEvent, makeBatch([
+                makeOp({ tableName: 'threads', pk: 'no-cursor-1' }),
+                makeOp({ tableName: 'threads', pk: 'no-cursor-2' }),
+            ]));
+            const raw = getRawDb();
+            raw.prepare('UPDATE change_log SET created_at = 0 WHERE workspace_id = ?').run(WORKSPACE_ID);
+
+            await adapter.gcChangeLog(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID }, retentionSeconds: 3600,
+            });
+
+            const remaining = raw
+                .prepare('SELECT COUNT(*) AS cnt FROM change_log WHERE workspace_id = ?')
+                .get(WORKSPACE_ID) as { cnt: number };
+            expect(remaining.cnt).toBe(0);
+        });
+
+        it('expires a stale cursor instead of allowing it to pin old history forever', async () => {
+            await adapter.push(stubEvent, makeBatch([
+                makeOp({ tableName: 'threads', pk: 'stale-cursor-1' }),
+                makeOp({ tableName: 'threads', pk: 'stale-cursor-2' }),
+            ]));
+            await adapter.updateCursor(makeSessionEvent('user-a'), {
+                scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 0,
+            });
+            const raw = getRawDb();
+            raw.prepare('UPDATE change_log SET created_at = 0 WHERE workspace_id = ?').run(WORKSPACE_ID);
+            raw.prepare('UPDATE device_cursors SET updated_at = 0 WHERE workspace_id = ?').run(WORKSPACE_ID);
+
+            await adapter.gcChangeLog(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID }, retentionSeconds: 3600,
+            });
+
+            const remaining = raw
+                .prepare('SELECT COUNT(*) AS cnt FROM change_log WHERE workspace_id = ?')
+                .get(WORKSPACE_ID) as { cnt: number };
+            const cursors = raw
+                .prepare('SELECT COUNT(*) AS cnt FROM device_cursors WHERE workspace_id = ?')
+                .get(WORKSPACE_ID) as { cnt: number };
+            expect(remaining.cnt).toBe(0);
+            expect(cursors.cnt).toBe(0);
+        });
+
         it('gcTombstones deletes old tombstones acknowledged by every device', async () => {
             // Create a delete to produce a tombstone
             const putOp = makeOp({ tableName: 'threads', pk: 't-1' });

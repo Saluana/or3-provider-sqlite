@@ -1,0 +1,73 @@
+/** Standalone host contract fixture used by the provider release typecheck. */
+export type RateLimitConfig = any;
+export type RateLimitProvider = any;
+export type RateLimitResult = any;
+export type RateLimitStats = any;
+export type ConnectAuthorizationRecord = any;
+export type ConnectEnvironmentRecord = any;
+export type StoredConnectHost = any;
+export class ConnectStoreError extends Error {
+  constructor(...args: any[]) {
+    super(typeof args[0] === 'string' ? args[0] : 'Connect store error');
+  }
+}
+export type ApproveConnectAuthorizationInput = any;
+export type BeginConnectEnvironmentRevocationInput = any;
+export type ConnectEnvironmentLifecycleClaim = any;
+export type ConnectEnvironmentRelayProgress = any;
+export type ConnectEnvironmentScope = any;
+export type ConnectStore = any;
+export type CreateConnectAuthorizationInput = any;
+export type PurgeConnectRecordsInput = any;
+export type PurgeConnectRecordsResult = any;
+export type ReserveConnectAuthorizationInput = any;
+export type WebhookDeliveryLog = any;
+export type WebhookHealth = any;
+export type WebhookRegistration = any;
+export type WebhookStore = any;
+export type CanonicalStorageQueryRequest = any;
+export type CanonicalStorageQueryResponse = any;
+export type SyncGatewayAdapter = any;
+export type SyncMaintenanceState = any;
+export type UploadIntentConsumptionRequest = any;
+export type UploadIntentReservationRequest = any;
+export type PendingOp = any;
+export type PullRequest = any;
+export type PullResponse = any;
+export type PushBatch = any;
+export type PushResult = any;
+export type SnapshotItem = any;
+export type SnapshotRequest = any;
+export type SnapshotResponse = any;
+export type SyncChange = any;
+export type WorkspaceRole = any;
+export type AuthWorkspaceStore = any;
+export type InviteProvisionResult = any;
+export type InviteValidationResult = any;
+export type ProviderAdminAdapter = any;
+export type ProviderActionContext = any;
+export type ProviderAdminStatusResult = any;
+export type ProviderStatusContext = any;
+export type AdminUserInfo = any;
+export type AdminUserStore = any;
+export type WorkspaceAccessStore = any;
+export type WorkspaceSettingsStore = any;
+export type WorkspaceSummary = any;
+
+export const registerAuthWorkspaceStore = (..._args: any[]): any => undefined;
+export const registerProviderAdminAdapter = (..._args: any[]): any => undefined;
+export const registerAdminStoreProvider = (..._args: any[]): any => undefined;
+export const registerSyncGatewayAdapter = (..._args: any[]): any => undefined;
+export const registerWebhookStore = (..._args: any[]): any => undefined;
+export const registerConnectStore = (..._args: any[]): any => undefined;
+export const registerRateLimitProvider = (..._args: any[]): any => undefined;
+export const emitWebhookSystemHook = async (..._args: any[]): Promise<void> => undefined;
+export const getActiveSyncGatewayAdapter = (..._args: any[]): any => undefined;
+export const resolveSessionContext = async (..._args: any[]): Promise<any> => ({ authenticated: false });
+export const registerProviderTokenBroker = (..._args: any[]): any => undefined;
+export const listProviderTokenBrokerIds = (..._args: any[]): any[] => [];
+export const resolveProviderToken = async (..._args: any[]): Promise<any> => null;
+export const registerDeploymentAdminChecker = (..._args: any[]): any => undefined;
+export const registerProvider = (..._args: any[]): any => undefined;
+export const memoryRateLimitProvider = (..._args: any[]): any => undefined;
+export const registerWebhook = (..._args: any[]): any => undefined;
