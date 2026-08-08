@@ -8,28 +8,44 @@
 export interface RuntimeConfigLike {
     auth?: {
         enabled?: boolean;
+        [key: string]: unknown;
     };
     sync: {
         provider?: string;
         enabled?: boolean;
+        [key: string]: unknown;
     };
     public: {
-        auth: {
+        auth?: {
             enabled?: boolean;
+            [key: string]: unknown;
         };
         sync: {
             provider?: string;
+            [key: string]: unknown;
         };
         storage: {
             provider?: string;
+            [key: string]: unknown;
         };
-        limits: {
+        limits?: {
             enabled?: boolean;
-            maxConversations: number;
+            maxConversations?: number;
+            [key: string]: unknown;
         };
+        [key: string]: unknown;
     };
+    [key: string]: unknown;
 }
 
 export const useRuntimeConfig: () => RuntimeConfigLike = () => {
+    const runtimeConfig = (
+        globalThis as typeof globalThis & {
+            useRuntimeConfig?: () => RuntimeConfigLike;
+        }
+    ).useRuntimeConfig;
+    if (runtimeConfig) {
+        return runtimeConfig();
+    }
     throw new Error('#imports shim — should never run at runtime');
 };
