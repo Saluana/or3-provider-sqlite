@@ -396,11 +396,7 @@ async function importRuntimeModule(moduleName: string): Promise<RuntimeModule> {
 }
 
 async function importCloudflareWorkersModule(): Promise<RuntimeModule> {
-    const imported: unknown = await import(/* @vite-ignore */ 'cloudflare:workers');
-    if (!isRecord(imported)) {
-        throw new Error('cloudflare:workers did not export an object.');
-    }
-    return imported;
+    return importRuntimeModule('cloudflare:workers');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -431,7 +427,7 @@ async function createBetterSqliteDatabase(path: string): Promise<SqliteRawDataba
 async function createBunSqliteDatabase(path: string): Promise<SqliteRawDatabase> {
     let imported: RuntimeModule;
     try {
-        imported = await import(/* @vite-ignore */ 'bun:sqlite');
+        imported = await importRuntimeModule('bun:sqlite');
     } catch (error) {
         throw new Error(
             'OR3_SQLITE_DRIVER=bun requires Bun and its built-in bun:sqlite module.',
