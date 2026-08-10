@@ -49,6 +49,7 @@ const SNAPSHOT_TTL_SECONDS = 60 * 60;
 const SESSION_CONTEXT_KEY_PREFIX = '__or3_session_context_';
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
 const MAX_SYNC_RETENTION_SECONDS = 365 * 24 * 60 * 60;
+const MAX_SYNC_PAYLOAD_BYTES = 256 * 1024;
 
 type SnapshotKind = 'row' | 'tombstone';
 
@@ -133,10 +134,17 @@ function validatePushOperation(workspaceId: string, op: PendingOp): string | und
     }
     const payload = op.payload as Record<string, unknown> | undefined;
     if (!payload) return undefined;
+    let serializedPayload: string;
     try {
-        JSON.stringify(payload);
+        serializedPayload = JSON.stringify(payload);
     } catch {
         return `Invalid payload for ${op.tableName}: payload is not serializable`;
+    }
+    if (
+        new TextEncoder().encode(serializedPayload).byteLength >
+        MAX_SYNC_PAYLOAD_BYTES
+    ) {
+        return `Payload too large for ${op.tableName}: exceeds ${MAX_SYNC_PAYLOAD_BYTES} bytes`;
     }
     if ('_id' in payload) return `Invalid payload for ${op.tableName}: '_id' is immutable`;
     if ('workspace_id' in payload && payload.workspace_id !== workspaceId) {

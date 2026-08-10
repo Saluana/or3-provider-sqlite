@@ -146,7 +146,7 @@ All tables use snake_case aligned with the sync wire format.
 
 ### Sync semantics
 
-- **Push**: validates ops → checks `op_id` idempotency → allocates contiguous `server_version` block → writes change_log → applies LWW to materialized tables → upserts tombstones for deletes
+- **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` block → writes change_log → applies LWW to materialized tables → upserts tombstones for deletes
 - **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination and optional table filtering
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`
 - **Cursor**: forward-only per-device cursor tracking

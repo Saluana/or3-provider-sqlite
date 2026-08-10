@@ -305,6 +305,39 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(getRawDb().prepare('SELECT COUNT(*) AS count FROM change_log').get())
                 .toEqual({ count: 1 });
         });
+
+        it('accepts payloads below 256KB and rejects larger operations', async () => {
+            const accepted = makeOp({
+                tableName: 'threads',
+                pk: 't-large-accepted',
+                payload: {
+                    id: 't-large-accepted',
+                    title: 'x'.repeat(120 * 1024),
+                },
+            });
+            const rejected = makeOp({
+                tableName: 'threads',
+                pk: 't-large-rejected',
+                payload: {
+                    id: 't-large-rejected',
+                    title: 'x'.repeat(257 * 1024),
+                },
+            });
+
+            const result = await adapter.push(
+                stubEvent,
+                makeBatch([accepted, rejected])
+            );
+
+            expect(result.results[0]).toMatchObject({ success: true });
+            expect(result.results[1]).toMatchObject({
+                success: false,
+                errorCode: 'VALIDATION_ERROR',
+            });
+            expect(result.results[1]!.error).toContain(
+                'Payload too large for threads'
+            );
+        });
     });
 
     describe('LWW', () => {
