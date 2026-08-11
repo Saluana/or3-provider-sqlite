@@ -13,6 +13,7 @@ import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { registerConnectStore } from '~~/server/connect/store/registry';
 import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
+import { registerBackgroundJobProvider } from '~~/server/utils/background-jobs/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
 import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
 import { createSqliteWebhookStore } from '../webhooks/sqlite-webhook-store';
@@ -26,6 +27,7 @@ import { createSqliteConnectStore } from '../connect/sqlite-connect-store';
 import { getSqliteDriver, initializeSqliteDb } from '../db/kysely';
 import { runMigrations } from '../db/migrate';
 import { sqliteRateLimitProvider } from '../rate-limit/sqlite-provider';
+import { sqliteBackgroundJobProvider } from '../background-jobs/sqlite-provider';
 import { useRuntimeConfig } from '#imports';
 
 const SQLITE_PROVIDER_ID = 'sqlite';
@@ -35,6 +37,7 @@ type RuntimeConfigWithSync = {
     auth?: { enabled?: boolean };
     sync?: { enabled?: boolean; provider?: string };
     connect?: { enabled?: boolean; provider?: string };
+    backgroundJobs?: { enabled?: boolean; storageProvider?: string };
 };
 
 export default defineNitroPlugin(async (nitroApp) => {
@@ -46,7 +49,10 @@ export default defineNitroPlugin(async (nitroApp) => {
     const connectSelected =
         config.connect?.enabled === true &&
         config.connect?.provider === SQLITE_PROVIDER_ID;
-    if (!syncSelected && !connectSelected) return;
+    const backgroundJobsSelected =
+        config.backgroundJobs?.enabled === true &&
+        config.backgroundJobs?.storageProvider === SQLITE_PROVIDER_ID;
+    if (!syncSelected && !connectSelected && !backgroundJobsSelected) return;
 
     const driver = getSqliteDriver();
     if (driver === 'd1' && connectSelected) {
@@ -63,6 +69,10 @@ export default defineNitroPlugin(async (nitroApp) => {
         create: createSqliteAuthWorkspaceStore,
     });
     registerRateLimitProvider(SQLITE_PROVIDER_ID, sqliteRateLimitProvider);
+    registerBackgroundJobProvider(
+        SQLITE_PROVIDER_ID,
+        sqliteBackgroundJobProvider
+    );
 
     if (syncSelected) {
         registerSyncGatewayAdapter({

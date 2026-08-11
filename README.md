@@ -125,9 +125,11 @@ On server startup, the Nitro plugin:
 6. Registers `WebhookStore` and the admin stores (workspace access, workspace
    settings, user search) — all runtimes except D1
 7. Registers `RateLimitProvider` with ID `sqlite` and the sync admin adapter
+8. Registers a durable `BackgroundJobProvider` with ID `sqlite`, so active chat
+   and workflow jobs remain addressable across Nitro HMR/module reloads
 
 Registration is skipped when `auth.enabled` is `false`, or when neither SQLite
-sync nor SQLite Connect is selected (local-only mode).
+sync, SQLite Connect, nor SQLite background jobs are selected (local-only mode).
 
 ### Schema
 
@@ -138,6 +140,8 @@ Ordered migrations create and evolve all tables:
 - **003–005**: workspace-scoped sync keys, invitations, and admin stores
 - **006_sync_snapshots**: winning operation IDs plus immutable snapshot headers/items
 - **009_or3_connect**: single-use device authorizations and connected computers
+- **017_background_jobs**: durable job status, workflow snapshots, cancellation,
+  inactivity timestamps, and worker leases
 
 Additional migrations (007–008, 010–016) evolve device-cursor ownership,
 upload intents, and Connect credential/lifecycle hardening and rate limits.

@@ -11,3 +11,12 @@ export class ConnectStoreError extends Error {
 }
 
 export async function emitWebhookSystemHook(): Promise<void> {}
+
+export function getJobConfig() {
+    return {
+        maxConcurrentJobs: 10,
+        maxConcurrentJobsPerUser: 5,
+        jobTimeoutMs: 30 * 60 * 1000,
+        completedJobRetentionMs: 60 * 60 * 1000
+    };
+}

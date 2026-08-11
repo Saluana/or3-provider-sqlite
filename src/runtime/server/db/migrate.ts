@@ -20,6 +20,7 @@ import * as m013 from './migrations/013_connect_environment_lifecycle';
 import * as m014 from './migrations/014_connect_retention_activation';
 import * as m015 from './migrations/015_rate_limits';
 import * as m016 from './migrations/016_connect_runtime_binding';
+import * as m017 from './migrations/017_background_jobs';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -46,6 +47,7 @@ const REQUIRED_SCHEMA_TABLES = [
     'connect_device_authorizations',
     'connect_environments',
     'rate_limits',
+    'background_jobs'
 ] as const;
 
 const migrations: Record<string, Migration> = {
@@ -65,6 +67,7 @@ const migrations: Record<string, Migration> = {
     '014_connect_retention_activation': m014,
     '015_rate_limits': m015,
     '016_connect_runtime_binding': m016,
+    '017_background_jobs': m017
 };
 
 class StaticMigrationProvider implements MigrationProvider {

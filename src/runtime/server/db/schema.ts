@@ -223,6 +223,29 @@ export interface RateLimitsTable {
     expires_at: number;
 }
 
+export interface BackgroundJobsTable {
+    id: string;
+    user_id: string;
+    thread_id: string;
+    message_id: string;
+    model: string;
+    kind: string | null;
+    status: 'streaming' | 'complete' | 'error' | 'aborted';
+    content: string;
+    chunks_received: number;
+    started_at: number;
+    last_activity_at: number;
+    completed_at: number | null;
+    error: string | null;
+    tool_calls_json: string | null;
+    workflow_state_json: string | null;
+    execution_json: string | null;
+    idempotency_key: string | null;
+    lease_owner: string | null;
+    lease_expires_at: number | null;
+    attempts: number;
+}
+
 export interface AdminUsersTable {
     user_id: string;
     created_at: number;
@@ -253,6 +276,7 @@ export interface Or3SqliteDb {
     connect_device_authorizations: ConnectDeviceAuthorizationsTable;
     connect_environments: ConnectEnvironmentsTable;
     rate_limits: RateLimitsTable;
+    background_jobs: BackgroundJobsTable;
     // Synced entity tables
     s_threads: SyncedEntityTable;
     s_messages: SyncedEntityTable;
