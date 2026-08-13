@@ -13,3 +13,10 @@ export function compareSyncRevision(
     if (left.opId !== right.opId) return left.opId > right.opId ? 1 : -1;
     return 0;
 }
+
+export function incomingRevisionWins(
+    incoming: SyncRevision,
+    current: SyncRevision
+): boolean {
+    return compareSyncRevision(incoming, current) > 0;
+}

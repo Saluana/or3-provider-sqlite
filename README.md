@@ -151,12 +151,13 @@ All tables use snake_case aligned with the sync wire format.
 ### Sync semantics
 
 - **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` block → writes change_log → applies LWW to materialized tables → upserts tombstones for deletes
-- **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination and optional table filtering
-- **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`
+- **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, `oldestRetainedVersion`, and `requiresSnapshot` when the cursor is behind retained history
+- **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
 - **Cursor**: forward-only per-device cursor tracking
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
+- **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
 
-LWW conflict resolution: incoming wins when `clock` is higher, or when clocks are equal and `hlc` is lexicographically greater.
+LWW conflict resolution: incoming wins when `clock` is higher, then when clocks are equal and `hlc` is lexicographically greater, then when `op_id` is greater. Tombstones use the same `(clock, hlc, op_id)` tuple. LWW losers return `applied: false` with the winning payload.
 
 Local, Bun, and Turso runtimes use `BEGIN IMMEDIATE` transactions. D1 uses its
 native atomic batch API for grouped writes.

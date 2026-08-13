@@ -17,7 +17,7 @@ import type {
 } from '~~/shared/sync/types';
 import type { H3Event } from 'h3';
 import { verifySyncContract } from '~~/shared/testing/contracts/sync';
-import { compareSyncRevision } from '~~/shared/sync/revision';
+import { incomingRevisionWins } from '~~/shared/sync/revision';
 
 const WORKSPACE_ID = 'ws-test-1';
 const DEVICE_A = 'device-a';
@@ -120,7 +120,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 return { items, highWatermark };
             },
             async resolveWinner(left, right) {
-                return compareSyncRevision(left, right) >= 0 ? left : right;
+                return incomingRevisionWins(left, right) ? left : right;
             },
         });
     });
@@ -852,7 +852,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 },
             });
             await adapter.push(
-                stubEvent,
+                makeSessionEvent('user-snapshot'),
                 makeBatch([updateThread, newNotification, deleteProject])
             );
 
@@ -887,7 +887,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 revision: { opId: originalThread.stamp.opId },
             });
 
-            const replay = await adapter.pull(stubEvent, {
+            const replay = await adapter.pull(makeSessionEvent('user-snapshot'), {
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: first.highWatermark,
                 limit: 10,
@@ -1366,5 +1366,229 @@ describe('SqliteSyncGatewayAdapter', () => {
                 })).rejects.toMatchObject({ statusCode: 400 });
             }
         );
+    });
+
+    describe('notification ownership', () => {
+        it('binds user_id, rejects spoofed owners, and scopes pull/snapshot', async () => {
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            const aliceNote = makeOp({
+                tableName: 'notifications',
+                pk: 'note-alice',
+                payload: { id: 'note-alice', title: 'alice note' },
+            });
+            const bobNote = makeOp({
+                tableName: 'notifications',
+                pk: 'note-bob',
+                payload: { id: 'note-bob', title: 'bob note' },
+            });
+            const spoofed = makeOp({
+                tableName: 'notifications',
+                pk: 'note-spoof',
+                payload: { id: 'note-spoof', title: 'spoof', user_id: 'user-bob' },
+            });
+
+            const alicePush = await adapter.push(alice, makeBatch([aliceNote]));
+            const bobPush = await adapter.push(bob, makeBatch([bobNote]));
+            const spoofPush = await adapter.push(alice, makeBatch([spoofed]));
+            const anonymous = await adapter.push(stubEvent, makeBatch([
+                makeOp({
+                    tableName: 'notifications',
+                    pk: 'note-anon',
+                    payload: { id: 'note-anon', title: 'anon' },
+                }),
+            ]));
+
+            expect(alicePush.results[0]?.success).toBe(true);
+            expect(bobPush.results[0]?.success).toBe(true);
+            expect(spoofPush.results[0]).toMatchObject({
+                success: false,
+                errorCode: 'UNAUTHORIZED',
+            });
+            expect(anonymous.results[0]).toMatchObject({
+                success: false,
+                errorCode: 'UNAUTHORIZED',
+            });
+
+            const alicePull = await adapter.pull(alice, {
+                scope: { workspaceId: WORKSPACE_ID },
+                cursor: 0,
+                limit: 50,
+            });
+            const bobPull = await adapter.pull(bob, {
+                scope: { workspaceId: WORKSPACE_ID },
+                cursor: 0,
+                limit: 50,
+            });
+            expect(alicePull.changes.filter((c) => c.tableName === 'notifications').map((c) => c.pk))
+                .toEqual(['note-alice']);
+            expect(bobPull.changes.filter((c) => c.tableName === 'notifications').map((c) => c.pk))
+                .toEqual(['note-bob']);
+            expect(alicePull.oldestRetainedVersion).toBe(1);
+            expect(alicePull.requiresSnapshot).toBe(false);
+
+            const collectSnapshot = async (event: H3Event) => {
+                const items: SnapshotItem[] = [];
+                let pageToken: string | undefined;
+                do {
+                    const page: SnapshotResponse = await adapter.snapshot(event, {
+                        scope: { workspaceId: WORKSPACE_ID },
+                        pageSize: 20,
+                        pageToken,
+                    });
+                    items.push(...page.items);
+                    pageToken = page.nextPageToken ?? undefined;
+                } while (pageToken);
+                return items.filter((item) => item.tableName === 'notifications');
+            };
+            expect((await collectSnapshot(alice)).map((item) => item.pk)).toEqual(['note-alice']);
+            expect((await collectSnapshot(bob)).map((item) => item.pk)).toEqual(['note-bob']);
+            expect(await collectSnapshot(stubEvent)).toEqual([]);
+        });
+
+        it('rejects deleting another user notification without allocating a version', async () => {
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch([
+                makeOp({
+                    tableName: 'notifications',
+                    pk: 'note-owned',
+                    payload: { id: 'note-owned', title: 'mine' },
+                }),
+            ]));
+            const before = getRawDb()
+                .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
+                .get(WORKSPACE_ID) as { value: number };
+
+            const result = await adapter.push(bob, makeBatch([
+                makeOp({
+                    tableName: 'notifications',
+                    pk: 'note-owned',
+                    operation: 'delete',
+                }),
+            ]));
+            expect(result.results[0]).toMatchObject({
+                success: false,
+                errorCode: 'UNAUTHORIZED',
+            });
+            const after = getRawDb()
+                .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
+                .get(WORKSPACE_ID) as { value: number };
+            expect(after.value).toBe(before.value);
+        });
+    });
+
+    describe('idempotency fingerprint and LWW', () => {
+        it('rejects reuse of a processed op_id with a different fingerprint', async () => {
+            const opId = randomUUID();
+            const original = makeOp({
+                tableName: 'threads',
+                pk: 't-fp',
+                payload: { id: 't-fp', title: 'original' },
+                stamp: {
+                    clock: 1,
+                    hlc: '2025-01-01T00:00:00.000Z-0000',
+                    deviceId: DEVICE_A,
+                    opId,
+                },
+            });
+            await adapter.push(stubEvent, makeBatch([original]));
+            const reused = makeOp({
+                tableName: 'threads',
+                pk: 't-fp-other',
+                payload: { id: 't-fp-other', title: 'different' },
+                stamp: {
+                    clock: 9,
+                    hlc: '2025-01-01T00:00:09.000Z-0000',
+                    deviceId: DEVICE_B,
+                    opId,
+                },
+            });
+            const result = await adapter.push(stubEvent, makeBatch([reused]));
+            expect(result.results[0]).toMatchObject({
+                success: false,
+                errorCode: 'CONFLICT',
+            });
+            expect(result.serverVersion).toBe(1);
+        });
+
+        it('returns applied false and the winning payload for an LWW loser', async () => {
+            const winnerOpId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+            const loserOpId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+            const winner = makeOp({
+                tableName: 'threads',
+                pk: 't-lww',
+                payload: { id: 't-lww', title: 'winner' },
+                stamp: {
+                    clock: 4,
+                    hlc: '2025-01-01T00:00:04.000Z-0000',
+                    deviceId: DEVICE_A,
+                    opId: winnerOpId,
+                },
+            });
+            await adapter.push(stubEvent, makeBatch([winner]));
+            const loser = makeOp({
+                tableName: 'threads',
+                pk: 't-lww',
+                payload: { id: 't-lww', title: 'loser' },
+                stamp: {
+                    clock: 4,
+                    hlc: '2025-01-01T00:00:04.000Z-0000',
+                    deviceId: DEVICE_B,
+                    opId: loserOpId,
+                },
+            });
+            const result = await adapter.push(stubEvent, makeBatch([loser]));
+            expect(result.results[0]).toMatchObject({
+                success: true,
+                applied: false,
+                payload: { id: 't-lww', title: 'winner' },
+            });
+            const row = getRawDb()
+                .prepare('SELECT data_json, op_id FROM s_threads WHERE id = ?')
+                .get('t-lww') as { data_json: string; op_id: string };
+            expect(JSON.parse(row.data_json).title).toBe('winner');
+            expect(row.op_id).toBe(winnerOpId);
+        });
+
+        it('rejects a stale put against an orphan tombstone', async () => {
+            await adapter.push(stubEvent, makeBatch([
+                makeOp({ tableName: 'threads', pk: 't-orphan' }),
+            ]));
+            await adapter.push(stubEvent, makeBatch([
+                makeOp({
+                    tableName: 'threads',
+                    pk: 't-orphan',
+                    operation: 'delete',
+                    stamp: {
+                        clock: 5,
+                        hlc: '2025-01-01T00:00:05.000Z-0000',
+                        deviceId: DEVICE_A,
+                        opId: randomUUID(),
+                    },
+                }),
+            ]));
+            getRawDb().prepare('DELETE FROM s_threads WHERE id = ?').run('t-orphan');
+            const stale = makeOp({
+                tableName: 'threads',
+                pk: 't-orphan',
+                payload: { id: 't-orphan', title: 'resurrect' },
+                stamp: {
+                    clock: 1,
+                    hlc: '2025-01-01T00:00:01.000Z-0000',
+                    deviceId: DEVICE_B,
+                    opId: randomUUID(),
+                },
+            });
+            const result = await adapter.push(stubEvent, makeBatch([stale]));
+            expect(result.results[0]).toMatchObject({
+                success: true,
+                applied: false,
+            });
+            const row = getRawDb()
+                .prepare('SELECT id FROM s_threads WHERE id = ?')
+                .get('t-orphan');
+            expect(row).toBeUndefined();
+        });
     });
 });

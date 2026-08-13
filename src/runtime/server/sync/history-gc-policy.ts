@@ -18,3 +18,18 @@ export function canRunSyncHistoryGc(): boolean {
         SYNC_HISTORY_GC_POLICY.snapshotBootstrapVerified
     );
 }
+
+export function computePullRetention(input: {
+    cursor: number;
+    oldestLogVersion: number | null;
+    highWatermark: number;
+}): { oldestRetainedVersion: number; requiresSnapshot: boolean } {
+    const oldestRetainedVersion =
+        input.oldestLogVersion ?? Math.max(0, input.highWatermark) + 1;
+    return {
+        oldestRetainedVersion,
+        requiresSnapshot:
+            oldestRetainedVersion > 0 &&
+            input.cursor < Math.max(0, oldestRetainedVersion - 1),
+    };
+}

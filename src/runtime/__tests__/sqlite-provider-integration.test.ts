@@ -322,4 +322,84 @@ describe('sqlite provider D1 integration', () => {
             store.getWorkspaceRole({ userId: accepted.userId, workspaceId })
         ).resolves.toBe('editor');
     });
+
+    it('scopes D1 notifications and rejects fingerprint reuse', async () => {
+        const { userId: alice } = await store.getOrCreateUser({
+            provider: 'clerk',
+            providerUserId: 'd1-alice',
+        });
+        const { userId: bob } = await store.getOrCreateUser({
+            provider: 'clerk',
+            providerUserId: 'd1-bob',
+        });
+        const { workspaceId } = await store.getOrCreateDefaultWorkspace(alice);
+        const aliceEvent = makeAuthenticatedEvent(alice, workspaceId);
+        const bobEvent = makeAuthenticatedEvent(bob, workspaceId);
+        const now = Math.floor(Date.now() / 1000);
+        const makeNote = (userId: string, pk: string, opId = randomUUID()) => ({
+            id: randomUUID(),
+            tableName: 'notifications' as const,
+            operation: 'put' as const,
+            pk,
+            payload: { id: pk, title: pk },
+            stamp: {
+                deviceId: `${userId}-device`,
+                opId,
+                hlc: '2025-01-01T00:00:00.000Z-0000',
+                clock: 1,
+            },
+            createdAt: now,
+            attempts: 0,
+            status: 'pending' as const,
+        });
+
+        expect((await adapter.push(aliceEvent, {
+            scope: { workspaceId },
+            ops: [makeNote(alice, 'd1-note-alice')],
+        })).results[0]?.success).toBe(true);
+        expect((await adapter.push(bobEvent, {
+            scope: { workspaceId },
+            ops: [makeNote(bob, 'd1-note-bob')],
+        })).results[0]?.success).toBe(true);
+
+        const alicePull = await adapter.pull(aliceEvent, {
+            scope: { workspaceId },
+            cursor: 0,
+            limit: 20,
+        });
+        expect(alicePull.changes.filter((c) => c.tableName === 'notifications').map((c) => c.pk))
+            .toEqual(['d1-note-alice']);
+
+        const sharedOpId = randomUUID();
+        const original = {
+            id: randomUUID(),
+            tableName: 'threads' as const,
+            operation: 'put' as const,
+            pk: 'd1-fp',
+            payload: { id: 'd1-fp', title: 'original' },
+            stamp: {
+                deviceId: 'd1-fp-device',
+                opId: sharedOpId,
+                hlc: '2025-01-01T00:00:00.000Z-0000',
+                clock: 1,
+            },
+            createdAt: now,
+            attempts: 0,
+            status: 'pending' as const,
+        };
+        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [original] });
+        const conflict = await adapter.push(stubEvent, {
+            scope: { workspaceId },
+            ops: [{
+                ...original,
+                id: randomUUID(),
+                pk: 'd1-fp-other',
+                payload: { id: 'd1-fp-other', title: 'other' },
+            }],
+        });
+        expect(conflict.results[0]).toMatchObject({
+            success: false,
+            errorCode: 'CONFLICT',
+        });
+    });
 });
