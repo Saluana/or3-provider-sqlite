@@ -232,6 +232,10 @@ export interface BackgroundJobsTable {
     kind: string | null;
     status: 'streaming' | 'complete' | 'error' | 'aborted';
     content: string;
+    reasoning: string;
+    generation_id: string | null;
+    history_phase: string | null;
+    sync_provider_id: string | null;
     chunks_received: number;
     started_at: number;
     last_activity_at: number;
@@ -244,6 +248,17 @@ export interface BackgroundJobsTable {
     lease_owner: string | null;
     lease_expires_at: number | null;
     attempts: number;
+}
+
+export interface BackgroundGenerationReceiptsTable {
+    id: string;
+    workspace_id: string;
+    generation_id: string;
+    stage: 'admission' | 'finalization';
+    fingerprint: string;
+    outcome: string;
+    server_version: number | null;
+    created_at: number;
 }
 
 export interface AdminUsersTable {
@@ -277,6 +292,7 @@ export interface Or3SqliteDb {
     connect_environments: ConnectEnvironmentsTable;
     rate_limits: RateLimitsTable;
     background_jobs: BackgroundJobsTable;
+    background_generation_receipts: BackgroundGenerationReceiptsTable;
     // Synced entity tables
     s_threads: SyncedEntityTable;
     s_messages: SyncedEntityTable;

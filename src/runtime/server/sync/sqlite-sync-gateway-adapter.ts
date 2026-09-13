@@ -6,6 +6,7 @@
  * native atomic batches for its asynchronous binding.
  */
 import type { H3Event } from 'h3';
+import { createHash } from 'node:crypto';
 import { canRunSyncHistoryGc } from './history-gc-policy';
 import { createError } from 'h3';
 import {
@@ -25,6 +26,17 @@ import type {
     UploadIntentReservationRequest,
 } from '~~/server/sync/gateway/types';
 import type {
+    AdmitChatGenerationResult,
+    CanonicalGenerationSnapshot,
+    CanonicalHistoryActor,
+    ChatGenerationAdmissionEnvelope,
+    FinalizeChatGenerationResult,
+} from '~~/shared/chat/background-history';
+import {
+    backgroundHistoryDeviceId,
+    parseChatGenerationAdmissionEnvelope,
+} from '~~/shared/chat/background-history';
+import type {
     PendingOp,
     PullRequest,
     PullResponse,
@@ -40,6 +52,7 @@ import { d1All, d1Batch, d1Run, type D1SqlStatement } from '../db/d1';
 import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
+import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
 import { computePullRetention } from './history-gc-policy';
 
 const DEFAULT_PULL_LIMIT = 100;
@@ -112,6 +125,21 @@ function stableJson(value: unknown): string {
     return `{${Object.keys(record).sort().map((key) =>
         `${JSON.stringify(key)}:${stableJson(record[key])}`
     ).join(',')}}`;
+}
+
+function backgroundHistoryOpId(
+    admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
+    stage: 'thread' | 'user' | 'assistant' | 'finalize'
+): string {
+    const hex = createHash('sha256')
+        .update(`${admission.workspaceId}\0${admission.generationId}\0${stage}`)
+        .digest('hex')
+        .slice(0, 32)
+        .split('');
+    hex[12] = '4';
+    hex[16] = ((Number.parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+    const value = hex.join('');
+    return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
 }
 
 function operationFingerprint(op: PendingOp): string {
@@ -557,13 +585,356 @@ function incomingWinsRevision(
 
 export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'sqlite';
-    readonly capabilities = {
-        snapshotBootstrap: 'snapshot-v1',
-        historyRetention: 'snapshot-v1',
-    } as const;
+    get capabilities() {
+        return isD1Driver()
+            ? ({
+                  snapshotBootstrap: 'snapshot-v1',
+                  historyRetention: 'snapshot-v1',
+              } as const)
+            : ({
+                  snapshotBootstrap: 'snapshot-v1',
+                  historyRetention: 'snapshot-v1',
+                  backgroundGenerationHistory: 'v1',
+              } as const);
+    }
 
     private get db() {
         return getSqliteDb();
+    }
+
+    private assertCanonicalActor(actor: CanonicalHistoryActor): void {
+        if (isD1Driver()) {
+            throw new Error('SQLite D1 does not support background generation history v1');
+        }
+        const membership = getRawDb()
+            .prepare(
+                `SELECT role FROM workspace_members
+                 WHERE workspace_id = ? AND user_id = ?`
+            )
+            .get(actor.workspaceId, actor.userId) as { role: string } | undefined;
+        if (!membership || (membership.role !== 'owner' && membership.role !== 'editor')) {
+            throw new Error('Forbidden background history actor');
+        }
+    }
+
+    async admitChatGeneration(
+        actor: CanonicalHistoryActor,
+        input: ChatGenerationAdmissionEnvelope
+    ): Promise<AdmitChatGenerationResult> {
+        const admission = parseChatGenerationAdmissionEnvelope(input);
+        if (actor.workspaceId !== admission.workspaceId) {
+            throw new Error('Invalid background history workspace');
+        }
+        const raw = getRawDb();
+        const fingerprint = createHash('sha256')
+            .update(stableJson(admission))
+            .digest('hex');
+        return raw.transaction(() => {
+            this.assertCanonicalActor(actor);
+            const receipt = raw
+                .prepare(
+                    `SELECT fingerprint, outcome, server_version
+                     FROM background_generation_receipts
+                     WHERE workspace_id = ? AND generation_id = ? AND stage = 'admission'`
+                )
+                .get(admission.workspaceId, admission.generationId) as
+                | { fingerprint: string; outcome: string; server_version: number | null }
+                | undefined;
+            if (receipt) {
+                if (receipt.fingerprint !== fingerprint) {
+                    throw new Error('Conflicting background admission replay');
+                }
+                return {
+                    status: 'admitted' as const,
+                    replayed: true,
+                    serverVersion: receipt.server_version ?? 0,
+                };
+            }
+
+            if (admission.kind === 'continuation') {
+                const row = raw
+                    .prepare(
+                        `SELECT data_json, clock, deleted FROM s_messages
+                         WHERE workspace_id = ? AND id = ?`
+                    )
+                    .get(admission.workspaceId, admission.messageId) as
+                    | { data_json: string; clock: number; deleted: number }
+                    | undefined;
+                const generationId = row
+                    ? (JSON.parse(row.data_json) as { data?: { generation_id?: unknown } })
+                          .data?.generation_id
+                    : undefined;
+                const expectedClock = admission.expectedAssistant?.clock ?? -1;
+                const admissionClock = admission.assistantMessage.clock;
+                if (
+                    (row && row.deleted === 1) ||
+                    (row && row.clock > admissionClock) ||
+                    (row && row.clock === admissionClock &&
+                        generationId !== admission.generationId) ||
+                    (row && row.clock > expectedClock && row.clock < admissionClock) ||
+                    (row &&
+                        row.clock === expectedClock &&
+                        admission.expectedAssistant?.generationId !== undefined &&
+                        generationId !== admission.expectedAssistant.generationId)
+                ) {
+                    throw new Error('Conflicting continuation admission');
+                }
+            }
+
+            const records = [
+                admission.thread
+                    ? { table: 'threads', materialized: 's_threads', record: admission.thread }
+                    : null,
+                admission.userMessage
+                    ? { table: 'messages', materialized: 's_messages', record: admission.userMessage }
+                    : null,
+                { table: 'messages', materialized: 's_messages', record: admission.assistantMessage },
+            ].filter(Boolean) as Array<{
+                table: 'threads' | 'messages';
+                materialized: 's_threads' | 's_messages';
+                record: Record<string, unknown> & { id: string; clock: number; hlc?: string };
+            }>;
+            const counter = raw
+                .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
+                .get(admission.workspaceId) as { value: number } | undefined;
+            const baseVersion = counter?.value ?? 0;
+            const finalVersion = baseVersion + records.length;
+            raw.prepare(
+                `INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
+                 ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`
+            ).run(admission.workspaceId, finalVersion);
+            const now = nowEpoch();
+            records.forEach((entry, index) => {
+                const opId = backgroundHistoryOpId(
+                    admission,
+                    entry.table === 'threads'
+                        ? 'thread'
+                        : entry.record.id === admission.messageId
+                          ? 'assistant'
+                          : 'user'
+                );
+                const hlc = entry.record.hlc ?? `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                const tombstone = raw.prepare(
+                    `SELECT clock, hlc, op_id FROM tombstones
+                     WHERE workspace_id = ? AND table_name = ? AND pk = ?`
+                ).get(
+                    admission.workspaceId,
+                    entry.table,
+                    entry.record.id
+                ) as { clock: number; hlc: string; op_id: string } | undefined;
+                if (tombstone && !incomingWinsRevision(
+                    { clock: entry.record.clock, hlc, opId },
+                    tombstone
+                )) {
+                    throw new Error('Background history record was superseded');
+                }
+                const sanitized = sanitizePayloadForSync(
+                    entry.table,
+                    entry.record,
+                    'put'
+                );
+                if (!sanitized) {
+                    throw new Error('Invalid background history payload');
+                }
+                const payload = { ...sanitized, hlc, op_id: opId };
+                const payloadJson = JSON.stringify(payload);
+                if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
+                    throw new Error('Invalid background history payload size');
+                }
+                const version = baseVersion + index + 1;
+                raw.prepare(
+                    `INSERT INTO change_log
+                     (id, workspace_id, server_version, table_name, pk, op, payload_json,
+                      clock, hlc, device_id, op_id, created_at)
+                     VALUES (?, ?, ?, ?, ?, 'put', ?, ?, ?, ?, ?, ?)`
+                ).run(
+                    uid(), admission.workspaceId, version, entry.table, entry.record.id,
+                    payloadJson, entry.record.clock, hlc,
+                    backgroundHistoryDeviceId(admission.generationId), opId, now
+                );
+                raw.prepare(
+                    `INSERT INTO ${entry.materialized}
+                     (id, workspace_id, data_json, clock, hlc, device_id, op_id,
+                      deleted, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                     ON CONFLICT(workspace_id, id) DO UPDATE SET
+                       data_json = excluded.data_json, clock = excluded.clock,
+                       hlc = excluded.hlc, device_id = excluded.device_id,
+                       op_id = excluded.op_id, deleted = 0, updated_at = excluded.updated_at
+                     WHERE ${lwwExcludedWins(entry.materialized)}`
+                ).run(
+                    entry.record.id, admission.workspaceId, payloadJson,
+                    entry.record.clock, hlc,
+                    backgroundHistoryDeviceId(admission.generationId), opId, now, now
+                );
+            });
+            const admittedAssistant = raw
+                .prepare(
+                    `SELECT data_json, clock, deleted FROM s_messages
+                     WHERE workspace_id = ? AND id = ?`
+                )
+                .get(admission.workspaceId, admission.messageId) as
+                | { data_json: string; clock: number; deleted: number }
+                | undefined;
+            const admittedPayload = admittedAssistant
+                ? (JSON.parse(admittedAssistant.data_json) as Record<string, unknown>)
+                : null;
+            const admittedData = admittedPayload?.data &&
+                typeof admittedPayload.data === 'object'
+                ? admittedPayload.data as Record<string, unknown>
+                : {};
+            if (
+                !admittedAssistant ||
+                admittedAssistant.deleted === 1 ||
+                admittedAssistant.clock !== admission.assistantMessage.clock ||
+                admittedData.generation_id !== admission.generationId
+            ) {
+                throw new Error('Background assistant admission was superseded');
+            }
+            raw.prepare(
+                `INSERT INTO background_generation_receipts
+                 (id, workspace_id, generation_id, stage, fingerprint, outcome,
+                  server_version, created_at)
+                 VALUES (?, ?, ?, 'admission', ?, 'admitted', ?, ?)`
+            ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, finalVersion, now);
+            return { status: 'admitted' as const, replayed: false, serverVersion: finalVersion };
+        }).immediate();
+    }
+
+    async finalizeChatGeneration(
+        actor: CanonicalHistoryActor,
+        input: {
+            admission: ChatGenerationAdmissionEnvelope;
+            snapshot: CanonicalGenerationSnapshot;
+        }
+    ): Promise<FinalizeChatGenerationResult> {
+        const admission = parseChatGenerationAdmissionEnvelope(input.admission);
+        if (actor.workspaceId !== admission.workspaceId) {
+            throw new Error('Invalid background history workspace');
+        }
+        const raw = getRawDb();
+        const fingerprint = createHash('sha256')
+            .update(stableJson(input))
+            .digest('hex');
+        return raw.transaction(() => {
+            this.assertCanonicalActor(actor);
+            const receipt = raw
+                .prepare(
+                    `SELECT fingerprint, outcome, server_version
+                     FROM background_generation_receipts
+                     WHERE workspace_id = ? AND generation_id = ? AND stage = 'finalization'`
+                )
+                .get(admission.workspaceId, admission.generationId) as
+                | { fingerprint: string; outcome: string; server_version: number | null }
+                | undefined;
+            if (receipt) {
+                if (receipt.fingerprint !== fingerprint) {
+                    throw new Error('Conflicting background finalization replay');
+                }
+                return receipt.outcome === 'committed'
+                    ? {
+                          status: 'committed' as const,
+                          replayed: true,
+                          serverVersion: receipt.server_version ?? 0,
+                      }
+                    : {
+                          status: 'superseded' as const,
+                          reason: receipt.outcome as 'deleted' | 'newer_generation' | 'edited' | 'missing',
+                      };
+            }
+            const row = raw
+                .prepare(
+                    `SELECT data_json, clock, deleted FROM s_messages
+                     WHERE workspace_id = ? AND id = ?`
+                )
+                .get(admission.workspaceId, admission.messageId) as
+                | { data_json: string; clock: number; deleted: number }
+                | undefined;
+            const current = row ? (JSON.parse(row.data_json) as Record<string, unknown>) : null;
+            const data = current?.data && typeof current.data === 'object'
+                ? (current.data as Record<string, unknown>)
+                : {};
+            let superseded: 'deleted' | 'newer_generation' | 'edited' | 'missing' | null = null;
+            if (!row || !current) superseded = 'missing';
+            else if (row.deleted === 1 || current.deleted === true) superseded = 'deleted';
+            else if (data.generation_id !== admission.generationId) superseded = 'newer_generation';
+            else if (row.clock !== admission.assistantMessage.clock) superseded = 'edited';
+            const now = nowEpoch();
+            if (superseded) {
+                raw.prepare(
+                    `INSERT INTO background_generation_receipts
+                     (id, workspace_id, generation_id, stage, fingerprint, outcome,
+                      server_version, created_at)
+                     VALUES (?, ?, ?, 'finalization', ?, ?, NULL, ?)`
+                ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, superseded, now);
+                return { status: 'superseded' as const, reason: superseded };
+            }
+            const nextClock = row!.clock + 1;
+            const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+            const opId = backgroundHistoryOpId(admission, 'finalize');
+            const terminalState = input.snapshot.status === 'complete'
+                ? 'complete'
+                : input.snapshot.status === 'aborted'
+                  ? 'aborted'
+                  : 'failed';
+            const payload = {
+                ...current!,
+                pending: false,
+                error: input.snapshot.error ?? null,
+                updated_at: Math.floor(input.snapshot.completedAt / 1000),
+                clock: nextClock,
+                hlc,
+                op_id: opId,
+                data: {
+                    ...data,
+                    content: input.snapshot.content,
+                    reasoning_text: input.snapshot.reasoning || null,
+                    tool_calls: input.snapshot.toolCalls ?? null,
+                    generation_state: terminalState,
+                    background_job_status: input.snapshot.status,
+                    background_job_error: input.snapshot.error ?? null,
+                    error: input.snapshot.error ?? null,
+                },
+            };
+            const payloadJson = JSON.stringify(payload);
+            if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
+                throw new Error('Invalid background history payload size');
+            }
+            const counter = raw
+                .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
+                .get(admission.workspaceId) as { value: number } | undefined;
+            const serverVersion = (counter?.value ?? 0) + 1;
+            raw.prepare(
+                `INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
+                 ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`
+            ).run(admission.workspaceId, serverVersion);
+            raw.prepare(
+                `UPDATE s_messages SET data_json = ?, clock = ?, hlc = ?, device_id = ?,
+                    op_id = ?, deleted = 0, updated_at = ?
+                 WHERE workspace_id = ? AND id = ?`
+            ).run(
+                payloadJson, nextClock, hlc,
+                backgroundHistoryDeviceId(admission.generationId), opId, now,
+                admission.workspaceId, admission.messageId
+            );
+            raw.prepare(
+                `INSERT INTO change_log
+                 (id, workspace_id, server_version, table_name, pk, op, payload_json,
+                  clock, hlc, device_id, op_id, created_at)
+                 VALUES (?, ?, ?, 'messages', ?, 'put', ?, ?, ?, ?, ?, ?)`
+            ).run(
+                uid(), admission.workspaceId, serverVersion, admission.messageId,
+                payloadJson, nextClock, hlc,
+                backgroundHistoryDeviceId(admission.generationId), opId, now
+            );
+            raw.prepare(
+                `INSERT INTO background_generation_receipts
+                 (id, workspace_id, generation_id, stage, fingerprint, outcome,
+                  server_version, created_at)
+                 VALUES (?, ?, ?, 'finalization', ?, 'committed', ?, ?)`
+            ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, serverVersion, now);
+            return { status: 'committed' as const, replayed: false, serverVersion };
+        }).immediate();
     }
 
     async reserveUploadIntent(
