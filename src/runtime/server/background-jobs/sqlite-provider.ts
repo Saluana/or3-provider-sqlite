@@ -3,7 +3,10 @@ import type {
     BackgroundJobExecution,
     BackgroundJobProvider,
     CreateJobParams,
-    JobUpdate
+    JobUpdate,
+    AdmissionCancellationResult,
+    GenerationHistoryPhase,
+    TerminalGenerationSnapshot
 } from '~~/server/utils/background-jobs/types';
 import { getJobConfig } from '~~/server/utils/background-jobs/store';
 import { randomUUID } from 'node:crypto';
@@ -19,6 +22,10 @@ type JobRow = {
     kind: 'chat' | 'workflow' | null;
     status: BackgroundJob['status'];
     content: string;
+    reasoning: string;
+    generation_id: string | null;
+    history_phase: string | null;
+    sync_provider_id: string | null;
     chunks_received: number;
     started_at: number;
     last_activity_at: number;
@@ -52,6 +59,11 @@ function toJob(row: JobRow): BackgroundJob {
         kind: row.kind ?? undefined,
         status: row.status,
         content: row.content,
+        reasoning: row.reasoning ?? '',
+        generationId: row.generation_id ?? undefined,
+        historyPhase:
+            (row.history_phase as BackgroundJob['historyPhase']) ?? undefined,
+        syncProviderId: row.sync_provider_id ?? undefined,
         chunksReceived: row.chunks_received,
         startedAt: row.started_at,
         lastActivityAt: row.last_activity_at,
@@ -107,6 +119,31 @@ function leaseLost(): Error {
     return error;
 }
 
+const ADMISSION_CANCEL_TTL_MS = 10 * 60 * 1000;
+
+function admissionCancelled(admissionId: string): Error {
+    const error = new Error(
+        `Background admission ${admissionId} was cancelled`
+    );
+    error.name = 'AdmissionCancelledError';
+    return error;
+}
+
+async function isAdmissionCancelled(
+    userId: string,
+    admissionId: string,
+    now: number
+): Promise<boolean> {
+    const row = await one<{ hit: number }>(
+        `SELECT 1 AS hit FROM background_admission_cancels
+         WHERE user_id = ? AND admission_id = ? AND expires_at > ?`,
+        userId,
+        admissionId,
+        now
+    );
+    return row !== undefined;
+}
+
 function insertParameters(
     id: string,
     params: CreateJobParams,
@@ -119,6 +156,11 @@ function insertParameters(
         params.messageId,
         params.model,
         params.kind ?? null,
+        params.initialContent ?? '',
+        params.initialReasoning ?? '',
+        params.generationId ?? null,
+        params.historyPhase ?? 'ready',
+        params.syncProviderId ?? null,
         now,
         now,
         json(params.tool_calls),
@@ -130,17 +172,23 @@ function insertParameters(
 
 const INSERT_JOB = `INSERT INTO background_jobs (
     id, user_id, thread_id, message_id, model, kind, status, content,
+    reasoning, generation_id, history_phase, sync_provider_id,
     chunks_received, started_at, last_activity_at, tool_calls_json,
     workflow_state_json, execution_json, idempotency_key, attempts
-) VALUES (?, ?, ?, ?, ?, ?, 'streaming', '', 0, ?, ?, ?, ?, ?, ?, 0)`;
+) VALUES (?, ?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0)`;
 
 const INSERT_JOB_IF_CAPACITY = `INSERT INTO background_jobs (
     id, user_id, thread_id, message_id, model, kind, status, content,
+    reasoning, generation_id, history_phase, sync_provider_id,
     chunks_received, started_at, last_activity_at, tool_calls_json,
     workflow_state_json, execution_json, idempotency_key, attempts
-) SELECT ?, ?, ?, ?, ?, ?, 'streaming', '', 0, ?, ?, ?, ?, ?, ?, 0
+) SELECT ?, ?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0
   WHERE (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming') < ?
     AND (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming' AND user_id = ?) < ?
+    AND NOT EXISTS (
+        SELECT 1 FROM background_admission_cancels
+        WHERE user_id = ? AND admission_id = ? AND expires_at > ?
+    )
   ON CONFLICT(idempotency_key) DO NOTHING
   RETURNING id`;
 
@@ -158,13 +206,25 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                     params.idempotencyKey
                 );
                 if (existing) return existing.id;
+                if (
+                    await isAdmissionCancelled(
+                        params.userId,
+                        params.idempotencyKey,
+                        now
+                    )
+                ) {
+                    throw admissionCancelled(params.idempotencyKey);
+                }
             }
             const inserted = await all<{ id: string }>(
                 INSERT_JOB_IF_CAPACITY,
                 ...insertParameters(id, params, now),
                 config.maxConcurrentJobs,
                 params.userId,
-                config.maxConcurrentJobsPerUser
+                config.maxConcurrentJobsPerUser,
+                params.userId,
+                params.idempotencyKey ?? '',
+                now
             );
             if (inserted[0]) return inserted[0].id;
             if (params.idempotencyKey) {
@@ -173,6 +233,15 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                     params.idempotencyKey
                 );
                 if (existing) return existing.id;
+                if (
+                    await isAdmissionCancelled(
+                        params.userId,
+                        params.idempotencyKey,
+                        now
+                    )
+                ) {
+                    throw admissionCancelled(params.idempotencyKey);
+                }
             }
             throw new Error('Maximum concurrent background jobs reached');
         }
@@ -189,6 +258,20 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                         | { id: string }
                         | undefined;
                     if (existing) return existing.id;
+                    const cancelled = raw
+                        .prepare(
+                            `SELECT 1 AS hit FROM background_admission_cancels
+                             WHERE user_id = ? AND admission_id = ?
+                               AND expires_at > ?`
+                        )
+                        .get(
+                            params.userId,
+                            params.idempotencyKey,
+                            now
+                        ) as { hit: number } | undefined;
+                    if (cancelled) {
+                        throw admissionCancelled(params.idempotencyKey);
+                    }
                 }
                 const active = raw
                     .prepare(
@@ -224,12 +307,120 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         return row ? toJob(row) : null;
     }
 
+    async findJobByIdempotencyKey(
+        idempotencyKey: string,
+        userId: string
+    ): Promise<BackgroundJob | null> {
+        const row = await one<JobRow>(
+            'SELECT * FROM background_jobs WHERE idempotency_key = ? AND user_id = ?',
+            idempotencyKey,
+            userId
+        );
+        return row ? toJob(row) : null;
+    }
+
+    async cancelAdmission(
+        userId: string,
+        admissionId: string
+    ): Promise<AdmissionCancellationResult> {
+        const now = Date.now();
+        const expiresAt = now + ADMISSION_CANCEL_TTL_MS;
+        const upsertMarker = `INSERT INTO background_admission_cancels
+                (user_id, admission_id, expires_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id, admission_id)
+             DO UPDATE SET expires_at = excluded.expires_at`;
+        const abortJob = `UPDATE background_jobs SET status = 'aborted',
+                completed_at = ?, last_activity_at = ?, error = ?,
+                lease_owner = NULL, lease_expires_at = NULL,
+                history_phase = CASE
+                    WHEN generation_id IS NOT NULL
+                      AND COALESCE(history_phase, 'ready') = 'ready'
+                    THEN 'finalization_pending'
+                    ELSE history_phase END
+             WHERE id = ? AND status = 'streaming'`;
+
+        if (!isD1Driver()) {
+            const raw = getRawDb();
+            return raw
+                .transaction(() => {
+                    raw.prepare(
+                        'DELETE FROM background_admission_cancels WHERE expires_at <= ?'
+                    ).run(now);
+                    raw.prepare(upsertMarker).run(userId, admissionId, expiresAt);
+                    const job = raw
+                        .prepare(
+                            'SELECT id, status FROM background_jobs WHERE user_id = ? AND idempotency_key = ?'
+                        )
+                        .get(userId, admissionId) as
+                        | { id: string; status: BackgroundJob['status'] }
+                        | undefined;
+                    if (!job) {
+                        return { aborted: false, pending: true };
+                    }
+                    if (job.status === 'streaming') {
+                        const changes = raw
+                            .prepare(abortJob)
+                            .run(
+                                now,
+                                now,
+                                'Cancelled by user',
+                                job.id
+                            ).changes;
+                        return {
+                            aborted: changes > 0,
+                            jobId: job.id,
+                            pending: false,
+                        };
+                    }
+                    return { aborted: false, jobId: job.id, pending: false };
+                })
+                .immediate();
+        }
+
+        await run(
+            'DELETE FROM background_admission_cancels WHERE expires_at <= ?',
+            now
+        );
+        await run(upsertMarker, userId, admissionId, expiresAt);
+        const job = await one<{
+            id: string;
+            status: BackgroundJob['status'];
+        }>(
+            'SELECT id, status FROM background_jobs WHERE user_id = ? AND idempotency_key = ?',
+            userId,
+            admissionId
+        );
+        if (!job) {
+            return { aborted: false, pending: true };
+        }
+        if (job.status === 'streaming') {
+            const changes = await run(
+                abortJob,
+                now,
+                now,
+                'Cancelled by user',
+                job.id
+            );
+            return {
+                aborted: changes > 0,
+                jobId: job.id,
+                pending: false,
+            };
+        }
+        return { aborted: false, jobId: job.id, pending: false };
+    }
+
     async updateJob(jobId: string, update: JobUpdate): Promise<void> {
         const sets = ['last_activity_at = ?'];
         const values: unknown[] = [Date.now()];
         if (update.contentChunk !== undefined) {
             sets.push('content = content || ?');
             values.push(update.contentChunk);
+        }
+        if (update.reasoningChunk !== undefined) {
+            sets.push('reasoning = reasoning || ?');
+            values.push(update.reasoningChunk);
         }
         if (update.chunksReceived !== undefined) {
             sets.push('chunks_received = ?');
@@ -246,8 +437,9 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         values.push(jobId);
         let where = "id = ? AND status = 'streaming'";
         if (update.leaseOwner) {
-            where += ' AND lease_owner = ?';
+            where += ' AND lease_owner = ? AND lease_expires_at > ?';
             values.push(update.leaseOwner);
+            values.push(Date.now());
         }
         const changes = await run(
             `UPDATE background_jobs SET ${sets.join(', ')} WHERE ${where}`,
@@ -303,7 +495,12 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         return (
             (await run(
                 `UPDATE background_jobs SET status = 'aborted', completed_at = ?,
-                last_activity_at = ?, lease_owner = NULL, lease_expires_at = NULL
+                last_activity_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                history_phase = CASE
+                    WHEN generation_id IS NOT NULL
+                      AND COALESCE(history_phase, 'ready') = 'ready'
+                    THEN 'finalization_pending'
+                    ELSE history_phase END
              WHERE id = ? AND user_id = ? AND status = 'streaming'`,
                 now,
                 now,
@@ -331,13 +528,29 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         now: number,
         leaseExpiresAt: number
     ): Promise<BackgroundJob | null> {
+        // Recovery must reproduce the memory/Convex contract: a reclaimed job
+        // resets text/iteration progress to its checkpoint before new deltas
+        // append. Otherwise the restarted model appends onto pre-crash output.
         const row = await one<JobRow>(
-            `UPDATE background_jobs SET lease_owner = ?, lease_expires_at = ?, attempts = attempts + 1
+            `UPDATE background_jobs SET
+                lease_owner = ?,
+                lease_expires_at = ?,
+                last_activity_at = ?,
+                content = CASE WHEN attempts > 0
+                    THEN COALESCE(json_extract(execution_json, '$.contentBase'), '')
+                    ELSE content END,
+                reasoning = CASE WHEN attempts > 0
+                    THEN COALESCE(json_extract(execution_json, '$.reasoningBase'), '')
+                    ELSE reasoning END,
+                chunks_received = CASE WHEN attempts > 0 THEN 0 ELSE chunks_received END,
+                attempts = attempts + 1
              WHERE id = ? AND status = 'streaming' AND execution_json IS NOT NULL
+               AND COALESCE(history_phase, 'ready') = 'ready'
                AND (lease_owner IS NULL OR lease_expires_at <= ?)
              RETURNING *`,
             leaseOwner,
             leaseExpiresAt,
+            now,
             jobId,
             now
         );
@@ -350,15 +563,28 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         leaseExpiresAt: number
     ): Promise<BackgroundJob | null> {
         const row = await one<JobRow>(
-            `UPDATE background_jobs SET lease_owner = ?, lease_expires_at = ?, attempts = attempts + 1
+            `UPDATE background_jobs SET
+                lease_owner = ?,
+                lease_expires_at = ?,
+                last_activity_at = ?,
+                content = CASE WHEN attempts > 0
+                    THEN COALESCE(json_extract(execution_json, '$.contentBase'), '')
+                    ELSE content END,
+                reasoning = CASE WHEN attempts > 0
+                    THEN COALESCE(json_extract(execution_json, '$.reasoningBase'), '')
+                    ELSE reasoning END,
+                chunks_received = CASE WHEN attempts > 0 THEN 0 ELSE chunks_received END,
+                attempts = attempts + 1
              WHERE id = (
                 SELECT id FROM background_jobs
                 WHERE status = 'streaming' AND execution_json IS NOT NULL
+                  AND COALESCE(history_phase, 'ready') = 'ready'
                   AND (lease_owner IS NULL OR lease_expires_at <= ?)
                 ORDER BY started_at ASC LIMIT 1
              ) RETURNING *`,
             leaseOwner,
             leaseExpiresAt,
+            now,
             now
         );
         return row ? toJob(row) : null;
@@ -373,11 +599,13 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         return (
             (await run(
                 `UPDATE background_jobs SET lease_expires_at = ?, last_activity_at = ?
-             WHERE id = ? AND status = 'streaming' AND lease_owner = ?`,
+             WHERE id = ? AND status = 'streaming' AND lease_owner = ?
+               AND lease_expires_at > ?`,
                 leaseExpiresAt,
                 Date.now(),
                 jobId,
-                leaseOwner
+                leaseOwner,
+                Date.now()
             )) > 0
         );
     }
@@ -399,19 +627,86 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         );
     }
 
+    async saveTerminalSnapshot(
+        jobId: string,
+        snapshot: TerminalGenerationSnapshot,
+        leaseOwner?: string
+    ): Promise<boolean> {
+        const values: unknown[] = [
+            snapshot.status,
+            snapshot.content,
+            snapshot.reasoning,
+            json(snapshot.toolCalls),
+            snapshot.error ?? null,
+            snapshot.completedAt,
+            snapshot.completedAt,
+        ];
+        let where = "id = ? AND status = 'streaming'";
+        values.push(jobId);
+        if (leaseOwner) {
+            where += ' AND lease_owner = ? AND lease_expires_at > ?';
+            values.push(leaseOwner, Date.now());
+        }
+        return (
+            (await run(
+                `UPDATE background_jobs SET status = ?, content = ?, reasoning = ?,
+                    tool_calls_json = ?, error = ?, completed_at = ?,
+                    history_phase = 'finalization_pending',
+                    last_activity_at = ?, lease_owner = NULL, lease_expires_at = NULL
+                 WHERE ${where}`,
+                ...values
+            )) > 0
+        );
+    }
+
+    async setHistoryPhase(
+        jobId: string,
+        phase: GenerationHistoryPhase,
+        options?: { from?: GenerationHistoryPhase[] }
+    ): Promise<boolean> {
+        const values: unknown[] = [phase, jobId];
+        let where = 'id = ?';
+        if (options?.from && options.from.length > 0) {
+            const placeholders = options.from.map(() => '?').join(', ');
+            where += ` AND COALESCE(history_phase, 'ready') IN (${placeholders})`;
+            values.push(...options.from);
+        }
+        return (await run(`UPDATE background_jobs SET history_phase = ? WHERE ${where}`, ...values)) > 0;
+    }
+
+    async getPendingHistoryJobs(limit: number): Promise<BackgroundJob[]> {
+        const rows = await all<JobRow>(
+            `SELECT * FROM background_jobs
+             WHERE history_phase IN ('admission_pending', 'finalization_pending')
+             ORDER BY started_at ASC
+             LIMIT ?`,
+            Math.max(1, Math.min(100, Math.floor(limit)))
+        );
+        return rows.map(toJob);
+    }
+
     async cleanupExpired(): Promise<number> {
         const config = getJobConfig();
         const now = Date.now();
         const timedOut = await run(
             `UPDATE background_jobs SET status = 'error', error = 'Job timed out',
-                completed_at = ?, lease_owner = NULL, lease_expires_at = NULL
+                completed_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+                history_phase = CASE
+                    WHEN generation_id IS NOT NULL
+                      AND COALESCE(history_phase, 'ready') = 'ready'
+                    THEN 'finalization_pending'
+                    ELSE history_phase END
              WHERE status = 'streaming' AND last_activity_at <= ?`,
             now,
             now - config.jobTimeoutMs
         );
         const removed = await run(
             `DELETE FROM background_jobs
-             WHERE status != 'streaming' AND completed_at IS NOT NULL AND completed_at <= ?`,
+             WHERE status != 'streaming' AND completed_at IS NOT NULL AND completed_at <= ?
+               AND (
+                 history_phase IS NULL
+                 OR history_phase IN ('ready', 'committed', 'superseded')
+               )`,
             now - config.completedJobRetentionMs
         );
         return timedOut + removed;

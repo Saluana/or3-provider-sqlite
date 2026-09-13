@@ -21,6 +21,9 @@ import * as m014 from './migrations/014_connect_retention_activation';
 import * as m015 from './migrations/015_rate_limits';
 import * as m016 from './migrations/016_connect_runtime_binding';
 import * as m017 from './migrations/017_background_jobs';
+import * as m018 from './migrations/018_background_admission_cancels';
+import * as m019 from './migrations/019_background_generation_history';
+import * as m020 from './migrations/020_background_generation_receipts';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -47,7 +50,9 @@ const REQUIRED_SCHEMA_TABLES = [
     'connect_device_authorizations',
     'connect_environments',
     'rate_limits',
-    'background_jobs'
+    'background_jobs',
+    'background_admission_cancels',
+    'background_generation_receipts'
 ] as const;
 
 const migrations: Record<string, Migration> = {
@@ -67,7 +72,10 @@ const migrations: Record<string, Migration> = {
     '014_connect_retention_activation': m014,
     '015_rate_limits': m015,
     '016_connect_runtime_binding': m016,
-    '017_background_jobs': m017
+    '017_background_jobs': m017,
+    '018_background_admission_cancels': m018,
+    '019_background_generation_history': m019,
+    '020_background_generation_receipts': m020
 };
 
 class StaticMigrationProvider implements MigrationProvider {

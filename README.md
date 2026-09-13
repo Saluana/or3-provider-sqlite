@@ -5,7 +5,7 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 ## What it provides
 
 - **AuthWorkspaceStore** (`sqlite`) — user identity mapping, workspace CRUD, role resolution
-- **SyncGatewayAdapter** (`sqlite`) — push/pull sync, consistent materialized snapshot pages, LWW conflict resolution, and cursor tracking
+- **SyncGatewayAdapter** (`sqlite`) — push/pull sync, consistent materialized snapshot pages, LWW conflict resolution, cursor tracking, and canonical background-generation history on synchronous SQLite runtimes
 - **ConnectStore** (`sqlite`) — durable, atomic device enrollment and connected-computer records for OR3 Connect
 - **WebhookStore** (`sqlite`) — durable webhook registrations and delivery logs (local, Bun, and Turso runtimes)
 - **Admin stores** (`sqlite`) — workspace access/lifecycle, workspace settings, user search, and deployment-admin grants (local, Bun, and Turso runtimes)
@@ -142,6 +142,13 @@ Ordered migrations create and evolve all tables:
 - **009_or3_connect**: single-use device authorizations and connected computers
 - **017_background_jobs**: durable job status, workflow snapshots, cancellation,
   inactivity timestamps, and worker leases
+- **018–020**: durable pre-admission cancellation, reasoning/generation history
+  phases, and idempotent canonical generation-write receipts
+
+Background-job claims reset text and iteration progress back to the durable
+checkpoint when reclaiming an expired lease, matching the memory/Convex recovery
+contract. The provider implements `findJobByIdempotencyKey`, which lets the
+server cancel an admission before the client has received its job ID.
 
 Additional migrations (007–008, 010–016) evolve device-cursor ownership,
 upload intents, and Connect credential/lifecycle hardening and rate limits.
@@ -161,6 +168,13 @@ LWW conflict resolution: incoming wins when `clock` is higher, then when clocks 
 
 Local, Bun, and Turso runtimes use `BEGIN IMMEDIATE` transactions. D1 uses its
 native atomic batch API for grouped writes.
+
+Canonical background generation history is advertised by the local, Bun, and
+Turso adapters. It writes admission rows, contiguous change-log versions,
+materialized state, and the receipt in one transaction, then commits a terminal
+snapshot only if its generation still owns the assistant row. D1 does not
+advertise this versioned capability, so background chat admission fails before
+model execution there; ordinary sync and other D1 features are unchanged.
 
 ### Workspace store
 

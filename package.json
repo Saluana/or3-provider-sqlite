@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-sqlite",
-    "version": "0.0.9",
+    "version": "0.0.10",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-sqlite.git"

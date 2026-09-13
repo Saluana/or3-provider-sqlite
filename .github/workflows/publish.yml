@@ -44,7 +44,6 @@ jobs:
             fi
             grep -Eq 'E404|404 Not Found|not found' <<<"$output" || { echo "$output" >&2; exit "${status}"; }
           fi
-      - run: bun run type-check
       - run: bun run type-check:standalone
       - run: bun run test
       - run: bun run build
