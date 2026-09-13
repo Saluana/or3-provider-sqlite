@@ -950,10 +950,28 @@ describe('SqliteSyncGatewayAdapter', () => {
                     hash: 'a'.repeat(64),
                     sizeBytes: 321,
                     storageId: 'object-1',
+                    mimeType: 'image/png',
+                    name: 'live.png',
+                    fileKind: 'image',
                     updatedAt: expect.any(Number),
                 }],
                 hasMore: false,
             });
+        });
+
+        it('accepts a zero-byte upload reservation', async () => {
+            const now = Math.floor(Date.now() / 1000);
+            await expect(adapter.reserveUploadIntent(stubEvent, {
+                intentId: 'intent-empty',
+                workspaceId: WORKSPACE_ID,
+                hash: `sha256:${'d'.repeat(64)}`,
+                mimeType: 'application/octet-stream',
+                sizeBytes: 0,
+                expiresAt: now + 60,
+            })).resolves.toBeUndefined();
+            expect(getRawDb().prepare(
+                'SELECT size_bytes FROM upload_intents WHERE id = ?',
+            ).get('intent-empty')).toMatchObject({ size_bytes: 0 });
         });
 
         it('keyset-pages canonical reference edges with a strict response bound', async () => {

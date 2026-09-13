@@ -571,7 +571,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         input: UploadIntentReservationRequest
     ): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.workspaceId);
-        if (!input.intentId || !Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 1 ||
+        if (!input.intentId || !Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0 ||
             !Number.isSafeInteger(input.expiresAt) || input.expiresAt <= nowEpoch()) {
             throw createError({ statusCode: 400, statusMessage: 'Invalid upload intent' });
         }
@@ -773,11 +773,24 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
                 }
                 const storageId = payload.storage_id ?? payload.storageId;
+                const fileKind =
+                    payload.kind === 'image'
+                        ? ('image' as const)
+                        : payload.kind === 'pdf'
+                          ? ('pdf' as const)
+                          : payload.kind === 'file'
+                            ? ('file' as const)
+                            : undefined;
                 return {
                     kind: 'metadata' as const,
                     hash: normalizeStorageHash(row.id),
                     sizeBytes: size,
                     ...(typeof storageId === 'string' && storageId ? { storageId } : {}),
+                    ...(typeof (payload.mime_type ?? payload.mimeType) === 'string'
+                        ? { mimeType: String(payload.mime_type ?? payload.mimeType) }
+                        : {}),
+                    ...(typeof payload.name === 'string' ? { name: payload.name } : {}),
+                    ...(fileKind ? { fileKind } : {}),
                     updatedAt: row.updated_at,
                 };
             });
