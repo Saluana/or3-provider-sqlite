@@ -555,6 +555,39 @@ class SqliteWorkspaceSettingsStore implements WorkspaceSettingsStore {
             )
             .execute();
     }
+
+    /** Atomically write only when the stored value still equals the expected value. */
+    async compareAndSet(
+        workspaceId: string,
+        key: string,
+        expectedValue: string | null,
+        nextValue: string
+    ): Promise<boolean> {
+        const now = nowEpoch();
+        if (expectedValue === null) {
+            const result = await this.db
+                .insertInto('admin_workspace_settings')
+                .values({
+                    id: globalThis.crypto.randomUUID(),
+                    workspace_id: workspaceId,
+                    key,
+                    value: nextValue,
+                    updated_at: now,
+                })
+                .onConflict((oc) => oc.columns(['workspace_id', 'key']).doNothing())
+                .executeTakeFirst();
+            return Number(result.numInsertedOrUpdatedRows ?? 0) === 1;
+        }
+
+        const result = await this.db
+            .updateTable('admin_workspace_settings')
+            .set({ value: nextValue, updated_at: now })
+            .where('workspace_id', '=', workspaceId)
+            .where('key', '=', key)
+            .where('value', '=', expectedValue)
+            .executeTakeFirst();
+        return Number(result.numUpdatedRows ?? 0) === 1;
+    }
 }
 
 class SqliteAdminUserStore implements AdminUserStore {

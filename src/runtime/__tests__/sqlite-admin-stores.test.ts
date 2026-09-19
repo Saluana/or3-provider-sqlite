@@ -89,6 +89,33 @@ describe('sqlite admin stores', () => {
         expect(await settingsStore.get(workspaceId, 'missing')).toBeNull();
     });
 
+    it('compares and sets workspace settings atomically', async () => {
+        const authStore = new SqliteAuthWorkspaceStore();
+        const settingsStore = createSqliteWorkspaceSettingsStore();
+        const competingStore = createSqliteWorkspaceSettingsStore();
+        const { userId } = await authStore.getOrCreateUser({
+            provider: 'basic-auth',
+            providerUserId: 'cas-owner',
+        });
+        const { workspaceId } = await authStore.createWorkspace({
+            userId,
+            name: 'CAS Workspace',
+        });
+
+        const competing = await Promise.all([
+            settingsStore.compareAndSet!(workspaceId, 'race', null, 'left'),
+            competingStore.compareAndSet!(workspaceId, 'race', null, 'right'),
+        ]);
+        expect(competing.filter(Boolean)).toHaveLength(1);
+        expect(['left', 'right']).toContain(await settingsStore.get(workspaceId, 'race'));
+
+        expect(await settingsStore.compareAndSet!(workspaceId, 'setup', null, 'one')).toBe(true);
+        expect(await settingsStore.compareAndSet!(workspaceId, 'setup', null, 'stale')).toBe(false);
+        expect(await settingsStore.compareAndSet!(workspaceId, 'setup', 'one', 'two')).toBe(true);
+        expect(await settingsStore.compareAndSet!(workspaceId, 'setup', 'one', 'stale')).toBe(false);
+        expect(await settingsStore.get(workspaceId, 'setup')).toBe('two');
+    });
+
     it('supports workspace create, soft-delete, restore, search, and member removal', async () => {
         const authStore = new SqliteAuthWorkspaceStore();
         const accessStore = createSqliteWorkspaceAccessStore();

@@ -235,3 +235,7 @@ bun run build       # build for distribution
   `OR3_CONNECT_ENABLED=false` or switch to better-sqlite3, Bun, or Turso.
 - **`OR3_SQLITE_DRIVER=bun requires Bun`** — the Bun driver only runs under
   the Bun runtime with its built-in `bun:sqlite`.
+
+### Atomic workspace settings
+
+The workspace settings store implements `compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null` expected value means the key must be absent; a conflict returns `false` without overwriting it. The host uses this for concurrent plugin setup saves and persistent AI spend reservations.
