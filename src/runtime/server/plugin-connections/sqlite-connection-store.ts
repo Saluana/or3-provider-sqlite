@@ -1,5 +1,6 @@
 import type {
     ConnectionTestEvidence,
+    PluginConnectionUpdate,
     StoredPluginConnection,
 } from '~~/shared/plugins/connections/contracts';
 import type { PluginConnectionStore } from '~~/server/utils/plugins/connections/store/registry';
@@ -17,6 +18,7 @@ type ConnectionRow = {
     workspace_id: string;
     plugin_id: string;
     provider_id: string;
+    slot_id: string | null;
     label: string;
     scopes: string;
     revision: number;
@@ -52,6 +54,7 @@ function toConnection(row: ConnectionRow): StoredPluginConnection {
         workspaceId: row.workspace_id,
         pluginId: row.plugin_id,
         providerId: row.provider_id,
+        ...(row.slot_id === null ? {} : { slotId: row.slot_id }),
         label: row.label,
         scopes: parseStringArray(row.scopes),
         revision: row.revision,
@@ -98,6 +101,7 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
                 workspace_id TEXT NOT NULL,
                 plugin_id TEXT NOT NULL,
                 provider_id TEXT NOT NULL,
+                slot_id TEXT,
                 label TEXT NOT NULL DEFAULT '',
                 scopes TEXT NOT NULL DEFAULT '[]',
                 revision INTEGER NOT NULL DEFAULT 1,
@@ -122,6 +126,13 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
             CREATE INDEX IF NOT EXISTS idx_plugin_connections_owner
                 ON plugin_connections (owner_user_id);
         `);
+
+        // Additive migration for databases created before slot bindings existed.
+        try {
+            this.db.prepare(`ALTER TABLE plugin_connections ADD COLUMN slot_id TEXT`).run();
+        } catch {
+            // The column is already present; nothing to migrate.
+        }
     }
 
     /**
@@ -156,23 +167,19 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
         return row ? toConnection(row) : null;
     }
 
-    async upsert(connection: StoredPluginConnection): Promise<void> {
-        this.db
+    /**
+     * Insert-only creation. `DO NOTHING` is deliberate: an upsert here could
+     * reassign an existing record's owner, workspace, plugin or provider when two
+     * processes happen to generate the same id.
+     */
+    async insert(connection: StoredPluginConnection): Promise<boolean> {
+        const result = this.db
             .prepare(
                 `INSERT INTO plugin_connections (
-                    id, owner_user_id, workspace_id, plugin_id, provider_id, label,
-                    scopes, revision, secret_ciphertext, created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(id) DO UPDATE SET
-                    owner_user_id = excluded.owner_user_id,
-                    workspace_id = excluded.workspace_id,
-                    plugin_id = excluded.plugin_id,
-                    provider_id = excluded.provider_id,
-                    label = excluded.label,
-                    scopes = excluded.scopes,
-                    revision = excluded.revision,
-                    secret_ciphertext = excluded.secret_ciphertext,
-                    updated_at = excluded.updated_at`
+                    id, owner_user_id, workspace_id, plugin_id, provider_id, slot_id,
+                    label, scopes, revision, secret_ciphertext, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO NOTHING`
             )
             .run(
                 connection.id,
@@ -180,6 +187,7 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
                 connection.workspaceId,
                 connection.pluginId,
                 connection.providerId,
+                connection.slotId ?? null,
                 connection.label,
                 JSON.stringify(connection.scopes),
                 connection.revision,
@@ -187,6 +195,35 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
                 connection.createdAt,
                 connection.updatedAt
             );
+        return result.changes > 0;
+    }
+
+    /**
+     * Compare-and-swap update. Identity columns are not in the SET list, so a
+     * retry cannot move the record; the revision predicate is the whole
+     * concurrency control.
+     */
+    async update(update: PluginConnectionUpdate): Promise<boolean> {
+        const result = this.db
+            .prepare(
+                `UPDATE plugin_connections
+                    SET revision = ?,
+                        secret_ciphertext = ?,
+                        updated_at = ?,
+                        scopes = COALESCE(?, scopes),
+                        label = COALESCE(?, label)
+                  WHERE id = ? AND revision = ?`
+            )
+            .run(
+                update.revision,
+                update.secretCiphertext,
+                update.updatedAt,
+                update.scopes === undefined ? null : JSON.stringify(update.scopes),
+                update.label ?? null,
+                update.id,
+                update.expectedRevision
+            );
+        return result.changes > 0;
     }
 
     async delete(id: string): Promise<void> {
@@ -203,19 +240,33 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
         return row ? toEvidence(row) : null;
     }
 
-    async setTestEvidence(evidence: ConnectionTestEvidence): Promise<void> {
-        this.db
+    /**
+     * Stores evidence only when it belongs to the connection's current revision
+     * and is not older than what is already stored. A slow test that finishes
+     * after a credential rotation therefore cannot reinstate itself as current
+     * evidence, and an older completion cannot replace a newer result.
+     */
+    async setTestEvidence(evidence: ConnectionTestEvidence): Promise<boolean> {
+        const result = this.db
             .prepare(
                 `INSERT INTO plugin_connection_tests (
                     connection_id, revision, operation_id, ok, code, checked_at, detail
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 )
+                 SELECT ?, ?, ?, ?, ?, ?, ?
+                  WHERE EXISTS (
+                        SELECT 1 FROM plugin_connections
+                         WHERE id = ? AND revision = ?
+                  )
                  ON CONFLICT(connection_id) DO UPDATE SET
                     revision = excluded.revision,
                     operation_id = excluded.operation_id,
                     ok = excluded.ok,
                     code = excluded.code,
                     checked_at = excluded.checked_at,
-                    detail = excluded.detail`
+                    detail = excluded.detail
+                  WHERE excluded.revision > plugin_connection_tests.revision
+                     OR (excluded.revision = plugin_connection_tests.revision
+                         AND excluded.checked_at >= plugin_connection_tests.checked_at)`
             )
             .run(
                 evidence.connectionId,
@@ -224,8 +275,11 @@ class SqlitePluginConnectionStore implements PluginConnectionStore {
                 evidence.ok ? 1 : 0,
                 evidence.code ?? null,
                 evidence.checkedAt,
-                evidence.detail ?? null
+                evidence.detail ?? null,
+                evidence.connectionId,
+                evidence.revision
             );
+        return result.changes > 0;
     }
 }
 
