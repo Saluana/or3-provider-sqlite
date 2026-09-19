@@ -12,6 +12,7 @@ import { registerAdminStoreProvider } from '~~/server/admin/stores/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import { registerWebhookStore } from '~~/server/utils/webhooks/store/registry';
 import { registerConnectStore } from '~~/server/connect/store/registry';
+import { registerPluginConnectionStore } from '~~/server/utils/plugins/connections/store/registry';
 import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
 import { registerBackgroundJobProvider } from '~~/server/utils/background-jobs/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
@@ -24,6 +25,7 @@ import {
 } from '../admin/stores/sqlite-store';
 import { sqliteSyncAdminAdapter } from '../admin/adapters/sync-sqlite';
 import { createSqliteConnectStore } from '../connect/sqlite-connect-store';
+import { createSqlitePluginConnectionStore } from '../plugin-connections/sqlite-connection-store';
 import { getSqliteDriver, initializeSqliteDb } from '../db/kysely';
 import { runMigrations } from '../db/migrate';
 import { sqliteRateLimitProvider } from '../rate-limit/sqlite-provider';
@@ -99,6 +101,18 @@ export default defineNitroPlugin(async (nitroApp) => {
     } else {
         console.warn(
             '[or3-sqlite] Webhook persistence is unavailable with Cloudflare D1.'
+        );
+    }
+
+    if (driver !== 'd1') {
+        registerPluginConnectionStore({
+            id: SQLITE_PROVIDER_ID,
+            order: 100,
+            create: createSqlitePluginConnectionStore,
+        });
+    } else {
+        console.warn(
+            '[or3-sqlite] Plugin connection persistence is unavailable with Cloudflare D1.'
         );
     }
 
