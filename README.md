@@ -239,3 +239,13 @@ bun run build       # build for distribution
 ### Atomic workspace settings
 
 The workspace settings store implements `compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null` expected value means the key must be absent; a conflict returns `false` without overwriting it. The host uses this for concurrent plugin setup saves and persistent AI spend reservations.
+
+
+### Testing local changes in OR3 Chat
+
+With this repository beside `or3-chat`, run `bun install` here once, then
+`bun run dev:ssr` from Chat. Chat's dev wrapper rebuilds the local provider and
+prints its selected path; restart it after provider edits. Missing repositories
+or failed builds fall back to installed packages with a warning.
+`OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
+installed package, so local development does not publish these changes.
