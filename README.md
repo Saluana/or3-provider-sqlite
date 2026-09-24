@@ -131,6 +131,12 @@ On server startup, the Nitro plugin:
 Registration is skipped when `auth.enabled` is `false`, or when neither SQLite
 sync, SQLite Connect, nor SQLite background jobs are selected (local-only mode).
 
+SQLite background jobs also persist mixed-runtime tool handoffs. Browser-only
+calls are atomically claimed and settled in `execution_json`; parked calls are
+excluded from worker claims until their browser result makes the job runnable.
+Parked handoffs have a separate global and per-user admission cap, so they do
+not consume active worker slots or grow without bound.
+
 ### Schema
 
 Ordered migrations create and evolve all tables:

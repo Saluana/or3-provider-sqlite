@@ -183,8 +183,14 @@ const INSERT_JOB_IF_CAPACITY = `INSERT INTO background_jobs (
     chunks_received, started_at, last_activity_at, tool_calls_json,
     workflow_state_json, execution_json, idempotency_key, attempts
 ) SELECT ?, ?, ?, ?, ?, ?, 'streaming', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0
-  WHERE (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming') < ?
-    AND (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming' AND user_id = ?) < ?
+  WHERE (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming'
+           AND json_extract(execution_json, '$.clientToolCall') IS NULL) < ?
+    AND (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming' AND user_id = ?
+           AND json_extract(execution_json, '$.clientToolCall') IS NULL) < ?
+    AND (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming'
+           AND json_extract(execution_json, '$.clientToolCall') IS NOT NULL) < ?
+    AND (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming' AND user_id = ?
+           AND json_extract(execution_json, '$.clientToolCall') IS NOT NULL) < ?
     AND NOT EXISTS (
         SELECT 1 FROM background_admission_cancels
         WHERE user_id = ? AND admission_id = ? AND expires_at > ?
@@ -219,6 +225,9 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
             const inserted = await all<{ id: string }>(
                 INSERT_JOB_IF_CAPACITY,
                 ...insertParameters(id, params, now),
+                config.maxConcurrentJobs,
+                params.userId,
+                config.maxConcurrentJobsPerUser,
                 config.maxConcurrentJobs,
                 params.userId,
                 config.maxConcurrentJobsPerUser,
@@ -275,17 +284,24 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                 }
                 const active = raw
                     .prepare(
-                        `SELECT COUNT(*) AS total,
-                    SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) AS user_total
+                        `SELECT
+                    SUM(CASE WHEN json_extract(execution_json, '$.clientToolCall') IS NULL THEN 1 ELSE 0 END) AS total,
+                    SUM(CASE WHEN user_id = ? AND json_extract(execution_json, '$.clientToolCall') IS NULL THEN 1 ELSE 0 END) AS user_total,
+                    SUM(CASE WHEN json_extract(execution_json, '$.clientToolCall') IS NOT NULL THEN 1 ELSE 0 END) AS waiting_total,
+                    SUM(CASE WHEN user_id = ? AND json_extract(execution_json, '$.clientToolCall') IS NOT NULL THEN 1 ELSE 0 END) AS waiting_user_total
                  FROM background_jobs WHERE status = 'streaming'`
                     )
-                    .get(params.userId) as {
-                    total: number;
+                    .get(params.userId, params.userId) as {
+                    total: number | null;
                     user_total: number | null;
+                    waiting_total: number | null;
+                    waiting_user_total: number | null;
                 };
                 if (
-                    active.total >= config.maxConcurrentJobs ||
-                    (active.user_total ?? 0) >= config.maxConcurrentJobsPerUser
+                    (active.total ?? 0) >= config.maxConcurrentJobs ||
+                    (active.user_total ?? 0) >= config.maxConcurrentJobsPerUser ||
+                    (active.waiting_total ?? 0) >= config.maxConcurrentJobs ||
+                    (active.waiting_user_total ?? 0) >= config.maxConcurrentJobsPerUser
                 ) {
                     throw new Error(
                         'Maximum concurrent background jobs reached'
@@ -545,6 +561,7 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                 chunks_received = CASE WHEN attempts > 0 THEN 0 ELSE chunks_received END,
                 attempts = attempts + 1
              WHERE id = ? AND status = 'streaming' AND execution_json IS NOT NULL
+               AND json_extract(execution_json, '$.clientToolCall') IS NULL
                AND COALESCE(history_phase, 'ready') = 'ready'
                AND (lease_owner IS NULL OR lease_expires_at <= ?)
              RETURNING *`,
@@ -578,6 +595,7 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
              WHERE id = (
                 SELECT id FROM background_jobs
                 WHERE status = 'streaming' AND execution_json IS NOT NULL
+                  AND json_extract(execution_json, '$.clientToolCall') IS NULL
                   AND COALESCE(history_phase, 'ready') = 'ready'
                   AND (lease_owner IS NULL OR lease_expires_at <= ?)
                 ORDER BY started_at ASC LIMIT 1
@@ -623,6 +641,69 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                 Date.now(),
                 jobId,
                 leaseOwner
+            )) > 0
+        );
+    }
+
+    async claimClientToolCall(
+        jobId: string,
+        userId: string,
+        callId: string,
+        claimToken: string,
+        claimExpiresAt: number
+    ): Promise<BackgroundJob | null> {
+        const now = Date.now();
+        const row = await one<JobRow>(
+            `UPDATE background_jobs SET
+                execution_json = json_set(
+                    execution_json,
+                    '$.clientToolCall.claimToken', ?,
+                    '$.clientToolCall.claimExpiresAt', ?
+                ),
+                last_activity_at = ?
+             WHERE id = ? AND user_id = ? AND status = 'streaming'
+               AND json_extract(execution_json, '$.clientToolCall.callId') = ?
+               AND (
+                    json_extract(execution_json, '$.clientToolCall.claimToken') IS NULL
+                    OR COALESCE(json_extract(execution_json, '$.clientToolCall.claimExpiresAt'), 0) <= ?
+               )
+             RETURNING *`,
+            claimToken,
+            claimExpiresAt,
+            now,
+            jobId,
+            userId,
+            callId,
+            now
+        );
+        return row ? toJob(row) : null;
+    }
+
+    async settleClientToolCall(
+        jobId: string,
+        userId: string,
+        callId: string,
+        claimToken: string,
+        execution: BackgroundJobExecution,
+        toolCalls: BackgroundJob['tool_calls']
+    ): Promise<boolean> {
+        const now = Date.now();
+        return (
+            (await run(
+                `UPDATE background_jobs SET execution_json = ?, tool_calls_json = ?,
+                    lease_owner = NULL, lease_expires_at = NULL, last_activity_at = ?
+                 WHERE id = ? AND user_id = ? AND status = 'streaming'
+                   AND json_extract(execution_json, '$.clientToolCall.callId') = ?
+                   AND json_extract(execution_json, '$.clientToolCall.claimToken') = ?
+                   AND COALESCE(json_extract(execution_json, '$.clientToolCall.claimExpiresAt'), 0) > ?`,
+                json(execution),
+                json(toolCalls),
+                now,
+                jobId,
+                userId,
+                callId,
+                claimToken,
+                now
             )) > 0
         );
     }
@@ -714,7 +795,8 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
 
     async getActiveJobCount(): Promise<number> {
         const row = await one<{ total: number }>(
-            "SELECT COUNT(*) AS total FROM background_jobs WHERE status = 'streaming'"
+            `SELECT COUNT(*) AS total FROM background_jobs WHERE status = 'streaming'
+             AND json_extract(execution_json, '$.clientToolCall') IS NULL`
         );
         return row?.total ?? 0;
     }

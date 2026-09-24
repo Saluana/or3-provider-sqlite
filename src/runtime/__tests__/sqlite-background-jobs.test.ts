@@ -170,6 +170,106 @@ describe('SQLite background jobs', () => {
             attempts: 2,
         });
     });
+
+    it('atomically parks, claims, and settles a browser tool call', async () => {
+        const provider = new SqliteBackgroundJobProvider();
+        const execution = {
+            version: 1 as const,
+            body: { model: 'test-model', messages: [] },
+            workspaceId: 'workspace-1',
+            referer: 'https://or3.chat',
+            apiKeyCiphertext: 'ciphertext',
+            pendingToolCalls: [
+                {
+                    id: 'call-1',
+                    type: 'function' as const,
+                    function: { name: 'client_tool', arguments: '{}' },
+                },
+            ],
+            clientToolCall: {
+                callId: 'call-1',
+                name: 'client_tool',
+                arguments: '{}',
+                argumentFingerprint: 'fingerprint',
+                definition: {
+                    type: 'function' as const,
+                    function: {
+                        name: 'client_tool',
+                        description: 'Client tool',
+                        parameters: {
+                            type: 'object' as const,
+                            properties: {},
+                        },
+                    },
+                    runtime: 'client' as const,
+                },
+            },
+        };
+        const jobId = await provider.createJob({
+            userId: 'user-1',
+            threadId: 'thread-1',
+            messageId: 'message-1',
+            model: 'test-model',
+            execution,
+            tool_calls: [
+                { id: 'call-1', name: 'client_tool', status: 'pending' },
+            ],
+        });
+
+        await expect(
+            provider.claimJob(jobId, 'worker', Date.now(), Date.now() + 1_000)
+        ).resolves.toBeNull();
+        await expect(
+            provider.claimClientToolCall(
+                jobId,
+                'user-1',
+                'call-1',
+                'token-1',
+                Date.now() + 30_000
+            )
+        ).resolves.toMatchObject({
+            execution: {
+                clientToolCall: expect.objectContaining({ claimToken: 'token-1' }),
+            },
+        });
+        await expect(
+            provider.claimClientToolCall(
+                jobId,
+                'user-1',
+                'call-1',
+                'token-2',
+                Date.now() + 30_000
+            )
+        ).resolves.toBeNull();
+
+        const settled = {
+            ...execution,
+            pendingToolCalls: undefined,
+            clientToolCall: undefined,
+        };
+        await expect(
+            provider.settleClientToolCall(
+                jobId,
+                'user-1',
+                'call-1',
+                'token-1',
+                settled,
+                [{ id: 'call-1', name: 'client_tool', status: 'complete' }]
+            )
+        ).resolves.toBe(true);
+        const resumed = await provider.claimJob(
+            jobId,
+            'worker',
+            Date.now(),
+            Date.now() + 1_000
+        );
+        expect(resumed?.execution).toMatchObject({
+            body: settled.body,
+            workspaceId: 'workspace-1',
+        });
+        expect(resumed?.execution?.clientToolCall).toBeUndefined();
+        expect(resumed?.execution?.pendingToolCalls).toBeUndefined();
+    });
 });
 
 describe('SQLite background jobs with D1', () => {
