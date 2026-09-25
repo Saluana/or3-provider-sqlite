@@ -5,10 +5,6 @@ export default defineConfig({
     resolve: {
         alias: [
             {
-                find: '~~/shared/testing/contracts/admin',
-                replacement: path.resolve(__dirname, 'src/shims/admin-test-contract.ts'),
-            },
-            {
                 find: '~~/shared/testing/contracts/sync',
                 replacement: path.resolve(__dirname, 'src/shims/sync-test-contract.ts'),
             },

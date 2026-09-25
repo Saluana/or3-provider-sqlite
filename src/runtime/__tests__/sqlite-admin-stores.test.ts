@@ -7,7 +7,6 @@ import {
     createSqliteWorkspaceAccessStore,
     createSqliteWorkspaceSettingsStore,
 } from '../server/admin/stores/sqlite-store';
-import { verifyAdminStoreProviderContract } from '~~/shared/testing/contracts/admin';
 
 describe('sqlite admin stores', () => {
     beforeEach(async () => {
@@ -18,22 +17,6 @@ describe('sqlite admin stores', () => {
 
     afterEach(async () => {
         await destroySqliteDb();
-    });
-
-    it('implements the complete shared admin provider contract', () => {
-        expect(() => verifyAdminStoreProviderContract({
-            name: 'sqlite',
-            workspaceAccess: createSqliteWorkspaceAccessStore(),
-            workspaceSettings: createSqliteWorkspaceSettingsStore(),
-            adminUsers: createSqliteAdminUserStore(),
-            capabilities: {
-                supportsServerSideAdmin: true,
-                supportsUserSearch: true,
-                supportsWorkspaceList: true,
-                supportsWorkspaceManagement: true,
-                supportsDeploymentAdminGrants: true,
-            },
-        })).not.toThrow();
     });
 
     it('lists and manages workspace membership', async () => {

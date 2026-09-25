@@ -191,6 +191,81 @@ describe('sqlite provider D1 integration', () => {
         d1.close();
     });
 
+    it('returns current live and tombstone winners for a replayed D1 push', async () => {
+        const { userId } = await store.getOrCreateUser({
+            provider: 'clerk', providerUserId: 'd1-replay-user',
+        });
+        const { workspaceId } = await store.getOrCreateDefaultWorkspace(userId);
+        const makePushOp = (clock: number, operation: 'put' | 'delete', title: string) => ({
+            id: randomUUID(),
+            tableName: 'threads',
+            operation,
+            pk: 'd1-replay-thread',
+            payload: operation === 'put' ? { id: 'd1-replay-thread', title } : undefined,
+            stamp: {
+                deviceId: 'd1-replay-device',
+                opId: randomUUID(),
+                hlc: `${clock}000-d1`,
+                clock,
+            },
+            createdAt: Math.floor(Date.now() / 1000),
+            attempts: 0,
+            status: 'pending' as const,
+        });
+        const first = makePushOp(1, 'put', 'first');
+        const second = makePushOp(2, 'put', 'second');
+        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [first] });
+        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [second] });
+        const liveReplay = await adapter.push(stubEvent, {
+            scope: { workspaceId }, ops: [first],
+        });
+        expect(liveReplay.results[0]).toMatchObject({
+            success: true, replayed: true, applied: false, serverVersion: 1,
+            winner: {
+                kind: 'put',
+                payload: { id: 'd1-replay-thread', title: 'second' },
+                revision: { clock: 2, hlc: '2000-d1', opId: second.stamp.opId },
+            },
+        });
+        const deletion = makePushOp(3, 'delete', '');
+        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [deletion] });
+        const tombstoneReplay = await adapter.push(stubEvent, {
+            scope: { workspaceId }, ops: [first],
+        });
+        expect(tombstoneReplay.results[0]).toMatchObject({
+            success: true, replayed: true, applied: false,
+            winner: {
+                kind: 'delete',
+                revision: { clock: 3, hlc: '3000-d1', opId: deletion.stamp.opId },
+            },
+        });
+        const stale = makePushOp(2, 'put', 'stale');
+        const staleResult = await adapter.push(stubEvent, {
+            scope: { workspaceId }, ops: [stale],
+        });
+        expect(staleResult.results[0]).toMatchObject({
+            success: true, applied: false,
+            winner: {
+                kind: 'delete',
+                revision: { clock: 3, hlc: '3000-d1', opId: deletion.stamp.opId },
+            },
+        });
+
+        await d1.database.prepare(
+            'DELETE FROM tombstones WHERE workspace_id = ? AND table_name = ? AND pk = ?'
+        ).bind(workspaceId, 'threads', 'd1-replay-thread').run();
+        const afterGc = await adapter.push(stubEvent, {
+            scope: { workspaceId }, ops: [first],
+        });
+        expect(afterGc.results[0]).toMatchObject({
+            success: true, replayed: true, applied: false,
+            winner: {
+                kind: 'delete',
+                revision: { clock: 3, hlc: '3000-d1', opId: deletion.stamp.opId },
+            },
+        });
+    });
+
     it('runs auth provisioning and push/pull through native D1 operations', async () => {
         const { userId } = await store.getOrCreateUser({
             provider: 'clerk',

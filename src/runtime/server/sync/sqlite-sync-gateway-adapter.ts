@@ -42,6 +42,7 @@ import type {
     PullResponse,
     PushBatch,
     PushResult,
+    PushWinner,
     SnapshotItem,
     SnapshotRequest,
     SnapshotResponse,
@@ -581,6 +582,94 @@ function incomingWinsRevision(
         hlc: existing.hlc,
         opId: existing.opId || existing.op_id || '',
     });
+}
+
+type MaterializedWinnerRow = {
+    clock: number;
+    hlc: string;
+    op_id: string;
+    data_json: string;
+    deleted: number;
+    updated_at: number;
+};
+
+type TombstoneWinnerRow = {
+    clock: number;
+    hlc: string;
+    op_id: string;
+    deleted_at: number;
+};
+
+function materializedWinner(
+    row: MaterializedWinnerRow | undefined,
+    tombstone: TombstoneWinnerRow | undefined
+): PushWinner | undefined {
+    if (
+        tombstone &&
+        (!row || incomingWinsRevision(
+            { clock: tombstone.clock, hlc: tombstone.hlc, opId: tombstone.op_id },
+            row
+        ))
+    ) {
+        return {
+            kind: 'delete',
+            revision: { clock: tombstone.clock, hlc: tombstone.hlc, opId: tombstone.op_id },
+            serverDeletedAt: tombstone.deleted_at,
+        };
+    }
+    if (!row) return undefined;
+    const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
+    return row.deleted
+        ? {
+              kind: 'delete',
+              revision,
+              serverDeletedAt: tombstone?.op_id === row.op_id
+                  ? tombstone.deleted_at
+                  : row.updated_at,
+          }
+        : { kind: 'put', payload: JSON.parse(row.data_json), revision };
+}
+
+function currentWinnerNative(
+    raw: ReturnType<typeof getRawDb>,
+    workspaceId: string,
+    tableName: string,
+    pk: string
+): PushWinner | undefined {
+    const materializedTable = SYNCED_TABLE_MAP[tableName];
+    if (!materializedTable) return undefined;
+    const row = raw.prepare(
+        `SELECT data_json, deleted, clock, hlc, op_id, updated_at
+         FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+    ).get(pk, workspaceId) as MaterializedWinnerRow | undefined;
+    const tombstone = raw.prepare(
+        `SELECT clock, hlc, op_id, deleted_at FROM tombstones
+         WHERE workspace_id = ? AND table_name = ? AND pk = ?`
+    ).get(workspaceId, tableName, pk) as TombstoneWinnerRow | undefined;
+    return materializedWinner(row, tombstone);
+}
+
+async function currentWinnerD1(
+    workspaceId: string,
+    tableName: string,
+    pk: string
+): Promise<PushWinner | undefined> {
+    const materializedTable = SYNCED_TABLE_MAP[tableName];
+    if (!materializedTable) return undefined;
+    const [row] = await d1All<MaterializedWinnerRow>(
+        `SELECT data_json, deleted, clock, hlc, op_id, updated_at
+         FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
+        pk,
+        workspaceId
+    );
+    const [tombstone] = await d1All<TombstoneWinnerRow>(
+        `SELECT clock, hlc, op_id, deleted_at FROM tombstones
+         WHERE workspace_id = ? AND table_name = ? AND pk = ?`,
+        workspaceId,
+        tableName,
+        pk
+    );
+    return materializedWinner(row, tombstone);
 }
 
 export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
@@ -1491,16 +1580,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         });
                         continue;
                     }
-                    const materialized = SYNCED_TABLE_MAP[op.tableName]
-                        ? raw.prepare(
-                            `SELECT op_id FROM ${SYNCED_TABLE_MAP[op.tableName]} WHERE id = ? AND workspace_id = ?`
-                        ).get(op.pk, workspaceId) as { op_id?: string } | undefined
-                        : undefined;
+                    const winner = currentWinnerNative(raw, workspaceId, op.tableName, op.pk);
                     uniqueResults.push({
                         opId,
                         success: true,
                         serverVersion: existingLog.server_version,
-                        applied: materialized?.op_id === opId,
+                        replayed: true,
+                        applied: winner?.revision.opId === opId,
+                        ...(winner?.revision.opId === opId ? {} : { winner }),
                     });
                     continue;
                 }
@@ -1655,7 +1742,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         success: true,
                         serverVersion,
                         applied,
-                        ...(applied ? {} : { payload: winnerPayload }),
+                        ...(applied ? {} : {
+                            payload: winnerPayload,
+                            winner: currentWinnerNative(raw, workspaceId, op.tableName, pkValue),
+                        }),
                     });
                 } else if (op.operation === 'delete') {
                     const existing = raw
@@ -1741,6 +1831,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         ...(applied || !existing
                             ? {}
                             : { payload: JSON.parse(existing.data_json) }),
+                        ...(applied ? {} : {
+                            winner: currentWinnerNative(raw, workspaceId, op.tableName, pkValue),
+                        }),
                     });
                 }
             }
@@ -3036,21 +3129,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (rejected.has(op.stamp.opId)) continue;
             const existing = existingOps.get(op.stamp.opId);
             if (existing) {
-                const materializedTable = SYNCED_TABLE_MAP[op.tableName];
-                let applied = true;
-                if (materializedTable) {
-                    const [row] = await d1All<{ op_id: string }>(
-                        `SELECT op_id FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
-                        op.pk,
-                        workspaceId
-                    );
-                    applied = row?.op_id === op.stamp.opId;
-                }
+                const winner = await currentWinnerD1(workspaceId, op.tableName, op.pk);
+                const applied = winner?.revision.opId === op.stamp.opId;
                 const result: PushResult['results'][number] = {
                     opId: op.stamp.opId,
                     success: true,
                     serverVersion: existing.server_version,
+                    replayed: true,
                     applied,
+                    ...(applied ? {} : { winner }),
                 };
                 for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
                     resultSlots[index] = result;
@@ -3084,6 +3171,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 serverVersion,
                 applied,
                 ...(applied ? {} : { payload: winnerPayload }),
+                ...(applied ? {} : {
+                    winner: await currentWinnerD1(workspaceId, op.tableName, op.pk),
+                }),
             };
             for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
                 resultSlots[index] = result;

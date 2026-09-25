@@ -170,7 +170,7 @@ All tables use snake_case aligned with the sync wire format.
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
 - **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
 
-LWW conflict resolution: incoming wins when `clock` is higher, then when clocks are equal and `hlc` is lexicographically greater, then when `op_id` is greater. Tombstones use the same `(clock, hlc, op_id)` tuple. LWW losers return `applied: false` with the winning payload.
+LWW conflict resolution: incoming wins when `clock` is higher, then when clocks are equal and `hlc` is lexicographically greater, then when `op_id` is greater. Tombstones use the same `(clock, hlc, op_id)` tuple. LWW losers return `applied: false` with the current winner as either `{ kind: 'put', payload, revision }` or `{ kind: 'delete', revision, serverDeletedAt? }`. Idempotent `op_id` retries return `replayed: true` and, if superseded, the current winner. A replay does not allocate another server version.
 
 Local, Bun, and Turso runtimes use `BEGIN IMMEDIATE` transactions. D1 uses its
 native atomic batch API for grouped writes.

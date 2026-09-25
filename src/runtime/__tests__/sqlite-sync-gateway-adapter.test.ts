@@ -162,6 +162,77 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(second.serverVersion).toBe(1);
         });
 
+        it('acknowledges a lost response and returns the newer live winner', async () => {
+            const original = makeOp({
+                tableName: 'threads', pk: 'replay-live',
+                payload: { id: 'replay-live', title: 'original' },
+                stamp: { clock: 1, hlc: '1000-a', deviceId: DEVICE_A, opId: randomUUID() },
+            });
+            await adapter.push(stubEvent, makeBatch([original]));
+            const newer = makeOp({
+                tableName: 'threads', pk: 'replay-live',
+                payload: { id: 'replay-live', title: 'newer' },
+                stamp: { clock: 2, hlc: '2000-b', deviceId: DEVICE_B, opId: randomUUID() },
+            });
+            await adapter.push(stubEvent, makeBatch([newer]));
+
+            const replay = await adapter.push(stubEvent, makeBatch([original]));
+            expect(replay.results[0]).toMatchObject({
+                success: true, replayed: true, applied: false, serverVersion: 1,
+                winner: {
+                    kind: 'put',
+                    payload: { id: 'replay-live', title: 'newer' },
+                    revision: { clock: 2, hlc: '2000-b', opId: newer.stamp.opId },
+                },
+            });
+            expect(replay.serverVersion).toBe(2);
+        });
+
+        it('returns a tombstone winner for replayed and newly stale puts', async () => {
+            const original = makeOp({
+                tableName: 'threads', pk: 'replay-deleted',
+                stamp: { clock: 1, hlc: '1000-a', deviceId: DEVICE_A, opId: randomUUID() },
+            });
+            await adapter.push(stubEvent, makeBatch([original]));
+            const deletion = makeOp({
+                tableName: 'threads', pk: 'replay-deleted', operation: 'delete',
+                stamp: { clock: 3, hlc: '3000-b', deviceId: DEVICE_B, opId: randomUUID() },
+            });
+            await adapter.push(stubEvent, makeBatch([deletion]));
+
+            const replay = await adapter.push(stubEvent, makeBatch([original]));
+            expect(replay.results[0]).toMatchObject({
+                success: true, replayed: true, applied: false,
+                winner: { kind: 'delete', revision: {
+                    clock: 3, hlc: '3000-b', opId: deletion.stamp.opId,
+                } },
+            });
+            const stale = makeOp({
+                tableName: 'threads', pk: 'replay-deleted',
+                stamp: { clock: 2, hlc: '2000-c', deviceId: DEVICE_A, opId: randomUUID() },
+            });
+            const staleResult = await adapter.push(stubEvent, makeBatch([stale]));
+            expect(staleResult.results[0]).toMatchObject({
+                success: true, applied: false,
+                winner: { kind: 'delete', revision: {
+                    clock: 3, hlc: '3000-b', opId: deletion.stamp.opId,
+                } },
+            });
+
+            // Tombstone GC may remove the side table before the old op_id is
+            // replayed. The deleted materialized row still names the winner.
+            getRawDb().prepare(
+                'DELETE FROM tombstones WHERE workspace_id = ? AND table_name = ? AND pk = ?'
+            ).run(WORKSPACE_ID, 'threads', 'replay-deleted');
+            const afterGc = await adapter.push(stubEvent, makeBatch([original]));
+            expect(afterGc.results[0]).toMatchObject({
+                success: true, replayed: true, applied: false,
+                winner: { kind: 'delete', revision: {
+                    clock: 3, hlc: '3000-b', opId: deletion.stamp.opId,
+                } },
+            });
+        });
+
         it('rejects invalid table names', async () => {
             const op = makeOp({ tableName: 'evil_table' as string, pk: 'x-1' });
 
