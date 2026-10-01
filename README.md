@@ -254,7 +254,7 @@ bun run build       # build for distribution
 
 ### Atomic workspace settings
 
-The workspace settings store implements `compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null` expected value means the key must be absent; a conflict returns `false` without overwriting it. The host uses this for concurrent plugin setup saves and persistent AI spend reservations.
+The workspace settings store implements `compareAndSet(workspaceId, key, expectedValue, nextValue)` atomically. A `null` expected value means the key must be absent; a conflict returns `false` without overwriting it. The host uses this for concurrent plugin setup saves, bulk plugin enablement and permission review, and persistent AI spend reservations. A provider without this operation cannot safely run a bulk plugin rollout. A slow plugin write may outlive the HTTP response: the host reports pending after eight seconds and keeps the plugin lock until the atomic operation settles.
 
 
 ### Testing local changes in OR3 Chat
