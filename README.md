@@ -32,7 +32,7 @@ runtime.
 | Runtime | `OR3_SQLITE_DRIVER` | Required configuration | Extra install |
 |---|---|---|---|
 | Local Node (default) | `better-sqlite3` | `OR3_SQLITE_DB_PATH` | `better-sqlite3` |
-| Bun | `bun` | `OR3_SQLITE_DB_PATH` | None; uses built-in `bun:sqlite` |
+| Bun | `bun` | `OR3_SQLITE_DB_PATH` | None for sync; uses built-in `bun:sqlite` |
 | Turso/libSQL | `turso` | `OR3_SQLITE_TURSO_URL`, `OR3_SQLITE_TURSO_AUTH_TOKEN` | `libsql` |
 | Cloudflare D1 | `d1` | `OR3_SQLITE_D1_BINDING` (defaults to `DB`) | None; uses the Worker binding |
 
@@ -50,6 +50,16 @@ OR3_SQLITE_PRAGMA_SYNCHRONOUS=NORMAL
 OR3_SQLITE_DRIVER=bun
 OR3_SQLITE_DB_PATH=/data/or3-sync.db
 ```
+
+OR3 Chat's source launcher (`bun run dev:ssr`) selects Bun when this provider
+uses the Bun driver, including when only the auth workspace store is active.
+Use the Bun version pinned in the host's `package.json`. The launcher checks
+the built-in driver and required native bindings before Nuxt starts. Run a
+built Bun-configured server with `bun .output/server/index.mjs`.
+
+Basic Auth still uses a separate `better-sqlite3` database; its native binding
+must also be compatible with Bun. The managed Cloud image uses Node and the
+default `better-sqlite3` sync driver.
 
 ### Turso/libSQL
 
