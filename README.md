@@ -144,6 +144,11 @@ use `sync.provider` even with `sync.enabled=false`; disabling conversation
 transfer does not disable the workspace store. The sync gateway remains
 unregistered while transfer is disabled.
 
+Workspace-only account storage requires `or3-provider-sqlite@0.0.12` or later.
+Version `0.0.11` skips workspace-store registration when sync, Connect and
+background jobs are all disabled, causing Chat to exit before listening.
+Upgrade the provider; conversation transfer can remain disabled.
+
 SQLite background jobs also persist mixed-runtime tool handoffs. Browser-only
 calls are atomically claimed and settled in `execution_json`; parked calls are
 excluded from worker claims until their browser result makes the job runnable.
