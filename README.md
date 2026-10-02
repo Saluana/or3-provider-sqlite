@@ -127,19 +127,22 @@ OR3_CONNECT_PROVIDER=sqlite
 
 On server startup, the Nitro plugin:
 
-1. Initializes the SQLite database (creates file if needed)
-2. Runs schema migrations automatically
-3. Registers `AuthWorkspaceStore` with ID `sqlite`
-4. Registers `SyncGatewayAdapter` when SQLite sync is selected
-5. Registers `ConnectStore` when SQLite Connect persistence is selected
-6. Registers `WebhookStore` and the admin stores (workspace access, workspace
-   settings, user search) — all runtimes except D1
-7. Registers `RateLimitProvider` with ID `sqlite` and the sync admin adapter
-8. Registers a durable `BackgroundJobProvider` with ID `sqlite`, so active chat
+1. Registers `AuthWorkspaceStore` with ID `sqlite`
+2. Registers `SyncGatewayAdapter` when SQLite conversation transfer is enabled
+3. Registers `ConnectStore` when SQLite Connect persistence is selected
+4. Registers `WebhookStore` on runtimes other than D1, and the admin store
+   provider (D1 declares server-side admin capabilities unavailable)
+5. Registers `RateLimitProvider` with ID `sqlite` and the sync admin adapter
+6. Registers a durable `BackgroundJobProvider` with ID `sqlite`, so active chat
    and workflow jobs remain addressable across Nitro HMR/module reloads
+7. Initializes the database and runs schema migrations eagerly on local
+   runtimes, or on the first Worker request for D1
 
-Registration is skipped when `auth.enabled` is `false`, or when neither SQLite
-sync, SQLite Connect, nor SQLite background jobs are selected (local-only mode).
+Registration is skipped when `auth.enabled` is `false`, or when SQLite is not
+selected for account workspaces, Connect or background jobs. Account workspaces
+use `sync.provider` even with `sync.enabled=false`; disabling conversation
+transfer does not disable the workspace store. The sync gateway remains
+unregistered while transfer is disabled.
 
 SQLite background jobs also persist mixed-runtime tool handoffs. Browser-only
 calls are atomically claimed and settled in `execution_json`; parked calls are
