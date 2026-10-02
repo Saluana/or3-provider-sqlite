@@ -54,6 +54,7 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
+import { readRequestUsage } from '~~/shared/chat/compaction';
 import { computePullRetention } from './history-gc-policy';
 
 const DEFAULT_PULL_LIMIT = 100;
@@ -966,6 +967,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 : input.snapshot.status === 'aborted'
                   ? 'aborted'
                   : 'failed';
+            const usage = readRequestUsage(input.snapshot.usage);
             const payload = {
                 ...current!,
                 pending: false,
@@ -976,6 +978,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 op_id: opId,
                 data: {
                     ...data,
+                    ...(usage ? { usage } : {}),
                     content: input.snapshot.content,
                     reasoning_text: input.snapshot.reasoning || null,
                     tool_calls: input.snapshot.toolCalls ?? null,

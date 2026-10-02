@@ -13,6 +13,12 @@ const registrations = vi.hoisted(() => ({
     jobs: new Set<string>(),
 }));
 
+// Canonical-history tests use the actual pinned registry through this exact
+// alias. Startup wiring still records the factory without replacing any store.
+vi.mock('~~/server/sync/gateway/registry', () => ({
+    registerSyncGatewayAdapter: (entry: { id: string }) => registrations.sync.add(entry.id),
+}));
+
 // The standalone suite supplies Chat registries through one existing shim.
 // Capture the actual factories registered by the plugin, not substitute stores.
 vi.mock('../../shims/or3-chat-test-runtime', async (importOriginal) => ({

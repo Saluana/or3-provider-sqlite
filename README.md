@@ -227,6 +227,13 @@ bun run type-check  # TypeScript validation
 bun run build       # build for distribution
 ```
 
+The normal test suite runs in a provider-only checkout using hash-verified,
+byte-for-byte host runtime fixtures. `bun run test:host-integration` reruns the
+same background-job, canonical-history and registration cases against a prepared
+sibling `../or3-chat` at the exact reviewed source tree. It fails on missing or
+mismatched source rather than falling back to fixtures. See the
+[fixture provenance and prerequisites](test/fixtures/host/README.md).
+
 ## Compatibility
 
 - Works with multiple auth providers (`basic-auth`, `clerk`, or custom)

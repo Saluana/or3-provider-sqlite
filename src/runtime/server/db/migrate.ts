@@ -24,6 +24,7 @@ import * as m017 from './migrations/017_background_jobs';
 import * as m018 from './migrations/018_background_admission_cancels';
 import * as m019 from './migrations/019_background_generation_history';
 import * as m020 from './migrations/020_background_generation_receipts';
+import * as m021 from './migrations/021_background_request_usage';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -75,7 +76,8 @@ const migrations: Record<string, Migration> = {
     '017_background_jobs': m017,
     '018_background_admission_cancels': m018,
     '019_background_generation_history': m019,
-    '020_background_generation_receipts': m020
+    '020_background_generation_receipts': m020,
+    '021_background_request_usage': m021
 };
 
 class StaticMigrationProvider implements MigrationProvider {

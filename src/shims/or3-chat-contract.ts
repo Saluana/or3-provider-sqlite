@@ -107,6 +107,8 @@ export type RateLimitResult<T = any, U = any, V = any, W = any, X = any> = any;
 export const RateLimitResult: any = undefined;
 export type RateLimitStats<T = any, U = any, V = any, W = any, X = any> = any;
 export const RateLimitStats: any = undefined;
+export type readRequestUsage<T = any, U = any, V = any, W = any, X = any> = any;
+export const readRequestUsage: any = undefined;
 export type registerAdminStoreProvider<T = any, U = any, V = any, W = any, X = any> = any;
 export const registerAdminStoreProvider: any = undefined;
 export type registerAuthWorkspaceStore<T = any, U = any, V = any, W = any, X = any> = any;
