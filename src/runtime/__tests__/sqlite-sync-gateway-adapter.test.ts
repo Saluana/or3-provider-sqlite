@@ -85,6 +85,27 @@ afterEach(async () => {
 });
 
 describe('SqliteSyncGatewayAdapter', () => {
+    it.each([
+        { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', title: 'Trashed native document', content: '{"type":"doc","content":[]}', file_hashes: JSON.stringify(['shared-hash']), meta: JSON.stringify({ plugin_key: 'preserved', 'or3.workspace-item': { version: 1, trashed_at: 1 } }) }, omitted: { id: 'workspace-item', postType: 'doc', meta: '' } },
+        { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'or3:file', title: 'Saved original', content: 'Indexed saffron prefix', file_hashes: JSON.stringify(['shared-hash']), meta: JSON.stringify({ plugin_key: 'preserved', 'or3.workspace-item': { version: 1, trashed_at: null, text: { coverage: 'prefix', indexed_bytes: 21 } } }) }, omitted: { id: 'workspace-item', postType: 'doc' } },
+        { tableName: 'projects', payload: { id: 'workspace-item', name: 'Project', data: [{ kind: 'file', id: 'catalog', name: 'Original', extra: 'preserved' }, { kind: 'plugin-resource', id: 'opaque', plugin_field: 'preserved' }] }, omitted: { id: 'workspace-item', name: 'Project', data: [] } },
+    ])('rejects old-writer omission transactionally for $tableName', async ({ tableName, payload, omitted }) => {
+        const first = makeOp({ tableName, pk: 'workspace-item', payload });
+        const admitted = { ...makeBatch([first]), workspaceItemCapability: 'v1' as const };
+        const saved = await adapter.push(stubEvent, admitted);
+        expect(saved.results[0]?.success).toBe(true);
+        const pull = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 10, workspaceItemCapability: 'v1' });
+        expect(pull.changes[0]?.payload).toMatchObject(payload);
+        const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 10, workspaceItemCapability: 'v1' });
+        expect(snapshot.items).toContainEqual(expect.objectContaining({ kind: 'row', tableName, pk: 'workspace-item', payload: expect.objectContaining(payload) }));
+        const old = makeOp({ tableName, pk: 'workspace-item', payload: omitted,
+            stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } });
+        await expect(adapter.push(stubEvent, makeBatch([old]))).rejects.toMatchObject({ statusCode: 426 });
+        const row = getRawDb().prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').get('workspace-item') as { data_json: string };
+        expect(JSON.parse(row.data_json)).toMatchObject(payload);
+        expect(getRawDb().prepare('SELECT count(*) AS total FROM change_log').get()).toMatchObject({ total: 1 });
+    });
+
     it('executes the shared bootstrap and revision contract', async () => {
         await verifySyncContract({
             name: 'sqlite',
@@ -1045,9 +1066,14 @@ describe('SqliteSyncGatewayAdapter', () => {
             ).get('intent-empty')).toMatchObject({ size_bytes: 0 });
         });
 
-        it('keyset-pages canonical reference edges with a strict response bound', async () => {
+        it.each([
+            ['catalog', { post_type: 'or3:file' }],
+            ['trashed catalog', { post_type: 'or3:file', meta: JSON.stringify({ 'or3.workspace-item': { version: 1, trashed_at: 10 } }) }],
+            ['trashed document', { post_type: 'doc', meta: JSON.stringify({ 'or3.workspace-item': { version: 1, trashed_at: 10 } }) }],
+            ['checkpoint', { post_type: 'or3:document-revision' }],
+        ])('keyset-pages retained %s reference edges with a strict response bound', async (_label, state) => {
             const hashes = ['a', 'b', 'c'].map((letter) => `sha256:${letter.repeat(64)}`);
-            await adapter.push(stubEvent, makeBatch([
+            const batch = makeBatch([
                 makeOp({
                     tableName: 'messages',
                     pk: 'message-1',
@@ -1056,9 +1082,10 @@ describe('SqliteSyncGatewayAdapter', () => {
                 makeOp({
                     tableName: 'posts',
                     pk: 'post-1',
-                    payload: { id: 'post-1', file_hashes: JSON.stringify(hashes.slice(2)), deleted: false },
+                    payload: { id: 'post-1', ...state, file_hashes: JSON.stringify(hashes.slice(2)), deleted: false },
                 }),
-            ]));
+            ]);
+            await adapter.push(stubEvent, { ...batch, workspaceItemCapability: 'v1' });
 
             const found: string[] = [];
             let cursor: string | undefined;

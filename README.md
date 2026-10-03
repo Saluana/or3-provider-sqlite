@@ -273,3 +273,19 @@ prints its selected path; restart it after provider edits. Missing repositories
 or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
+
+## Workspace Files and Trash admission
+
+Native synchronous adapters advertise workspace-item capability v1. Canonical
+posts/projects with catalog, logical Trash, or file-membership semantics require
+a current writer even when the incoming update omits those fields. Admission is
+checked inside the same write transaction, before versions or changes are
+allocated. Canonical retained post references include logically trashed catalog
+entries/documents and checkpoints. D1 does not advertise this transactional
+capability.
+
+This source change is a provider publication dependency for the host feature.
+Rebuild the provider before testing a file-linked host; follow the existing OR3
+release/update workflow separately. Local qualification does not authorize
+publication or a production migration. Files cloud exposure remains gated until
+the supported profile is qualified.
