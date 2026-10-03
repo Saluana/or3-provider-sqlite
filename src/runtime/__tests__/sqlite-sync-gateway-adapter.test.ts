@@ -93,6 +93,55 @@ afterEach(async () => {
 });
 
 describe('SqliteSyncGatewayAdapter', () => {
+    describe.runIf(process.env.OR3_CANONICAL_ARTIFACTS === 'true')('source-built canonical history reader', () => {
+        it('reads materialized workspace rows after log deletion, pages legacy ties both ways, and rechecks revocation', async () => {
+            const artifactDb = await import('../../../dist/runtime/server/db/kysely.js');
+            const artifactMigrations = await import('../../../dist/runtime/server/db/migrate.js');
+            const artifact = await import('../../../dist/runtime/server/sync/sqlite-sync-gateway-adapter.js');
+            const reader = new artifact.SqliteSyncGatewayAdapter();
+            await artifactMigrations.runMigrations(await artifactDb.initializeSqliteDb({ path: ':memory:' }));
+            try {
+                const raw = artifactDb.getRawDb();
+                raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Disposable canonical', 'canonical-user');
+                raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('canonical-member', WORKSPACE_ID, 'canonical-user', 'owner');
+                const actor = { userId: 'canonical-user', workspaceId: WORKSPACE_ID };
+                const metadata = { branch_mode: 'compacted', root_thread_id: 'root', summary_message_id: 'summary',
+                    parent_thread_id: 'root', anchor_message_id: 'anchor', anchor_index: 9 };
+                const rows = [makeOp({ tableName: 'threads', pk: 'canonical-thread', payload: { id: 'canonical-thread', ...metadata } }),
+                    ...Array.from({ length: 140 }, (_, index) => makeOp({ tableName: 'messages', pk: `canonical-${String(index).padStart(3, '0')}`,
+                        payload: { id: `canonical-${String(index).padStart(3, '0')}`, thread_id: 'canonical-thread', index: Math.floor(index / 2),
+                            ...(index % 2 ? { order_key: 'ordered' } : {}), role: 'assistant', clock: 1, data: { content: `evidence ${index}` } } }))];
+                await reader.push(stubEvent, makeBatch(rows));
+                // Content history is independent from retained replication logs.
+                raw.exec('DELETE FROM change_log');
+                const before = await reader.readChatHistory(actor, { kind: 'thread', thread_id: 'canonical-thread' });
+                expect(before.thread).toMatchObject(metadata);
+                const first = await reader.readChatHistory(actor, { kind: 'thread_page', thread_id: 'canonical-thread', limit: 100 });
+                const second = await reader.readChatHistory(actor, { kind: 'thread_page', thread_id: 'canonical-thread', limit: 100, cursor: first.next_cursor });
+                expect([...first.messages!, ...second.messages!].map((row) => row.id)).toEqual(rows.slice(1).map((row) => row.pk));
+                const { encodeCanonicalChatSeek } = await import('~~/shared/chat/history-reader');
+                const backward = await reader.readChatHistory(actor, { kind: 'thread_page', thread_id: 'canonical-thread', limit: 2,
+                    cursor: encodeCanonicalChatSeek({ thread_id: 'canonical-thread', backward: true, key: [1, '', 'canonical-002'] }) });
+                expect(backward.messages!.map((row) => row.id)).toEqual(['canonical-001', 'canonical-000']);
+                const byId = await reader.readChatHistory(actor, { kind: 'messages', message_ids: ['canonical-000', 'unknown'] });
+                expect(byId.messages).toHaveLength(1);
+                const foreign = await reader.readChatHistory({ ...actor, workspaceId: 'foreign' }, { kind: 'messages', message_ids: ['canonical-000'] }).catch((error: Error) => error.message);
+                expect(foreign).toContain('Forbidden');
+                const canceled = new AbortController(); canceled.abort();
+                await expect(reader.readChatHistory(actor, { kind: 'thread', thread_id: 'canonical-thread' }, canceled.signal)).rejects.toThrow();
+                raw.prepare("UPDATE s_messages SET clock = clock + 1 WHERE workspace_id = ? AND id = 'canonical-000'").run(WORKSPACE_ID);
+                const after = await reader.readChatHistory(actor, { kind: 'thread', thread_id: 'canonical-thread' });
+                expect(after.revision).not.toBe(before.revision);
+                const plan = raw.prepare(`EXPLAIN QUERY PLAN SELECT id FROM s_messages WHERE workspace_id = ?
+                    AND json_extract(data_json, '$.thread_id') = ? ORDER BY json_extract(data_json, '$.index'),
+                    COALESCE(json_extract(data_json, '$.order_key'), ''), id LIMIT 100`).all(WORKSPACE_ID, 'canonical-thread');
+                expect(JSON.stringify(plan)).toContain('s_messages_history_order');
+                expect(JSON.stringify(plan)).not.toContain('TEMP B-TREE');
+                raw.prepare("DELETE FROM workspace_members WHERE id = 'canonical-member'").run();
+                await expect(reader.readChatHistory(actor, { kind: 'messages', message_ids: ['canonical-000'] })).rejects.toThrow('Forbidden');
+            } finally { await artifactDb.destroySqliteDb(); }
+        });
+    });
     describe('durable background usage finalization', () => {
         let directory: string;
         let databasePath: string;
