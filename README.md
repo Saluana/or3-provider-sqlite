@@ -280,3 +280,7 @@ prints its selected path; restart it after provider edits. Missing repositories
 or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
+
+### Canonical compaction history reader (private source, unqualified)
+
+`canonicalChatHistory: 'v1'` and `readChatHistory` read current `s_threads`/`s_messages`, with explicit workspace membership (owner/editor/viewer), bounded by-ID queries and canonical `(index, order_key, id)` keyset pages. Migration 022 adds the JSON expression index and transactional per-thread revision triggers; current-chat tool result writes do not invalidate ancestor search cursors. The reader never consults retained sync logs. D1 omits the capability. This source patch has not been built or migration/conformance qualified, released, or selected through new package pins.
