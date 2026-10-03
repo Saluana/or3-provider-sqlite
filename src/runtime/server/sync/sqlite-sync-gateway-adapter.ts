@@ -55,7 +55,7 @@ import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
 import { readRequestUsage } from '~~/shared/chat/compaction';
-import { validateCanonicalChatQuery, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
+import { validateCanonicalChatQuery, encodeCanonicalChatSeek, parseCanonicalChatSeek, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
 import type { CanonicalHistoryRecord } from '~~/shared/chat/background-history';
 import { computePullRetention } from './history-gc-policy';
 
@@ -726,7 +726,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 return { status: 'ok' as const, revision, messages: rows.map(parse) };
             }
             let after: [number, string, string] | undefined;
-            if (query.cursor) {
+            const seek = parseCanonicalChatSeek(query.cursor, query.thread_id);
+            if (seek) after = seek.key;
+            else if (query.cursor) {
                 const value: unknown = JSON.parse(query.cursor);
                 if (!Array.isArray(value) || value.length !== 4 || value[0] !== query.thread_id
                     || !Number.isSafeInteger(value[1]) || typeof value[2] !== 'string' || typeof value[3] !== 'string') throw new Error('Invalid canonical history cursor');
@@ -734,12 +736,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             }
             const rows = raw.prepare(`SELECT id, data_json, clock, deleted FROM s_messages
                 WHERE workspace_id = ? AND json_extract(data_json, '$.thread_id') = ?
-                ${after ? "AND (json_extract(data_json, '$.index'), json_extract(data_json, '$.order_key'), id) > (?, ?, ?)" : ''}
-                ORDER BY json_extract(data_json, '$.index'), json_extract(data_json, '$.order_key'), id LIMIT ?`)
+                ${after ? `AND (json_extract(data_json, '$.index'), COALESCE(json_extract(data_json, '$.order_key'), ''), id) ${seek?.backward ? '<' : '>'} (?, ?, ?)` : ''}
+                ORDER BY json_extract(data_json, '$.index') ${seek?.backward ? 'DESC' : 'ASC'}, COALESCE(json_extract(data_json, '$.order_key'), '') ${seek?.backward ? 'DESC' : 'ASC'}, id ${seek?.backward ? 'DESC' : 'ASC'} LIMIT ?`)
                 .all(actor.workspaceId, query.thread_id, ...(after ?? []), query.limit) as StoredRow[];
             const messages = rows.map(parse); const last = messages.at(-1);
             return { status: 'ok' as const, revision, messages, next_cursor: messages.length === query.limit && last
-                ? JSON.stringify([query.thread_id, last.index, last.order_key, last.id]) : undefined };
+                ? seek ? encodeCanonicalChatSeek({ ...seek, key: [Number(last.index), String(last.order_key ?? ''), last.id] })
+                    : JSON.stringify([query.thread_id, last.index, last.order_key ?? '', last.id]) : undefined };
         })();
         signal?.throwIfAborted(); return result;
     }

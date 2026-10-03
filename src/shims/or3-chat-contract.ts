@@ -61,6 +61,8 @@ export type CreateJobParams<T = any, U = any, V = any, W = any, X = any> = any;
 export const CreateJobParams: any = undefined;
 export type emitWebhookSystemHook<T = any, U = any, V = any, W = any, X = any> = any;
 export const emitWebhookSystemHook: any = undefined;
+export type encodeCanonicalChatSeek<T = any, U = any, V = any, W = any, X = any> = any;
+export const encodeCanonicalChatSeek: any = undefined;
 export type FinalizeChatGenerationResult<T = any, U = any, V = any, W = any, X = any> = any;
 export const FinalizeChatGenerationResult: any = undefined;
 export type GenerationHistoryPhase<T = any, U = any, V = any, W = any, X = any> = any;
@@ -75,6 +77,8 @@ export type InviteValidationResult<T = any, U = any, V = any, W = any, X = any> 
 export const InviteValidationResult: any = undefined;
 export type JobUpdate<T = any, U = any, V = any, W = any, X = any> = any;
 export const JobUpdate: any = undefined;
+export type parseCanonicalChatSeek<T = any, U = any, V = any, W = any, X = any> = any;
+export const parseCanonicalChatSeek: any = undefined;
 export type parseChatGenerationAdmissionEnvelope<T = any, U = any, V = any, W = any, X = any> = any;
 export const parseChatGenerationAdmissionEnvelope: any = undefined;
 export type PendingOp<T = any, U = any, V = any, W = any, X = any> = any;
