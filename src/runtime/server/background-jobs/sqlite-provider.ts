@@ -9,6 +9,7 @@ import type {
     TerminalGenerationSnapshot
 } from '~~/server/utils/background-jobs/types';
 import { getJobConfig } from '~~/server/utils/background-jobs/store';
+import { readRequestUsage } from '~~/shared/chat/compaction';
 import { randomUUID } from 'node:crypto';
 import { d1All, d1Run } from '../db/d1';
 import { getRawDb, isD1Driver } from '../db/kysely';
@@ -32,6 +33,7 @@ type JobRow = {
     completed_at: number | null;
     error: string | null;
     tool_calls_json: string | null;
+    usage_json: string | null;
     workflow_state_json: string | null;
     execution_json: string | null;
     idempotency_key: string | null;
@@ -47,6 +49,16 @@ function parseJson<T>(value: string | null): T | undefined {
 
 function json(value: unknown): string | null {
     return value === undefined ? null : JSON.stringify(value);
+}
+
+function readStoredUsage(value: string | null) {
+    try {
+        return readRequestUsage(parseJson<unknown>(value));
+    } catch {
+        // Usage is optional telemetry. A damaged legacy value must not hide
+        // otherwise readable text or prevent terminal history reconciliation.
+        return undefined;
+    }
 }
 
 function toJob(row: JobRow): BackgroundJob {
@@ -70,6 +82,7 @@ function toJob(row: JobRow): BackgroundJob {
         completedAt: row.completed_at ?? undefined,
         error: row.error ?? undefined,
         tool_calls: parseJson<BackgroundJob['tool_calls']>(row.tool_calls_json),
+        usage: readStoredUsage(row.usage_json),
         workflow_state: parseJson<BackgroundJob['workflow_state']>(
             row.workflow_state_json
         ),
@@ -450,12 +463,20 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
             sets.push('workflow_state_json = ?');
             values.push(json(update.workflow_state));
         }
+        const usage = readRequestUsage(update.usage);
+        if (usage) {
+            // Each event is the last measured request, never a token increment.
+            sets.push('usage_json = ?');
+            values.push(json(usage));
+        }
         values.push(jobId);
         let where = "id = ? AND status = 'streaming'";
         if (update.leaseOwner) {
             where += ' AND lease_owner = ? AND lease_expires_at > ?';
             values.push(update.leaseOwner);
             values.push(Date.now());
+        } else {
+            where += ' AND lease_owner IS NULL';
         }
         const changes = await run(
             `UPDATE background_jobs SET ${sets.join(', ')} WHERE ${where}`,
@@ -494,8 +515,10 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         values.push(jobId);
         let where = "id = ? AND status = 'streaming'";
         if (leaseOwner) {
-            where += ' AND lease_owner = ?';
-            values.push(leaseOwner);
+            where += ' AND lease_owner = ? AND lease_expires_at > ?';
+            values.push(leaseOwner, now);
+        } else {
+            where += ' AND lease_owner IS NULL';
         }
         const changes = await run(
             `UPDATE background_jobs SET status = ?, completed_at = ?, last_activity_at = ?,
@@ -558,6 +581,11 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                 reasoning = CASE WHEN attempts > 0
                     THEN COALESCE(json_extract(execution_json, '$.reasoningBase'), '')
                     ELSE reasoning END,
+                usage_json = CASE WHEN attempts > 0
+                    THEN CASE WHEN json_type(execution_json, '$.normalizedToolState.requestUsage') = 'object'
+                        THEN json_extract(execution_json, '$.normalizedToolState.requestUsage')
+                        ELSE NULL END
+                    ELSE usage_json END,
                 chunks_received = CASE WHEN attempts > 0 THEN 0 ELSE chunks_received END,
                 attempts = attempts + 1
              WHERE id = ? AND status = 'streaming' AND execution_json IS NOT NULL
@@ -590,6 +618,11 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
                 reasoning = CASE WHEN attempts > 0
                     THEN COALESCE(json_extract(execution_json, '$.reasoningBase'), '')
                     ELSE reasoning END,
+                usage_json = CASE WHEN attempts > 0
+                    THEN CASE WHEN json_type(execution_json, '$.normalizedToolState.requestUsage') = 'object'
+                        THEN json_extract(execution_json, '$.normalizedToolState.requestUsage')
+                        ELSE NULL END
+                    ELSE usage_json END,
                 chunks_received = CASE WHEN attempts > 0 THEN 0 ELSE chunks_received END,
                 attempts = attempts + 1
              WHERE id = (
@@ -636,11 +669,13 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         return (
             (await run(
                 `UPDATE background_jobs SET execution_json = ?, last_activity_at = ?
-             WHERE id = ? AND status = 'streaming' AND lease_owner = ?`,
+             WHERE id = ? AND status = 'streaming' AND lease_owner = ?
+               AND lease_expires_at > ?`,
                 json(execution),
                 Date.now(),
                 jobId,
-                leaseOwner
+                leaseOwner,
+                Date.now()
             )) > 0
         );
     }
@@ -718,6 +753,7 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
             snapshot.content,
             snapshot.reasoning,
             json(snapshot.toolCalls),
+            json(readRequestUsage(snapshot.usage)),
             snapshot.error ?? null,
             snapshot.completedAt,
             snapshot.completedAt,
@@ -727,11 +763,13 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         if (leaseOwner) {
             where += ' AND lease_owner = ? AND lease_expires_at > ?';
             values.push(leaseOwner, Date.now());
+        } else {
+            where += ' AND lease_owner IS NULL';
         }
         return (
             (await run(
                 `UPDATE background_jobs SET status = ?, content = ?, reasoning = ?,
-                    tool_calls_json = ?, error = ?, completed_at = ?,
+                    tool_calls_json = ?, usage_json = COALESCE(?, usage_json), error = ?, completed_at = ?,
                     history_phase = 'finalization_pending',
                     last_activity_at = ?, lease_owner = NULL, lease_expires_at = NULL
                  WHERE ${where}`,

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "repository": "Saluana/or3-chat",
+  "source_commit": null,
+  "source_status": "reviewed unpublished candidate; synthetic local commits are not upstream ancestry",
+  "upstream_base_commit": "0c64775204752837db6e9d7694fe3c88e22c74f5",
+  "reviewed_candidate_tree": "82821322afb51b88273a4f8560187bcfb23a4eef",
+  "candidate_patch_sha256": "86a02d395b38d9f39730b4f8273d3900f49763353cf4a66b86a642a1eb6ea3a4",
+  "runtime_dependency": {
+    "zod": "4.6.5"
+  },
+  "files": [
+    {
+      "path": "shared/chat/compaction.ts",
+      "git_blob": "22aeef63df506a04e515f77fdaedeb9b4c6e7da8",
+      "sha256": "88d526d713d709bdfd497f42d003a44dc245cc5e5b144a762b61ece6da7f0593"
+    },
+    {
+      "path": "shared/chat/background-history.ts",
+      "git_blob": "cbe741ef5bea677a29c7d61bb0e7509ea13ceb97",
+      "sha256": "a1afd296a47faa2e1f4aaf8f8e75867ece7fae519f8ad91fd15ac425b3c8d210"
+    },
+    {
+      "path": "shared/sync/sanitize.ts",
+      "git_blob": "154a24517a6523ea3b039395012581c6d3351884",
+      "sha256": "34baa8f3c4fd44e9c548c8336d88839c3717d1621f1080ec4345caa50e8e4424"
+    },
+    {
+      "path": "shared/sync/field-mappings.ts",
+      "git_blob": "a229c8191ce1c99cde6af92822a5d908265f4b9f",
+      "sha256": "79a24842b0c7583163fd4d8e0f2c9ec047ec650ccd04cb1182e0132b224d8cd8"
+    },
+    {
+      "path": "server/utils/background-jobs/history.ts",
+      "git_blob": "35b405aa5b613359ebf234cf3d41eb4476578a98",
+      "sha256": "2e5c521959848576775589b0ac62a656f845703028cb1f2deabe0b790830c255"
+    },
+    {
+      "path": "server/utils/background-jobs/types.ts",
+      "git_blob": "17dd2936c4f8cf6bc046ebcf3657ec554a19ccd9",
+      "sha256": "31e4a00ce89da3599f9ad0cd07214abd72e1753ddfa7ff815bb9bec4ff5e59cb"
+    },
+    {
+      "path": "server/sync/gateway/registry.ts",
+      "git_blob": "3cad36817d17b90dde891c6f36902f7d3f5e48a1",
+      "sha256": "ae2cbb6d540e43226920689eca229bd55881135439c544d21aa827844515859f"
+    },
+    {
+      "path": "server/utils/registry/create-runtime-config-registry.ts",
+      "git_blob": "4841f3f103bc983d3e9b1ae61161bc503c727268",
+      "sha256": "6bdf95566e5e38eff54310d625813b0fb0a808fc33dde1b917cd384e62ccefac"
+    }
+  ]
+}

@@ -54,6 +54,9 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
+import { readRequestUsage } from '~~/shared/chat/compaction';
+import { validateCanonicalChatQuery, encodeCanonicalChatSeek, parseCanonicalChatSeek, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
+import type { CanonicalHistoryRecord } from '~~/shared/chat/background-history';
 import { computePullRetention } from './history-gc-policy';
 
 const DEFAULT_PULL_LIMIT = 100;
@@ -684,11 +687,64 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   snapshotBootstrap: 'snapshot-v1',
                   historyRetention: 'snapshot-v1',
                   backgroundGenerationHistory: 'v1',
+                  canonicalChatHistory: 'v1',
               } as const);
     }
 
     private get db() {
         return getSqliteDb();
+    }
+
+    async readChatHistory(actor: CanonicalHistoryActor, query: CanonicalChatQuery, signal?: AbortSignal): Promise<CanonicalChatReadResult> {
+        validateCanonicalChatQuery(query);
+        signal?.throwIfAborted();
+        if (isD1Driver()) return { status: 'scope_incomplete' };
+        const raw = getRawDb();
+        const result = raw.transaction(() => {
+            const membership = raw.prepare(`SELECT m.role FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+                WHERE m.workspace_id = ? AND m.user_id = ? AND COALESCE(w.deleted, 0) = 0`).get(actor.workspaceId, actor.userId) as { role: string } | undefined;
+            if (!membership || !['owner', 'editor', 'viewer'].includes(membership.role)) throw new Error('Forbidden canonical history actor');
+            const counter = raw.prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(actor.workspaceId) as { value: number } | undefined;
+            const revision = String(counter?.value ?? 0);
+            type StoredRow = { id: string; data_json: string; clock: number; deleted: number };
+            const parse = (row: StoredRow): CanonicalHistoryRecord => {
+                const payload = JSON.parse(row.data_json) as CanonicalHistoryRecord;
+                if (payload.id !== row.id) throw new Error('Canonical history identity mismatch');
+                return { ...payload, id: row.id, clock: row.clock, deleted: row.deleted === 1 };
+            };
+            if (query.kind === 'thread') {
+                const threadRevision = raw.prepare('SELECT value FROM chat_history_revisions WHERE workspace_id = ? AND thread_id = ?')
+                    .get(actor.workspaceId, query.thread_id) as { value: number } | undefined;
+                const row = raw.prepare('SELECT id, data_json, clock, deleted FROM s_threads WHERE workspace_id = ? AND id = ?')
+                    .get(actor.workspaceId, query.thread_id) as StoredRow | undefined;
+                return { status: 'ok' as const, revision: String(threadRevision?.value ?? 0), thread: row ? parse(row) : undefined };
+            }
+            if (query.kind === 'messages') {
+                if (!query.message_ids.length) return { status: 'ok' as const, revision, messages: [] };
+                const rows = raw.prepare(`SELECT id, data_json, clock, deleted FROM s_messages WHERE workspace_id = ? AND id IN (${query.message_ids.map(() => '?').join(',')})`)
+                    .all(actor.workspaceId, ...query.message_ids) as StoredRow[];
+                return { status: 'ok' as const, revision, messages: rows.map(parse) };
+            }
+            let after: [number, string, string] | undefined;
+            const seek = parseCanonicalChatSeek(query.cursor, query.thread_id);
+            if (seek) after = seek.key;
+            else if (query.cursor) {
+                const value: unknown = JSON.parse(query.cursor);
+                if (!Array.isArray(value) || value.length !== 4 || value[0] !== query.thread_id
+                    || !Number.isSafeInteger(value[1]) || typeof value[2] !== 'string' || typeof value[3] !== 'string') throw new Error('Invalid canonical history cursor');
+                after = [value[1] as number, value[2], value[3]];
+            }
+            const rows = raw.prepare(`SELECT id, data_json, clock, deleted FROM s_messages
+                WHERE workspace_id = ? AND json_extract(data_json, '$.thread_id') = ?
+                ${after ? `AND (json_extract(data_json, '$.index'), COALESCE(json_extract(data_json, '$.order_key'), ''), id) ${seek?.backward ? '<' : '>'} (?, ?, ?)` : ''}
+                ORDER BY json_extract(data_json, '$.index') ${seek?.backward ? 'DESC' : 'ASC'}, COALESCE(json_extract(data_json, '$.order_key'), '') ${seek?.backward ? 'DESC' : 'ASC'}, id ${seek?.backward ? 'DESC' : 'ASC'} LIMIT ?`)
+                .all(actor.workspaceId, query.thread_id, ...(after ?? []), query.limit) as StoredRow[];
+            const messages = rows.map(parse); const last = messages.at(-1);
+            return { status: 'ok' as const, revision, messages, next_cursor: messages.length === query.limit && last
+                ? seek ? encodeCanonicalChatSeek({ ...seek, key: [Number(last.index), String(last.order_key ?? ''), last.id] })
+                    : JSON.stringify([query.thread_id, last.index, last.order_key ?? '', last.id]) : undefined };
+        })();
+        signal?.throwIfAborted(); return result;
     }
 
     private assertCanonicalActor(actor: CanonicalHistoryActor): void {
@@ -966,6 +1022,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 : input.snapshot.status === 'aborted'
                   ? 'aborted'
                   : 'failed';
+            const usage = readRequestUsage(input.snapshot.usage);
             const payload = {
                 ...current!,
                 pending: false,
@@ -976,6 +1033,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 op_id: opId,
                 data: {
                     ...data,
+                    ...(usage ? { usage } : {}),
                     content: input.snapshot.content,
                     reasoning_text: input.snapshot.reasoning || null,
                     tool_calls: input.snapshot.toolCalls ?? null,
