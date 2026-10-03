@@ -94,6 +94,81 @@ afterEach(async () => {
 
 describe('SqliteSyncGatewayAdapter', () => {
     describe.runIf(process.env.OR3_CANONICAL_ARTIFACTS === 'true')('source-built canonical history reader', () => {
+        it('roundtrips a real local compacted fork through built canonical storage, partial second-client delivery and reconnect', async () => {
+            const indexedDbFixture = 'fake-indexeddb/auto';
+            await import(indexedDbFixture);
+            const { getDb, setActiveWorkspaceDb, evictWorkspaceDb, Or3DB } = await import('~~/app/db/client');
+            const { createHookEngine } = await import('~~/app/core/hooks/hooks');
+            const { createTypedHookEngine } = await import('~~/app/core/hooks/typed-hooks');
+            const { setHookEngine } = await import('~~/app/core/hooks/useHooks');
+            const { captureCompaction, validateCompactionSummary, createCompactedFork } = await import('~~/app/db/compaction');
+            const { resolveThreadProjection } = await import('~~/app/utils/chat/compaction/history');
+            const { ConflictResolver } = await import('~~/app/core/sync/conflict-resolver');
+            const { applySnapshotChain } = await import('~~/app/core/sync/snapshot-applier');
+            const { captureUsagePrefix, attachRequestUsage } = await import('~~/shared/chat/request-usage');
+            const { getHookBridge, _resetHookBridge } = await import('~~/app/core/sync/hook-bridge');
+            const workspace = `roundtrip-${randomUUID()}`; const local = setActiveWorkspaceDb(workspace);
+            let second = new Or3DB(`roundtrip-second-${randomUUID()}`);
+            setHookEngine(createTypedHookEngine(createHookEngine()));
+            await local.open(); await second.open();
+            getRawDb().prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(workspace, 'Disposable roundtrip', 'roundtrip-user');
+            getRawDb().prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('roundtrip-member', workspace, 'roundtrip-user', 'owner');
+            try {
+                getHookBridge(local).start();
+                await local.transaction('rw', local.threads, local.messages, local.pending_ops, local.tombstones, async () => {
+                    await local.threads.put({ id: 'roundtrip-root', title: 'Roundtrip', status: 'ready', created_at: 1, updated_at: 1, clock: 1, deleted: false, pinned: false, forked: false });
+                    for (let index = 0; index < 4; index++) await local.messages.put({ id: `roundtrip-${index}`, thread_id: 'roundtrip-root', role: index % 2 ? 'assistant' : 'user', index,
+                        pending: false, deleted: false, created_at: 1, updated_at: 1, clock: 1, data: { content: `Original ${index} ${'Preserve exact source context '.repeat(100)}` } });
+                });
+                const capture = await captureCompaction({ sourceThreadId: 'roundtrip-root', anchorMessageId: 'roundtrip-3', model: 'scripted-model', db: getDb() });
+                const summary = await validateCompactionSummary(capture, JSON.stringify({ summary_markdown: '## Objective\nRoundtrip.\n## Important Details\nPreserve files.\n## Work State\nPending.\n## Next Move\nContinue.\n## Relevant Files\nNone.',
+                    landmarks: [{ message_id: 'roundtrip-0', kind: 'decision', summary: 'Preserve exact source context' }] }), { targetTokens: 4096, countText: async (text) => Math.ceil(text.length / 4) });
+                const child = await createCompactedFork({ capture, summary });
+                const pushed = await adapter.push(stubEvent, { scope: { workspaceId: workspace }, ops: await local.pending_ops.toArray() });
+                expect(pushed.results.every((result) => result.success)).toBe(true);
+                const actor = { userId: 'roundtrip-user', workspaceId: workspace };
+                expect((await adapter.readChatHistory(actor, { kind: 'thread', thread_id: child.thread.id })).thread).toMatchObject({ branch_mode: 'compacted', summary_message_id: child.summary.id, parent_thread_id: 'roundtrip-root' });
+                const event = makeSessionEvent(actor.userId, workspace);
+                const pulled = await adapter.pull(event, { scope: { workspaceId: workspace }, cursor: 0, limit: 100 });
+                const resolver = new ConflictResolver(second);
+                const summaryChanges = pulled.changes.filter((change) => change.pk === child.summary.id);
+                const partial = await resolver.applyChanges(pulled.changes.filter((change) => change.pk !== child.summary.id));
+                expect(partial.skipped).toBe(0);
+                await expect(resolveThreadProjection(child.thread.id, second)).rejects.toThrow(/summary/i);
+                expect((await resolver.applyChanges(summaryChanges)).skipped).toBe(0);
+                expect((await resolveThreadProjection(child.thread.id, second)).messages.map((row) => row.id)).toEqual([child.summary.id]);
+                const prefix = await captureUsagePrefix({ model: 'scripted-model', messages: [{ role: 'system', content: summary.content }, { role: 'user', content: 'Continue summary' }], countText: async text => Math.ceil(text.length / 4) });
+                const measured = attachRequestUsage(prefix, { prompt_tokens: 300, completion_tokens: 20 }, { requestId: 'roundtrip-request', iteration: 1, measuredAt: 1000 });
+                expect(measured).toBeTruthy();
+                const admission: ChatGenerationAdmissionEnvelope = { version: 1, kind: 'new-turn', admissionId: 'roundtrip-admission', generationId: 'roundtrip-generation', workspaceId: workspace, threadId: child.thread.id, messageId: 'roundtrip-answer',
+                    thread: { ...child.thread, clock: 2 }, userMessage: { id: 'roundtrip-user-message', clock: 1, thread_id: child.thread.id, role: 'user', index: 1, created_at: 2, updated_at: 2, pending: false, deleted: false, data: { content: 'Continue summary' } },
+                    assistantMessage: { id: 'roundtrip-answer', clock: 1, thread_id: child.thread.id, role: 'assistant', index: 2, created_at: 2, updated_at: 2, pending: true, deleted: false, stream_id: 'roundtrip-generation', data: { content: '', generation_id: 'roundtrip-generation', generation_state: 'streaming', custom_metadata: { keep: true } } } };
+                await adapter.admitChatGeneration(actor, admission);
+                await adapter.finalizeChatGeneration(actor, { admission, snapshot: { status: 'complete', content: 'Continued from summary', reasoning: '', completedAt: 1001, usage: measured } });
+                const completed = await adapter.pull(event, { scope: { workspaceId: workspace }, cursor: pulled.nextCursor, limit: 100 });
+                expect((await resolver.applyChanges(completed.changes)).skipped).toBe(0);
+                expect((await second.messages.get('roundtrip-answer'))?.data).toMatchObject({ usage: measured, custom_metadata: { keep: true } });
+                const secondName = second.name; second.close(); second = new Or3DB(secondName); await second.open();
+                const pages: SnapshotResponse[] = []; let pageToken: string | undefined;
+                do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); pages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
+                await applySnapshotChain(second, pages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
+                expect((await resolveThreadProjection(child.thread.id, second)).messages.map((row) => row.id)).toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
+                expect((await second.messages.get('roundtrip-answer'))?.data).toMatchObject({ usage: measured });
+                // Disposable canonical purge, followed by the actual authoritative snapshot path.
+                getRawDb().prepare("DELETE FROM s_messages WHERE workspace_id = ? AND json_extract(data_json, '$.thread_id') = ?").run(workspace, 'roundtrip-root');
+                getRawDb().prepare('DELETE FROM s_threads WHERE workspace_id = ? AND id = ?').run(workspace, 'roundtrip-root');
+                expect((await adapter.readChatHistory(actor, { kind: 'messages', message_ids: ['roundtrip-0'] })).messages).toEqual([]);
+                const purgedPages: SnapshotResponse[] = []; pageToken = undefined;
+                do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); purgedPages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
+                await applySnapshotChain(second, purgedPages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
+                expect(await second.threads.get('roundtrip-root')).toBeUndefined(); expect(await second.messages.get('roundtrip-0')).toBeUndefined();
+                expect((await resolveThreadProjection(child.thread.id, second)).messages.map(row => row.id)).toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
+                expect(await second.pending_ops.count()).toBe(0);
+                expect(await local.messages.count()).toBe(5);
+            } finally {
+                _resetHookBridge(); second.close(); await second.delete(); setActiveWorkspaceDb(null); evictWorkspaceDb(workspace); await local.delete(); setHookEngine(null);
+            }
+        });
         it('reads materialized workspace rows after log deletion, pages legacy ties both ways, and rechecks revocation', async () => {
             const artifactDb = await import('../../../dist/runtime/server/db/kysely.js');
             const artifactMigrations = await import('../../../dist/runtime/server/db/migrate.js');
@@ -161,7 +236,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } },
             };
         }
-        const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot => ({
+        const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & import('~~/server/utils/background-jobs/types').TerminalGenerationSnapshot => ({
             status, content: 'canonical answer', reasoning: 'canonical reason', usage, completedAt: 1_800_000_000_000,
             toolCalls: [{ id: 'call-1', name: 'tool', status: 'complete', result: 'result' }],
             error: status === 'error' ? 'upstream interrupted' : undefined,
@@ -184,7 +259,10 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(item?.kind).toBe('row');
             if (!item || item.kind !== 'row') throw new Error('Missing canonical assistant');
             expect(last?.payload).toEqual(item.payload);
-            return item.payload;
+            if (!item.payload || typeof item.payload !== 'object' || Array.isArray(item.payload)) throw new Error('Invalid canonical payload');
+            const payload = item.payload as Record<string, unknown>;
+            if (!payload.data || typeof payload.data !== 'object' || Array.isArray(payload.data)) throw new Error('Invalid canonical data');
+            return { ...payload, data: payload.data as Record<string, unknown> };
         }
         beforeEach(async () => {
             await destroySqliteDb();
