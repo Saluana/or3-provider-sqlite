@@ -1,3 +1,4 @@
+import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspace-item-capability';
 /**
  * SQLite implementation of SyncGatewayAdapter.
  *
@@ -688,6 +689,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   historyRetention: 'snapshot-v1',
                   backgroundGenerationHistory: 'v1',
                   canonicalChatHistory: 'v1',
+                  workspaceItems: 'v1',
               } as const);
     }
 
@@ -1506,6 +1508,20 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const hookEmissions: HookEmission[] = [];
 
         const runTx = raw.transaction(() => {
+            // Admission observes canonical state under the same write lock as LWW.
+            if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
+                for (const op of uniqueOps) {
+                    const table = SYNCED_TABLE_MAP[op.tableName];
+                    if (!table || !['posts', 'projects'].includes(op.tableName)) continue;
+                    const canonical = raw.prepare('SELECT data_json FROM ' + table + ' WHERE id = ? AND workspace_id = ?')
+                        .get(op.pk, workspaceId) as { data_json: string } | undefined;
+                    if (hasWorkspaceItemSemantics(op.tableName, op.payload)
+                        || hasWorkspaceItemSemantics(op.tableName, canonical ? JSON.parse(canonical.data_json) : undefined)) {
+                        throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat to use workspace Files and Trash',
+                            data: { code: 'OR3_WORKSPACE_ITEM_UPDATE_REQUIRED', requiredCapability: WORKSPACE_ITEM_CAPABILITY } });
+                    }
+                }
+            }
             // Check for existing op_ids (idempotency)
             const opIds = uniqueOps.map((o) => o.stamp.opId);
             const existingOps = new Map<string, {

@@ -285,6 +285,22 @@ installed package, so local development does not publish these changes.
 
 `canonicalChatHistory: 'v1'` and `readChatHistory` read current `s_threads`/`s_messages`, with explicit workspace membership (owner/editor/viewer), bounded by-ID queries and canonical `(index, order_key, id)` keyset pages. Migration 022 adds transactional per-thread revision triggers. Migration 023 matches the index to legacy missing-order-key normalization and preserves the existing orphan-row cleanup lifecycle; revision bookkeeping does not add a foreign key to otherwise independent sync rows. Current-chat tool result writes do not invalidate ancestor search cursors. The reader never consults retained sync logs. D1 omits the capability.
 
-The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane passes 113 cases across three files, including the 76-case gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. No package has been published.
+The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane passes 119 cases across three files, including the real gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. This compaction capability is not yet included in a published package.
 
 The canonical-history qualification lane defaults to a sibling `../or3-chat` checkout. For an isolated host worktree, set `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat` before the command. Install the host dependencies too; the two-client fixture resolves its IndexedDB test dependency from that checkout. Its contract-byte checks fail closed on uncommitted changes; this does not replace the pinned host fixture or certify deployed/released provider behavior.
+
+## Workspace Files and Trash admission
+
+Native synchronous adapters advertise workspace-item capability v1. Canonical
+posts/projects with catalog, logical Trash, or file-membership semantics require
+a current writer even when the incoming update omits those fields. Admission is
+checked inside the same write transaction, before versions or changes are
+allocated. Canonical retained post references include logically trashed catalog
+entries/documents and checkpoints. D1 does not advertise this transactional
+capability.
+
+This source change is a provider publication dependency for the host feature.
+Rebuild the provider before testing a file-linked host; follow the existing OR3
+release/update workflow separately. Local qualification does not authorize
+publication or a production migration. Files cloud exposure remains gated until
+the supported profile is qualified.
