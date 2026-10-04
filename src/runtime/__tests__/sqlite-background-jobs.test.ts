@@ -1,8 +1,228 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { destroySqliteDb, initializeSqliteDb } from '../server/db/kysely';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { destroySqliteDb, getRawDb, initializeSqliteDb } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteBackgroundJobProvider } from '../server/background-jobs/sqlite-provider';
 import { createD1TestDatabase } from '../../../test/support/d1-test-database';
+import type { RequestUsage } from '~~/shared/chat/compaction';
+import type { BackgroundJobExecution, JobUpdate, TerminalGenerationSnapshot } from '~~/server/utils/background-jobs/types';
+
+function measuredUsage(promptTokens = 150, iteration = 0): RequestUsage {
+    return {
+        prompt_tokens: promptTokens, completion_tokens: 25, model: 'test-model',
+        request_id: `request-${iteration}`, iteration, measured_at: 1_800_000_000_000,
+        prefix_message_count: iteration + 1, prefix_hash: `prefix-${iteration}`,
+        configuration_hash: 'configuration-1', input_estimate_tokens: promptTokens - 10,
+    };
+}
+
+// Failure inventory: dropped progress/terminal usage; summed snapshots; malformed
+// telemetry breaking text; usage lost at reopen; uncheckpointed retry leakage;
+// expired, superseded or absent lease owners overwriting a durable measurement.
+describe('SQLite durable request usage', () => {
+    let directory: string;
+    let databasePath: string;
+    let provider: SqliteBackgroundJobProvider;
+    const params = {
+        userId: 'user-usage', threadId: 'thread-usage', messageId: 'message-usage',
+        model: 'test-model', generationId: 'generation-usage', kind: 'chat' as const,
+    };
+    const execution: BackgroundJobExecution = {
+        version: 1, body: { model: 'test-model', messages: [] },
+        workspaceId: 'workspace-usage', referer: 'https://example.test',
+        apiKeyCiphertext: 'test-only-not-a-credential', contentBase: 'checkpoint',
+    };
+
+    async function reopen() {
+        await destroySqliteDb();
+        await runMigrations(await initializeSqliteDb({ path: databasePath }));
+        provider = new SqliteBackgroundJobProvider();
+    }
+
+    beforeEach(async () => {
+        vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
+        directory = await mkdtemp(join(tmpdir(), 'or3-sqlite-usage-'));
+        databasePath = join(directory, 'history.sqlite');
+        await runMigrations(await initializeSqliteDb({ path: databasePath }));
+        provider = new SqliteBackgroundJobProvider();
+    });
+    afterEach(async () => {
+        vi.restoreAllMocks();
+        await destroySqliteDb();
+        await rm(directory, { recursive: true, force: true });
+    });
+
+    it.each(['complete', 'error', 'aborted'] as const)(
+        'reopens the last measured request after %s without summing snapshots', async (status) => {
+            const id = await provider.createJob(params);
+            await provider.updateJob(id, { contentChunk: 'answer', usage: measuredUsage() });
+            const latest = measuredUsage(400, 1);
+            await provider.updateJob(id, { usage: latest });
+            await provider.updateJob(id, { usage: latest });
+            await provider.updateJob(id, { reasoningChunk: 'reason', usage: undefined });
+            await provider.updateJob(id, { usage: { ...latest, prompt_tokens: -1 } } as JobUpdate);
+            expect(await provider.saveTerminalSnapshot(id, {
+                status, content: 'answer', reasoning: 'reason', completedAt: Date.now(),
+                ...(status === 'error' ? { error: 'provider interrupted' } : {}),
+            })).toBe(true);
+            await reopen();
+            expect(await provider.getJob(id, params.userId)).toMatchObject({
+                content: 'answer', reasoning: 'reason', status, usage: latest,
+                generationId: params.generationId, historyPhase: 'finalization_pending',
+            });
+            expect((await provider.getPendingHistoryJobs(10))[0]?.usage).toEqual(latest);
+            expect(await provider.getJob(id, 'different-user')).toBeNull();
+        }
+    );
+
+    it('persists usage supplied only by the terminal snapshot and refuses late writes', async () => {
+        const id = await provider.createJob(params);
+        const usage = measuredUsage(400, 1);
+        const terminal: TerminalGenerationSnapshot = {
+            status: 'complete', content: 'terminal answer', reasoning: '',
+            usage, completedAt: Date.now(),
+        };
+        expect(await provider.saveTerminalSnapshot(id, terminal)).toBe(true);
+        await provider.updateJob(id, { contentChunk: 'late', usage: measuredUsage(900, 2) });
+        expect(await provider.saveTerminalSnapshot(id, { ...terminal, usage: measuredUsage(900, 2) })).toBe(false);
+        await reopen();
+        expect(await provider.getJob(id, params.userId)).toMatchObject({ usage, content: 'terminal answer' });
+    });
+
+    it('preserves valid zero counters without manufacturing a measurement for old jobs', async () => {
+        const id = await provider.createJob(params);
+        expect((await provider.getJob(id, params.userId))?.usage).toBeUndefined();
+        const zero = { ...measuredUsage(), prompt_tokens: 0, completion_tokens: 0 };
+        await provider.updateJob(id, { usage: zero });
+        await reopen();
+        expect((await provider.getJob(id, params.userId))?.usage).toEqual(zero);
+    });
+
+    it.each(['abort', 'fail'] as const)('keeps the completed measurement on direct %s', async (method) => {
+        const id = await provider.createJob(params);
+        await provider.updateJob(id, { contentChunk: 'partial', usage: measuredUsage() });
+        if (method === 'abort') await provider.abortJob(id, params.userId);
+        else await provider.failJob(id, 'interrupted');
+        await reopen();
+        expect(await provider.getJob(id, params.userId)).toMatchObject({ content: 'partial', usage: measuredUsage() });
+    });
+
+    it('keeps missing and malformed usage absent while valid text persists', async () => {
+        const id = await provider.createJob(params);
+        for (const usage of [undefined, null, {}, { ...measuredUsage(), prompt_tokens: NaN },
+            { ...measuredUsage(), prefix_hash: '' }, { ...measuredUsage(), completion_tokens: 1.5 }]) {
+            await provider.updateJob(id, { contentChunk: 'text', usage } as JobUpdate);
+        }
+        await provider.saveTerminalSnapshot(id, {
+            status: 'error', content: 'valid text', reasoning: '', completedAt: Date.now(),
+            usage: { prompt_tokens: 1 },
+        } as TerminalGenerationSnapshot);
+        await reopen();
+        expect(await provider.getJob(id, params.userId)).toMatchObject({ content: 'valid text', status: 'error' });
+        expect((await provider.getJob(id, params.userId))?.usage).toBeUndefined();
+    });
+
+    it.each(['claimJob', 'claimNextJob'] as const)('%s restores only checkpointed measurement on a new attempt', async (method) => {
+        const checkpoint = measuredUsage();
+        const id = await provider.createJob({ ...params, execution: {
+            ...execution, normalizedToolState: { requestUsage: checkpoint },
+        } as BackgroundJobExecution });
+        const now = Date.now();
+        await provider.claimJob(id, 'worker-a', now, now + 1_000);
+        await provider.updateJob(id, { leaseOwner: 'worker-a', contentChunk: 'discarded', usage: measuredUsage(400, 1) });
+        await reopen();
+        vi.mocked(Date.now).mockReturnValue(now + 2_000);
+        const recovered = method === 'claimJob'
+            ? await provider.claimJob(id, 'worker-b', Date.now(), now + 5_000)
+            : await provider.claimNextJob('worker-b', Date.now(), now + 5_000);
+        expect(recovered).toMatchObject({ content: 'checkpoint', usage: checkpoint, attempts: 2, generationId: params.generationId });
+        await expect(provider.updateJob(id, { leaseOwner: 'worker-a', usage: measuredUsage(900, 2) }))
+            .rejects.toMatchObject({ name: 'BackgroundJobLeaseLostError' });
+        expect(await provider.saveTerminalSnapshot(id, {
+            status: 'complete', content: 'stale', reasoning: '', usage: measuredUsage(900, 2), completedAt: Date.now(),
+        }, 'worker-a')).toBe(false);
+        expect((await provider.getJob(id, params.userId))?.usage).toEqual(checkpoint);
+    });
+
+    it.each([undefined, { prompt_tokens: 150 }])('clears discarded-attempt usage when the checkpoint is absent or malformed (%j)', async (requestUsage) => {
+        const id = await provider.createJob({ ...params, execution: {
+            ...execution, normalizedToolState: { requestUsage },
+        } as BackgroundJobExecution });
+        const now = Date.now();
+        await provider.claimJob(id, 'worker-a', now, now + 1_000);
+        await provider.updateJob(id, { leaseOwner: 'worker-a', usage: measuredUsage(400, 1) });
+        vi.mocked(Date.now).mockReturnValue(now + 2_000);
+        const recovered = await provider.claimJob(id, 'worker-b', Date.now(), now + 5_000);
+        expect(recovered?.usage).toBeUndefined();
+        await reopen();
+        expect((await provider.getJob(id, params.userId))?.usage).toBeUndefined();
+    });
+
+    it.each(['claimJob', 'claimNextJob'] as const)('%s rejects a JSON-string checkpoint rather than parsing usage twice', async (method) => {
+        const id = await provider.createJob({ ...params, execution: {
+            ...execution, normalizedToolState: { requestUsage: JSON.stringify(measuredUsage()) },
+        } as unknown as BackgroundJobExecution });
+        const now = Date.now();
+        await provider.claimJob(id, 'worker-a', now, now + 1_000);
+        await provider.updateJob(id, { leaseOwner: 'worker-a', usage: measuredUsage(400, 1) });
+        vi.mocked(Date.now).mockReturnValue(now + 2_000);
+        const recovered = method === 'claimJob'
+            ? await provider.claimJob(id, 'worker-b', Date.now(), now + 5_000)
+            : await provider.claimNextJob('worker-b', Date.now(), now + 5_000);
+        expect(recovered?.usage).toBeUndefined();
+        await reopen();
+        expect((await provider.getJob(id, params.userId))?.usage).toBeUndefined();
+    });
+
+    it('does not let missing or expired lease owners change measurements or checkpoints', async () => {
+        const id = await provider.createJob({ ...params, execution });
+        const now = Date.now();
+        await provider.claimJob(id, 'worker-a', now, now + 1_000);
+        await provider.updateJob(id, { leaseOwner: 'worker-a', usage: measuredUsage() });
+        await provider.updateJob(id, { contentChunk: 'unowned', usage: measuredUsage(400, 1) });
+        expect(await provider.saveTerminalSnapshot(id, {
+            status: 'complete', content: 'unowned', reasoning: '', usage: measuredUsage(400, 1), completedAt: now,
+        })).toBe(false);
+        vi.mocked(Date.now).mockReturnValue(now + 2_000);
+        expect(await provider.updateJobExecution(id, { ...execution, contentBase: 'stale checkpoint' }, 'worker-a')).toBe(false);
+        await expect(provider.updateJob(id, { leaseOwner: 'worker-a', usage: measuredUsage(400, 1) }))
+            .rejects.toMatchObject({ name: 'BackgroundJobLeaseLostError' });
+        expect((await provider.getJob(id, params.userId))?.usage).toEqual(measuredUsage());
+    });
+
+    it.each(['complete', 'fail'] as const)('ignores unowned direct %s of a leased measured generation', async (method) => {
+        const id = await provider.createJob({ ...params, execution });
+        const now = Date.now();
+        await provider.claimJob(id, 'worker-a', now, now + 1_000);
+        await provider.updateJob(id, { leaseOwner: 'worker-a', contentChunk: 'owned answer', usage: measuredUsage() });
+        if (method === 'complete') await provider.completeJob(id, 'unowned answer');
+        else await provider.failJob(id, 'unowned error');
+        expect(await provider.getJob(id, params.userId)).toMatchObject({ status: 'streaming', content: 'owned answer', usage: measuredUsage() });
+    });
+
+    it.each(['complete', 'fail'] as const)('rejects expired-owner direct %s of a measured generation', async (method) => {
+        const id = await provider.createJob({ ...params, execution });
+        const now = Date.now();
+        await provider.claimJob(id, 'worker-a', now, now + 1_000);
+        await provider.updateJob(id, { leaseOwner: 'worker-a', usage: measuredUsage() });
+        vi.mocked(Date.now).mockReturnValue(now + 2_000);
+        const finish = method === 'complete'
+            ? provider.completeJob(id, 'expired answer', 'worker-a')
+            : provider.failJob(id, 'expired error', 'worker-a');
+        await expect(finish).rejects.toMatchObject({ name: 'BackgroundJobLeaseLostError' });
+        expect(await provider.getJob(id, params.userId)).toMatchObject({ status: 'streaming', usage: measuredUsage() });
+    });
+
+    it('ignores malformed stored usage without breaking job text reads', async () => {
+        const id = await provider.createJob({ ...params, initialContent: 'surviving text' });
+        getRawDb().prepare('UPDATE background_jobs SET usage_json = ? WHERE id = ?').run('{broken', id);
+        await reopen();
+        expect(await provider.getJob(id, params.userId)).toMatchObject({ content: 'surviving text' });
+        expect((await provider.getJob(id, params.userId))?.usage).toBeUndefined();
+    });
+});
 
 describe('SQLite background jobs', () => {
     beforeEach(async () => {

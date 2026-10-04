@@ -227,6 +227,13 @@ bun run type-check  # TypeScript validation
 bun run build       # build for distribution
 ```
 
+The normal test suite runs in a provider-only checkout using hash-verified,
+byte-for-byte host runtime fixtures. `bun run test:host-integration` reruns the
+same background-job, canonical-history and registration cases against a prepared
+sibling `../or3-chat` at the exact reviewed source tree. It fails on missing or
+mismatched source rather than falling back to fixtures. See the
+[fixture provenance and prerequisites](test/fixtures/host/README.md).
+
 ## Compatibility
 
 - Works with multiple auth providers (`basic-auth`, `clerk`, or custom)
@@ -273,6 +280,14 @@ prints its selected path; restart it after provider edits. Missing repositories
 or failed builds fall back to installed packages with a warning.
 `OR3_LOCAL_PROVIDERS=false` disables local selection. Production builds use the
 installed package, so local development does not publish these changes.
+
+### Canonical compaction history reader (unreleased)
+
+`canonicalChatHistory: 'v1'` and `readChatHistory` read current `s_threads`/`s_messages`, with explicit workspace membership (owner/editor/viewer), bounded by-ID queries and canonical `(index, order_key, id)` keyset pages. Migration 022 adds transactional per-thread revision triggers. Migration 023 matches the index to legacy missing-order-key normalization and preserves the existing orphan-row cleanup lifecycle; revision bookkeeping does not add a foreign key to otherwise independent sync rows. Current-chat tool result writes do not invalidate ancestor search cursors. The reader never consults retained sync logs. D1 omits the capability.
+
+The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane passes 119 cases across three files, including the real gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. This compaction capability is not yet included in a published package.
+
+The canonical-history qualification lane defaults to a sibling `../or3-chat` checkout. For an isolated host worktree, set `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat` before the command. Install the host dependencies too; the two-client fixture resolves its IndexedDB test dependency from that checkout. Its contract-byte checks fail closed on uncommitted changes; this does not replace the pinned host fixture or certify deployed/released provider behavior.
 
 ## Workspace Files and Trash admission
 

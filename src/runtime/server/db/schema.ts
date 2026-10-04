@@ -242,6 +242,7 @@ export interface BackgroundJobsTable {
     completed_at: number | null;
     error: string | null;
     tool_calls_json: string | null;
+    usage_json: string | null;
     workflow_state_json: string | null;
     execution_json: string | null;
     idempotency_key: string | null;
