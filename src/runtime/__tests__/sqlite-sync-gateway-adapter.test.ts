@@ -93,6 +93,23 @@ afterEach(async () => {
 });
 
 describe('SqliteSyncGatewayAdapter', () => {
+    // Security failures: legacy membership omitted, foreign/deleted projects included,
+    // ambiguous owners guessed, or an explicit pointer overridden by stale associations.
+    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT))('resolves canonical project ownership in the authorized storage snapshot', async () => {
+        const raw = getRawDb();
+        raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
+        raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+        const actor = { userId: 'owner', workspaceId: WORKSPACE_ID };
+        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',payload:{id:'legacy'}})]));
+        const read = () => adapter.readChatHistory(actor, {kind:'thread',thread_id:'legacy'});
+        expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
+        for (const id of ['one', 'two']) {
+            await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? ['legacy'] : JSON.stringify([{id:'legacy'}])}})]));
+            expect(await read()).toMatchObject(id === 'one' ? {project_ownership:'resolved',thread:{project_id:'one'}} : {project_ownership:'conflict'});
+        }
+        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]));
+        expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
+    });
     describe.runIf(process.env.OR3_CANONICAL_ARTIFACTS === 'true')('source-built canonical history reader', () => {
         it('roundtrips a real local compacted fork through built canonical storage, partial second-client delivery and reconnect', async () => {
             const indexedDbFixture = 'fake-indexeddb/auto';

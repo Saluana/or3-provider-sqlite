@@ -7,6 +7,10 @@ verifyHostFixture();
 export default defineConfig({
     resolve: {
         alias: [
+            ...(process.env.OR3_PROJECT_HOST_ROOT ? [{
+                find: '~~/shared/chat/history-reader',
+                replacement: path.resolve(process.env.OR3_PROJECT_HOST_ROOT, 'shared/chat/history-reader.ts'),
+            }] : []),
             // Exact pinned host source, verified above, also works in a
             // provider-only checkout. The explicit integration lane uses the host.
             ...hostContractAliases(hostFixtureRoot),

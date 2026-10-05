@@ -719,7 +719,22 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     .get(actor.workspaceId, query.thread_id) as { value: number } | undefined;
                 const row = raw.prepare('SELECT id, data_json, clock, deleted FROM s_threads WHERE workspace_id = ? AND id = ?')
                     .get(actor.workspaceId, query.thread_id) as StoredRow | undefined;
-                return { status: 'ok' as const, revision: String(threadRevision?.value ?? 0), thread: row ? parse(row) : undefined };
+                const thread = row ? parse(row) : undefined;
+                if (!thread || thread.project_id) return { status: 'ok' as const, project_ownership: 'resolved' as const,
+                    revision: String(threadRevision?.value ?? 0), thread };
+                // Legacy folder membership is authoritative when the chat has no
+                // pointer. Resolve it in this same authorized SQLite snapshot.
+                const projects = raw.prepare('SELECT id, data_json FROM s_projects WHERE workspace_id = ? AND COALESCE(deleted, 0) = 0')
+                    .all(actor.workspaceId) as { id: string; data_json: string }[];
+                const owners = projects.filter(project => {
+                    const payload = JSON.parse(project.data_json);
+                    const entries: unknown = typeof payload.data === 'string' ? JSON.parse(payload.data) : payload.data ?? [];
+                    if (!Array.isArray(entries)) throw new Error('Canonical project membership is unresolved.');
+                    return entries.some(entry => typeof entry === 'string' ? entry === query.thread_id
+                        : entry && typeof entry === 'object' && !Array.isArray(entry) && (entry.kind === undefined || entry.kind === 'chat') && entry.id === query.thread_id);
+                });
+                return { status: 'ok' as const, project_ownership: owners.length > 1 ? 'conflict' as const : 'resolved' as const,
+                    revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: owners[0]?.id ?? null } };
             }
             if (query.kind === 'messages') {
                 if (!query.message_ids.length) return { status: 'ok' as const, revision, messages: [] };

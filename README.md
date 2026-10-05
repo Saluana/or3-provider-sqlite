@@ -291,6 +291,10 @@ The canonical-history qualification lane defaults to a sibling `../or3-chat` che
 
 ## Workspace Files and Trash admission
 
+Persistent Projects uses this same capability for opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts. Preserve their JSON, metadata, and every original/extraction `file_hashes` reference. The project-aware canonical reader resolves `threads.project_id` or a single legacy membership in its authorized SQLite snapshot, returning `project_ownership: resolved | conflict`. String entries and JSON-encoded membership arrays remain supported; malformed or ambiguous memberships do not grant server execution. Hosts without this result must refuse project-sensitive server admission rather than infer ownership from the visible UI.
+
+Projects review qualification: `OR3_PROJECT_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/sqlite-sync-gateway-adapter.test.ts`. This explicit lane uses the host's canonical-reader query contract while retaining the pinned standalone fixture for existing contracts. Qualify the updated provider with the disposable host cloud journey before publishing; no release version is assigned by this review change.
+
 Native synchronous adapters advertise workspace-item capability v1. Canonical
 posts/projects with catalog, logical Trash, or file-membership semantics require
 a current writer even when the incoming update omits those fields. Admission is
