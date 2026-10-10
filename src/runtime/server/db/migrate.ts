@@ -28,6 +28,7 @@ import * as m021 from './migrations/021_background_request_usage';
 import * as m022 from './migrations/022_canonical_chat_reader';
 import * as m023 from './migrations/023_legacy_chat_seek_index';
 import * as m024 from './migrations/024_storage_generations';
+import * as m025 from './migrations/025_storage_generation_uploads';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -58,7 +59,8 @@ const REQUIRED_SCHEMA_TABLES = [
     'background_admission_cancels',
     'background_generation_receipts',
     'storage_object_generations',
-    'storage_object_heads'
+    'storage_object_heads',
+    'storage_generation_uploads'
 ] as const;
 
 const migrations: Record<string, Migration> = {
@@ -85,7 +87,8 @@ const migrations: Record<string, Migration> = {
     '021_background_request_usage': m021,
     '022_canonical_chat_reader': m022,
     '023_legacy_chat_seek_index': m023,
-    '024_storage_generations': m024
+    '024_storage_generations': m024,
+    '025_storage_generation_uploads': m025
 };
 
 class StaticMigrationProvider implements MigrationProvider {

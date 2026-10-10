@@ -341,3 +341,10 @@ coordinator or advertises `externalStorageGenerations`, and physical cleanup
 remains disabled. The directly imported trusted-server coordinator is exercised
 only against disposable test databases. See [protocol invariants and activation
 blockers](docs/storage-generations.md) before using or extending this foundation.
+
+Migration 025 adds a separate dormant generation-upload ledger and quota-bound
+restore tickets. Shared reservation charges remain visible to old quota readers,
+and only exact canonical metadata or proofed irreversible abandonment can release
+them. The optional coordinator is still unregistered. See [upload, restore, and
+recovery invariants](docs/storage-generation-uploads.md), including the missing
+client restore admission wiring and the limits of the mixed-legacy quota promise.
