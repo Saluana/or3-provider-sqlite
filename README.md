@@ -332,3 +332,12 @@ incomplete uploads require storage-provider inventory.
 This capability grants no physical deletion authority, adds no deletion
 coordinator, and does not qualify any provider profile for physical deletion.
 It does not change the existing D1 admission or concurrency guarantees.
+
+## Dormant immutable-generation foundation (unreleased)
+
+Migration 024 adds inert generation records, current-hash heads, and canonical
+write barriers. No runtime route creates these records, no adapter registers the
+coordinator or advertises `externalStorageGenerations`, and physical cleanup
+remains disabled. The directly imported trusted-server coordinator is exercised
+only against disposable test databases. See [protocol invariants and activation
+blockers](docs/storage-generations.md) before using or extending this foundation.
