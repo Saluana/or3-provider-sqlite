@@ -285,7 +285,7 @@ installed package, so local development does not publish these changes.
 
 `canonicalChatHistory: 'v1'` and `readChatHistory` read current `s_threads`/`s_messages`, with explicit workspace membership (owner/editor/viewer), bounded by-ID queries and canonical `(index, order_key, id)` keyset pages. Migration 022 adds transactional per-thread revision triggers. Migration 023 matches the index to legacy missing-order-key normalization and preserves the existing orphan-row cleanup lifecycle; revision bookkeeping does not add a foreign key to otherwise independent sync rows. Current-chat tool result writes do not invalidate ancestor search cursors. The reader never consults retained sync logs. D1 omits the capability.
 
-The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane passes 119 cases across three files, including the real gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. This compaction capability is not yet included in a published package.
+The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane covers three files, including the real gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. Missing ancestor project provenance must fail closed after a canonical purge. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. This compaction capability is not yet included in a published package.
 
 The canonical-history qualification lane defaults to a sibling `../or3-chat` checkout. For an isolated host worktree, set `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat` before the command. Install the host dependencies too; the two-client fixture resolves its IndexedDB test dependency from that checkout. Its contract-byte checks fail closed on uncommitted changes; this does not replace the pinned host fixture or certify deployed/released provider behavior.
 
@@ -308,3 +308,27 @@ Rebuild the provider before testing a file-linked host; follow the existing OR3
 release/update workflow separately. Local qualification does not authorize
 publication or a production migration. Files cloud exposure remains gated until
 the supported profile is qualified.
+
+## Retained storage accounting (unreleased)
+
+The adapter advertises `retainedStorageMetadata: 'v1'`. The read-only
+`retained_metadata` canonical storage query pages logically deleted
+`s_file_meta` rows within the requested workspace, using the existing hash
+filter and bounded keyset pagination. These observations survive change-log
+and tombstone pruning. A winning restoration moves the row back to
+`live_metadata`; it is not counted in both views.
+
+A retained row with a known nonnegative safe-integer size reports `sizeBytes`,
+including zero. A delete-before-put placeholder or invalid/missing size leaves
+`sizeBytes` absent. Consumers must report this uncertainty rather than treating
+it as zero bytes.
+
+Logical upload quota admission remains active metadata plus active reservations.
+Deleted metadata releases that logical quota while its stored object can still
+occupy disk. Retained metadata is an accounting observation, not proof that the
+object exists or a measurement of actual disk usage. Physical usage and
+incomplete uploads require storage-provider inventory.
+
+This capability grants no physical deletion authority, adds no deletion
+coordinator, and does not qualify any provider profile for physical deletion.
+It does not change the existing D1 admission or concurrency guarantees.
