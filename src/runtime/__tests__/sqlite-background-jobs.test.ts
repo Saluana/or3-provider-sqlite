@@ -487,8 +487,11 @@ describe('SQLite background jobs', () => {
             body: settled.body,
             workspaceId: 'workspace-1',
         });
-        expect(resumed?.execution?.clientToolCall).toBeUndefined();
-        expect(resumed?.execution?.pendingToolCalls).toBeUndefined();
+        if (!resumed?.execution || !('body' in resumed.execution)) {
+            throw new Error('Expected resumed chat execution');
+        }
+        expect(resumed.execution.clientToolCall).toBeUndefined();
+        expect(resumed.execution.pendingToolCalls).toBeUndefined();
     });
 });
 

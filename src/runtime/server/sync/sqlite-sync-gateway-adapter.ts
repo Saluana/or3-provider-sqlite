@@ -683,6 +683,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             ? ({
                   snapshotBootstrap: 'snapshot-v1',
                   historyRetention: 'snapshot-v1',
+                  retainedStorageMetadata: 'v1',
               } as const)
             : ({
                   snapshotBootstrap: 'snapshot-v1',
@@ -691,6 +692,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   canonicalChatHistory: 'v1',
                   projectOwnership: 'v1',
                   workspaceItems: 'v1',
+                  retainedStorageMetadata: 'v1',
               } as const);
     }
 
@@ -1270,7 +1272,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             };
         }
 
-        if (input.kind === 'live_metadata') {
+        if (input.kind === 'live_metadata' || input.kind === 'retained_metadata') {
+            const retained = input.kind === 'retained_metadata';
             if (after.length > 1) {
                 throw createError({ statusCode: 400, statusMessage: 'Invalid canonical storage cursor' });
             }
@@ -1282,7 +1285,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 SELECT id, data_json, updated_at
                 FROM s_file_meta
                 WHERE workspace_id = ?
-                  AND deleted = 0
+                  AND deleted = ?
                   AND id > ?
                   AND (? IS NULL OR lower(
                     CASE
@@ -1293,7 +1296,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   ) = ?)
                 ORDER BY id ASC
                 LIMIT ?
-            `, workspaceId, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
+            `, workspaceId, retained ? 1 : 0, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
 
             const hasMore = rows.length > limit;
             const page = hasMore ? rows.slice(0, limit) : rows;
@@ -1305,6 +1308,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file metadata' });
                 }
                 const size = payload.size_bytes ?? payload.sizeBytes;
+                if (retained) {
+                    // A delete-before-put placeholder has no size. Preserve that
+                    // uncertainty rather than inventing zero retained bytes.
+                    const storageId = payload.storage_id ?? payload.storageId;
+                    return {
+                        kind: 'retained_metadata' as const,
+                        hash: normalizeStorageHash(row.id),
+                        ...(typeof size === 'number' && Number.isSafeInteger(size) && size >= 0 ? { sizeBytes: size } : {}),
+                        ...(typeof storageId === 'string' && storageId ? { storageId } : {}),
+                        updatedAt: row.updated_at,
+                    };
+                }
                 if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
                     throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
                 }
@@ -1345,6 +1360,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                       }
                     : {}),
             };
+        }
+
+        if (input.kind !== 'reference_edges') {
+            throw createError({ statusCode: 400, statusMessage: 'Unsupported canonical storage query' });
         }
 
         if (after.length !== 0 && after.length !== 3) {

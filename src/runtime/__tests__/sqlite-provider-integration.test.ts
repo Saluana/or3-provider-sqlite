@@ -191,6 +191,55 @@ describe('sqlite provider D1 integration', () => {
         d1.close();
     });
 
+    it('pages retained metadata through D1 after pruning and removes winning restorations', async () => {
+        const { userId } = await store.getOrCreateUser({
+            provider: 'clerk', providerUserId: 'd1-retained-storage',
+        });
+        const { workspaceId } = await store.getOrCreateDefaultWorkspace(userId);
+        const event = makeAuthenticatedEvent(userId, workspaceId);
+        const write = async (hash: string, clock: number, operation: 'put' | 'delete') =>
+            adapter.push(event, {
+                scope: { workspaceId },
+                ops: [{
+                    id: randomUUID(), tableName: 'file_meta', operation, pk: hash,
+                    payload: operation === 'put' ? { hash, size_bytes: 17, storage_id: 'd1-object' } : undefined,
+                    stamp: { deviceId: 'd1-storage', opId: randomUUID(), clock, hlc: `${clock}000-storage` },
+                    createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
+                }],
+            });
+        const known = '1'.repeat(64);
+        const unknown = '2'.repeat(64);
+        await write(known, 1, 'put');
+        await write(known, 2, 'delete');
+        await write(unknown, 1, 'delete');
+        await d1.database.prepare('DELETE FROM change_log WHERE workspace_id = ?').bind(workspaceId).run();
+        await d1.database.prepare('DELETE FROM tombstones WHERE workspace_id = ?').bind(workspaceId).run();
+        expect(adapter.capabilities).toMatchObject({ retainedStorageMetadata: 'v1' });
+        const request = { scope: { workspaceId }, kind: 'retained_metadata' as const, limit: 1 };
+        const first = await adapter.queryCanonicalStorage(event, request);
+        expect(first.items).toEqual([{
+            kind: 'retained_metadata', hash: known, sizeBytes: 17,
+            storageId: 'd1-object', updatedAt: expect.any(Number),
+        }]);
+        expect(first.hasMore).toBe(true);
+        expect(first.nextCursor).toBeTypeOf('string');
+        expect(await adapter.queryCanonicalStorage(event, { ...request, cursor: first.nextCursor })).toEqual({
+            items: [{ kind: 'retained_metadata', hash: unknown, updatedAt: expect.any(Number) }],
+            hasMore: false,
+        });
+        await expect(adapter.queryCanonicalStorage(event, {
+            ...request, scope: { workspaceId: 'foreign' },
+        })).rejects.toMatchObject({ statusCode: 403 });
+        await write(known, 3, 'put');
+        expect(await adapter.queryCanonicalStorage(event, request)).toEqual({
+            items: [{ kind: 'retained_metadata', hash: unknown, updatedAt: expect.any(Number) }],
+            hasMore: false,
+        });
+        expect(await adapter.queryCanonicalStorage(event, {
+            scope: { workspaceId }, kind: 'live_metadata', hash: known,
+        })).toMatchObject({ items: [{ kind: 'metadata', hash: known, sizeBytes: 17 }], hasMore: false });
+    });
+
     it('returns current live and tombstone winners for a replayed D1 push', async () => {
         const { userId } = await store.getOrCreateUser({
             provider: 'clerk', providerUserId: 'd1-replay-user',

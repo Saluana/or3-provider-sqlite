@@ -26,6 +26,7 @@ import { reconcileBackgroundJobHistory } from '~~/server/utils/background-jobs/h
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import type { CanonicalGenerationSnapshot, ChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
 import type { RequestUsage } from '~~/shared/chat/compaction';
+import type { TerminalGenerationSnapshot } from '~~/server/utils/background-jobs/types';
 
 const WORKSPACE_ID = 'ws-test-1';
 const DEVICE_A = 'device-a';
@@ -179,7 +180,9 @@ describe('SqliteSyncGatewayAdapter', () => {
                 do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); purgedPages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
                 await applySnapshotChain(second, purgedPages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
                 expect(await second.threads.get('roundtrip-root')).toBeUndefined(); expect(await second.messages.get('roundtrip-0')).toBeUndefined();
-                expect((await resolveThreadProjection(child.thread.id, second)).messages.map(row => row.id)).toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
+                // Purging the ancestor also removes its project provenance.
+                // Current hosts must fail closed instead of trusting the summary alone.
+                await expect(resolveThreadProjection(child.thread.id, second)).rejects.toMatchObject({ code: 'scope_incomplete' });
                 expect(await second.pending_ops.count()).toBe(0);
                 expect(await local.messages.count()).toBe(5);
             } finally {
@@ -253,7 +256,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } },
             };
         }
-        const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & import('~~/server/utils/background-jobs/types').TerminalGenerationSnapshot => ({
+        const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & TerminalGenerationSnapshot => ({
             status, content: 'canonical answer', reasoning: 'canonical reason', usage, completedAt: 1_800_000_000_000,
             toolCalls: [{ id: 'call-1', name: 'tool', status: 'complete', result: 'result' }],
             error: status === 'error' ? 'upstream interrupted' : undefined,
@@ -1289,6 +1292,157 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('canonical storage queries', () => {
+        // Failure modes: deleted rows vanish from usage after log pruning,
+        // placeholder tombstones invent a zero size, and restoration appears in
+        // both views. These are observations, never deletion authorization.
+        it('accounts retained metadata after pruning and moves restored hashes back to live', async () => {
+            const hash = `sha256:${'e'.repeat(64)}`;
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
+                payload: { hash, size_bytes: 41, storage_id: `${WORKSPACE_ID}:${hash}` } })]));
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
+                stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            getRawDb().prepare('DELETE FROM change_log').run();
+            getRawDb().prepare('DELETE FROM tombstones').run();
+            expect(adapter.capabilities).toMatchObject({ retainedStorageMetadata: 'v1' });
+            const query = () => adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1 });
+            expect(await query()).toMatchObject({ items: [{ kind: 'retained_metadata', hash: 'e'.repeat(64), sizeBytes: 41 }], hasMore: false });
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
+                payload: { hash, size_bytes: 41 },
+                stamp: { clock: 3, hlc: '2026-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            expect(await query()).toEqual({ items: [], hasMore: false });
+            expect(await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'live_metadata' }))
+                .toMatchObject({ items: [{ kind: 'metadata', hash: 'e'.repeat(64), sizeBytes: 41 }] });
+        });
+
+        it('reports unknown size for delete-before-put tombstones and scopes retained keyset pages', async () => {
+            for (const digit of ['1', '2', '3']) {
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: digit.repeat(64), operation: 'delete' })]));
+            }
+            const first = await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1 });
+            expect(first.items).toEqual([{ kind: 'retained_metadata', hash: '1'.repeat(64), updatedAt: expect.any(Number) }]);
+            expect(first.hasMore).toBe(true);
+            const second = await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1, cursor: first.nextCursor });
+            expect(second.items).toEqual([{ kind: 'retained_metadata', hash: '2'.repeat(64), updatedAt: expect.any(Number) }]);
+            expect(second.hasMore).toBe(true);
+            const third = await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1, cursor: second.nextCursor });
+            expect(third).toEqual({ items: [{ kind: 'retained_metadata', hash: '3'.repeat(64), updatedAt: expect.any(Number) }], hasMore: false });
+            expect(await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: 'foreign' }, kind: 'retained_metadata' }))
+                .toEqual({ items: [], hasMore: false });
+            await expect(adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'live_metadata', cursor: first.nextCursor }))
+                .rejects.toMatchObject({ statusCode: 400 });
+        });
+
+        it.each([0, 41, undefined, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '41'])(
+            'preserves known retained sizes and leaves invalid sizes unknown (%j)',
+            async (size) => {
+                const hash = `sha256:${'a'.repeat(64)}`;
+                await adapter.push(stubEvent, makeBatch([makeOp({
+                    tableName: 'file_meta', pk: hash,
+                    payload: { hash, size_bytes: size, storage_id: 'retained-object' },
+                })]));
+                await adapter.push(stubEvent, makeBatch([makeOp({
+                    tableName: 'file_meta', pk: hash, operation: 'delete',
+                    stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
+                })]));
+                const valid = typeof size === 'number' && Number.isSafeInteger(size) && size >= 0;
+                expect(await adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
+                    hash: `SHA256:${'A'.repeat(64)}`,
+                })).toEqual({
+                    items: [{
+                        kind: 'retained_metadata', hash: 'a'.repeat(64),
+                        ...(valid ? { sizeBytes: size } : {}),
+                        storageId: 'retained-object', updatedAt: expect.any(Number),
+                    }],
+                    hasMore: false,
+                });
+            }
+        );
+
+        it('isolates retained rows by workspace and rejects mismatched session scopes', async () => {
+            const hash = 'b'.repeat(64);
+            for (const [workspaceId, size] of [[WORKSPACE_ID, 11], ['foreign', 99]] as const) {
+                await adapter.push(stubEvent, {
+                    scope: { workspaceId },
+                    ops: [makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: size } })],
+                });
+                await adapter.push(stubEvent, {
+                    scope: { workspaceId },
+                    ops: [makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
+                        stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })],
+                });
+            }
+            const event = makeSessionEvent('storage-owner');
+            expect(await adapter.queryCanonicalStorage(event, {
+                scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', hash,
+            })).toEqual({
+                items: [{ kind: 'retained_metadata', hash, sizeBytes: 11, updatedAt: expect.any(Number) }],
+                hasMore: false,
+            });
+            await expect(adapter.queryCanonicalStorage(event, {
+                scope: { workspaceId: 'foreign' }, kind: 'retained_metadata', hash,
+            })).rejects.toMatchObject({ statusCode: 403 });
+        });
+
+        it('keeps retained reads mutation-free and rejects mismatched or malformed cursors', async () => {
+            for (const digit of ['1', '2']) {
+                await adapter.push(stubEvent, makeBatch([makeOp({
+                    tableName: 'file_meta', pk: digit.repeat(64), operation: 'delete',
+                })]));
+            }
+            const raw = getRawDb();
+            const before = raw.prepare('SELECT total_changes() AS count').get();
+            const request = { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata' as const, limit: 1 };
+            const page = await adapter.queryCanonicalStorage(stubEvent, request);
+            expect(page.hasMore).toBe(true);
+            expect(page.nextCursor).toBeTypeOf('string');
+            for (const cursor of ['not-json', 'x'.repeat(2049), Buffer.from(JSON.stringify({
+                version: 1, kind: 'retained_metadata', key: ['1', '2'],
+            })).toString('base64url')]) {
+                await expect(adapter.queryCanonicalStorage(stubEvent, { ...request, cursor }))
+                    .rejects.toMatchObject({ statusCode: 400 });
+            }
+            await expect(adapter.queryCanonicalStorage(stubEvent, {
+                ...request, hash: '1'.repeat(64), cursor: page.nextCursor,
+            })).rejects.toMatchObject({ statusCode: 400 });
+            expect(raw.prepare('SELECT total_changes() AS count').get()).toEqual(before);
+        });
+
+        it('keeps logical quota admission separate from retained disk observations', async () => {
+            const retainedHash = 'c'.repeat(64);
+            await adapter.push(stubEvent, makeBatch([makeOp({
+                tableName: 'file_meta', pk: retainedHash,
+                payload: { hash: retainedHash, size_bytes: 900 },
+            })]));
+            await adapter.push(stubEvent, makeBatch([makeOp({
+                tableName: 'file_meta', pk: retainedHash, operation: 'delete',
+                stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
+            }), makeOp({ tableName: 'file_meta', pk: 'd'.repeat(64), operation: 'delete' })]));
+            await adapter.push(stubEvent, makeBatch([makeOp({
+                tableName: 'file_meta', pk: 'e'.repeat(64),
+                payload: { hash: 'e'.repeat(64), size_bytes: 30 },
+            })]));
+            const request = {
+                workspaceId: WORKSPACE_ID, hash: 'f'.repeat(64), mimeType: 'image/png',
+                expiresAt: Math.floor(Date.now() / 1000) + 60, workspaceQuotaBytes: 40,
+            };
+            await expect(adapter.reserveUploadIntent(stubEvent, {
+                ...request, intentId: 'fits-logical-quota', sizeBytes: 10,
+            })).resolves.toBeUndefined();
+            await expect(adapter.reserveUploadIntent(stubEvent, {
+                ...request, intentId: 'exceeds-logical-quota', hash: 'a'.repeat(64), sizeBytes: 1,
+            })).rejects.toMatchObject({ statusCode: 413 });
+            expect(await adapter.queryCanonicalStorage(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
+            })).toEqual({
+                items: [
+                    { kind: 'retained_metadata', hash: retainedHash, sizeBytes: 900, updatedAt: expect.any(Number) },
+                    { kind: 'retained_metadata', hash: 'd'.repeat(64), updatedAt: expect.any(Number) },
+                ],
+                hasMore: false,
+            });
+        });
+
         it('reads live metadata from materialized state after logs are pruned and ignores a losing delete', async () => {
             const hash = `sha256:${'a'.repeat(64)}`;
             const put = makeOp({
