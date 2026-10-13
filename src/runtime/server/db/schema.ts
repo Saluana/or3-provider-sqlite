@@ -40,6 +40,15 @@ export interface WorkspaceMembersTable {
     created_at: Generated<number>;
 }
 
+export interface SignupInvitesTable {
+    id: string; email: string; token_hash: string; status: string;
+    expires_at: number; created_at: number; created_by_admin: string;
+    revoked_at: number | null; accepted_at: number | null;
+    user_id: string | null; workspace_id: string | null;
+    accepted_provider: string | null; accepted_provider_user_id: string | null;
+    retain_until: number;
+}
+
 export interface AuthInvitesTable {
     id: string;
     workspace_id: string;
@@ -282,6 +291,7 @@ export interface Or3SqliteDb {
     workspaces: WorkspacesTable;
     workspace_members: WorkspaceMembersTable;
     auth_invites: AuthInvitesTable;
+    signup_invites: SignupInvitesTable;
     server_version_counter: ServerVersionCounterTable;
     change_log: ChangeLogTable;
     device_cursors: DeviceCursorsTable;

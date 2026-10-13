@@ -566,3 +566,71 @@ describe('SqliteAuthWorkspaceStore', () => {
         }
     });
 });
+
+
+describe('private signup invitations', () => {
+    const identity = { provider: 'basic-auth', provider_user_id: 'signup-subject', email: 'signup@example.com' };
+    const invite = { id: 'signup-invite', email: identity.email, token_hash: 'signup-hash', expires_at: Date.now() + 3600_000, created_by_admin: 'admin' };
+    const accept = () => store.acceptSignupInviteAndProvisionUser!({ ...identity, invite_id: invite.id, token_hash: invite.token_hash });
+
+    it('creates one private owner workspace and replays without resetting a later selection', async () => {
+        await store.createSignupInvite!(invite);
+        const results = await Promise.all([accept(), accept()]);
+        expect(results.filter(r => r.ok && r.created)).toHaveLength(1);
+        const first = results[0];
+        expect(first.ok).toBe(true);
+        if (!first.ok) throw new Error('signup failed');
+        expect(await store.listUserWorkspaces(first.user_id)).toEqual([expect.objectContaining({ id: first.workspace_id, role: 'owner', isActive: true })]);
+        const members = await getSqliteDb().selectFrom('workspace_members').selectAll().execute();
+        expect(members).toHaveLength(1);
+        expect(members[0]?.user_id).toBe(first.user_id);
+        const other = await store.createWorkspace({ userId: first.user_id, name: 'Other' });
+        await store.setActiveWorkspace({ userId: first.user_id, workspaceId: other.workspaceId });
+        expect(await accept()).toMatchObject({ ok: true, created: false, workspace_id: first.workspace_id });
+        expect((await store.getOrCreateDefaultWorkspace(first.user_id)).workspaceId).toBe(other.workspaceId);
+        expect(await store.acceptSignupInviteAndProvisionUser!({ ...identity, provider_user_id: 'impostor', invite_id: invite.id, token_hash: invite.token_hash })).toEqual({ ok: false, reason: 'already_used' });
+        expect(await store.revokeSignupInvite!({ id: invite.id })).toEqual({ ok: false, reason: 'already_used' });
+    });
+
+    it('rolls back canonical writes when the workspace insert fails, and retries the same provider identity', async () => {
+        await store.createSignupInvite!(invite);
+        const { sql } = await import('kysely');
+        await sql.raw("CREATE TRIGGER refuse_signup BEFORE INSERT ON workspaces BEGIN SELECT RAISE(ABORT, 'workspace failure'); END").execute(getSqliteDb());
+        await expect(accept()).rejects.toThrow('workspace failure');
+        expect(await store.getUser({ provider: identity.provider, providerUserId: identity.provider_user_id })).toBeNull();
+        expect(await getSqliteDb().selectFrom('users').selectAll().execute()).toEqual([]);
+        expect(await store.validateSignupInvite!({ id: invite.id, email: identity.email, token_hash: invite.token_hash })).toEqual({ ok: true });
+        await sql.raw('DROP TRIGGER refuse_signup').execute(getSqliteDb());
+        expect(await accept()).toMatchObject({ ok: true, created: true });
+    });
+
+    it.each(['revoked', 'expired', 'token_mismatch', 'email_mismatch', 'account_exists'])(
+        'rejects %s without creating a workspace', async reason => {
+            await store.createSignupInvite!({ ...invite, expires_at: reason === 'expired' ? Date.now() - 1000 : invite.expires_at });
+            if (reason === 'revoked') await store.revokeSignupInvite!({ id: invite.id });
+            if (reason === 'account_exists') await store.getOrCreateUser({ provider: 'clerk', providerUserId: 'existing', email: identity.email });
+            const result = await store.acceptSignupInviteAndProvisionUser!({ ...identity, invite_id: invite.id,
+                email: reason === 'email_mismatch' ? 'wrong@example.com' : identity.email,
+                token_hash: reason === 'token_mismatch' ? 'wrong' : invite.token_hash });
+            expect(result).toEqual({ ok: false, reason });
+            expect(await getSqliteDb().selectFrom('workspaces').selectAll().execute()).toEqual([]);
+        }
+    );
+
+    it('paginates without token material and removes only a bounded set of old terminal rows', async () => {
+        for (let n = 0; n < 105; n++) {
+            await store.createSignupInvite!({ ...invite, id: 'old-' + n, token_hash: 'hash-' + n, expires_at: Date.now() - 1000 });
+        }
+        // Create cleanup is bounded; inject the old timestamps as a persisted retention fixture.
+        const { sql } = await import('kysely');
+        await sql.raw('UPDATE signup_invites SET expires_at = 1, retain_until = 1').execute(getSqliteDb());
+        const result = await store.listSignupInvites!({ limit: 2 });
+        expect(result.invites).toHaveLength(2);
+        expect(result.next_cursor).toBeTruthy();
+        expect(result.invites[0]).not.toHaveProperty('token_hash');
+        const remaining = await getSqliteDb().selectFrom('signup_invites').selectAll().execute();
+        expect(remaining).toHaveLength(5);
+        const second = await store.listSignupInvites!({ limit: 2, cursor: result.next_cursor! });
+        expect(second.invites).toEqual([]); // next bounded cleanup finishes retention
+    });
+});

@@ -45,6 +45,7 @@ const REQUIRED_SCHEMA_TABLES = [
     's_file_meta',
     's_notifications',
     'auth_invites',
+    'signup_invites',
     'admin_users',
     'admin_workspace_settings',
     'sync_snapshots',
@@ -57,6 +58,8 @@ const REQUIRED_SCHEMA_TABLES = [
     'background_admission_cancels',
     'background_generation_receipts'
 ] as const;
+
+import * as m024 from './migrations/024_signup_invites';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -81,7 +84,8 @@ const migrations: Record<string, Migration> = {
     '020_background_generation_receipts': m020,
     '021_background_request_usage': m021,
     '022_canonical_chat_reader': m022,
-    '023_legacy_chat_seek_index': m023
+    '023_legacy_chat_seek_index': m023,
+    '024_signup_invites': m024
 };
 
 class StaticMigrationProvider implements MigrationProvider {
