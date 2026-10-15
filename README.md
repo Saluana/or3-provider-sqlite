@@ -11,6 +11,22 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 - **Admin stores** (`sqlite`) — workspace access/lifecycle, workspace settings, user search, and deployment-admin grants (local, Bun, and Turso runtimes)
 - **RateLimitProvider** (`sqlite`) — durable rate-limit counters
 
+SSR-authenticated deployments also activate SQLite when it is selected only by
+`OR3_LIMITS_ENABLED=true` and `OR3_LIMITS_STORAGE_PROVIDER=sqlite`, independently
+of the account workspace backend.
+
+Canonical storage queries include bounded retained deleted metadata pages and
+advertise `retainedStorageMetadata: 'v1'` on native SQLite and D1. Missing sizes in
+delete-before-put rows remain unknown; these reads never replay sync history.
+
+Upload quota admission groups pending authorizations by hash, keeps consumed
+uploads charged until their original expiry or canonical metadata admission,
+and runs atomically on native SQLite and D1. Exact consumed receipts can retry
+within that lifetime without consuming twice. After expiry, obtain a fresh
+reservation; mismatched hash, MIME, size, workspace, or storage ID is rejected.
+Quota measures logical live metadata plus pending authorizations, not retained
+physical disk usage.
+
 ## Install
 
 ```bash
@@ -291,7 +307,9 @@ The canonical-history qualification lane defaults to a sibling `../or3-chat` che
 
 ## Workspace Files and Trash admission
 
-Persistent Projects uses this same capability for opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts. Preserve their JSON, metadata, and every original/extraction `file_hashes` reference. The project-aware canonical reader resolves `threads.project_id` or a single legacy membership in its authorized SQLite snapshot, returning `project_ownership: resolved | conflict`. String entries and JSON-encoded membership arrays remain supported; malformed or ambiguous memberships do not grant server execution. Hosts without this result must refuse project-sensitive server admission rather than infer ownership from the visible UI.
+Persistent Projects uses this same capability for opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts. Preserve their JSON, metadata, and every original/extraction `file_hashes` reference. The project-aware canonical reader resolves `threads.project_id` or a single legacy membership in its authorized SQLite snapshot, returning `project_ownership: resolved | conflict`. String entries and JSON-encoded membership arrays remain supported; chat IDs are trimmed and entry kinds ignore case and surrounding whitespace, matching the host's legacy normalization. Malformed or ambiguous memberships do not grant server execution. Hosts without this result must refuse project-sensitive server admission rather than infer ownership from the visible UI.
+
+Explicit ownership requires a live project in the same workspace. A missing or deleted project releases the chat even if a concurrent thread write retained its former pointer; legacy folders do not override that explicit release. Canonical reads leave the persisted pointer untouched.
 
 Version 0.0.15 declares `projectOwnership: 'v1'` on the native canonical-history adapter. D1 does not advertise this contract. Projects qualification: `OR3_PROJECT_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/sqlite-sync-gateway-adapter.test.ts`. This explicit lane uses the host's canonical-reader query contract while retaining the pinned standalone fixture for existing contracts. Qualify the published exact version with the disposable host cloud journey.
 

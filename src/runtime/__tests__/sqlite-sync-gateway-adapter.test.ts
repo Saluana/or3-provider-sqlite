@@ -3,12 +3,13 @@
  *
  * Covers push idempotency, LWW, pull pagination, cursor updates, and GC safety.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { initializeSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { initializeSqliteDb, getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { createD1TestDatabase } from '../../../test/support/d1-test-database';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import type {
@@ -26,6 +27,7 @@ import { reconcileBackgroundJobHistory } from '~~/server/utils/background-jobs/h
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import type { CanonicalGenerationSnapshot, ChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
 import type { RequestUsage } from '~~/shared/chat/compaction';
+import type { TerminalGenerationSnapshot } from '~~/server/utils/background-jobs/types';
 
 const WORKSPACE_ID = 'ws-test-1';
 const DEVICE_A = 'device-a';
@@ -35,6 +37,14 @@ const DEVICE_B = 'device-b';
 const stubEvent = {} as H3Event;
 
 let adapter: SqliteSyncGatewayAdapter;
+let d1TestDatabase: ReturnType<typeof createD1TestDatabase> | undefined;
+
+async function useD1TestDatabase(): Promise<void> {
+    await destroySqliteDb();
+    d1TestDatabase = createD1TestDatabase();
+    const db = await initializeSqliteDb({ driver: 'd1', d1Database: d1TestDatabase.database });
+    await runMigrations(db);
+}
 
 function makeOp(overrides: Partial<PendingOp> & { tableName: string; pk: string }): PendingOp {
     return {
@@ -90,12 +100,21 @@ beforeEach(async () => {
 
 afterEach(async () => {
     await destroySqliteDb();
+    d1TestDatabase?.close();
+    d1TestDatabase = undefined;
 });
 
 describe('SqliteSyncGatewayAdapter', () => {
-    // Security failures: legacy membership omitted, foreign/deleted projects included,
-    // ambiguous owners guessed, or an explicit pointer overridden by stale associations.
-    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT))('resolves canonical project ownership in the authorized storage snapshot', async () => {
+    // Security failures: normalized legacy membership omitted, extension/invalid
+    // entries counted as chats, ambiguous owners guessed, or explicit pointers
+    // overridden by stale associations.
+    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT)).each([
+        { label: 'plain strings', data: ['legacy'] },
+        { label: 'padded strings', data: [' legacy '] },
+        { label: 'padded object IDs', data: [{ id: ' legacy ' }] },
+        { label: 'normalized kinds', data: [{ id: ' legacy ', kind: ' CHAT ' }] },
+        { label: 'encoded normalized memberships', data: JSON.stringify([{ id: ' legacy ', kind: ' CHAT ' }]) },
+    ])('resolves canonical project ownership for $label in the authorized storage snapshot', async ({ data }) => {
         const raw = getRawDb();
         raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
         raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
@@ -103,13 +122,40 @@ describe('SqliteSyncGatewayAdapter', () => {
         await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',payload:{id:'legacy'}})]));
         const read = () => adapter.readChatHistory(actor, {kind:'thread',thread_id:'legacy'});
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
+        await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'projects', pk: 'extensions', payload: { id: 'extensions', data: [
+            { id: 'legacy', kind: 'plugin-resource' }, { id: 'legacy', kind: 'doc' }, { id: 'legacy', kind: 'file' },
+            { id: 'legacy', kind: null }, { id: 123, kind: 'chat' }, [], null,
+        ] } })]), workspaceItemCapability: 'v1' });
+        expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
         for (const id of ['one', 'two']) {
-            await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? ['legacy'] : JSON.stringify([{id:'legacy'}])}})]));
+            await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? data : JSON.stringify([{id:'legacy'}])}})]));
             expect(await read()).toMatchObject(id === 'one' ? {project_ownership:'resolved',thread:{project_id:'one'}} : {project_ownership:'conflict'});
         }
+        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:'chosen',payload:{id:'chosen',name:'Chosen',data:[]}})]));
         await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]));
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     });
+    // A deleted/missing owner releases the chat even if LWW preserved its old
+    // pointer. A same-ID project in another workspace cannot retain ownership,
+    // and legacy membership must not override an explicit released pointer.
+    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT)).each(['missing', 'deleted', 'foreign'] as const)(
+        'releases canonical chats with an explicit %s project owner', async (state) => {
+            const raw = getRawDb();
+            raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
+            raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+            await adapter.push(stubEvent, makeBatch([
+                makeOp({ tableName: 'threads', pk: 'released-chat', payload: { id: 'released-chat', project_id: 'old-owner' } }),
+                makeOp({ tableName: 'projects', pk: 'stale-folder', payload: { id: 'stale-folder', data: ['released-chat'] } }),
+            ]));
+            if (state !== 'missing') {
+                const scope = { workspaceId: state === 'foreign' ? 'another-workspace' : WORKSPACE_ID };
+                await adapter.push(stubEvent, { scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', payload: { id: 'old-owner', data: [] } })] });
+                if (state === 'deleted') await adapter.push(stubEvent, { scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', operation: 'delete',
+                    stamp: { deviceId: DEVICE_A, opId: randomUUID(), clock: 2, hlc: '2026-10-05T00:00:00.000Z-0000' } })] });
+            }
+            expect(await adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'thread', thread_id: 'released-chat' }))
+                .toMatchObject({ project_ownership: 'resolved', thread: { project_id: null } });
+        });
     describe.runIf(process.env.OR3_CANONICAL_ARTIFACTS === 'true')('source-built canonical history reader', () => {
         it('roundtrips a real local compacted fork through built canonical storage, partial second-client delivery and reconnect', async () => {
             const indexedDbFixture = 'fake-indexeddb/auto';
@@ -179,7 +225,11 @@ describe('SqliteSyncGatewayAdapter', () => {
                 do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); purgedPages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
                 await applySnapshotChain(second, purgedPages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
                 expect(await second.threads.get('roundtrip-root')).toBeUndefined(); expect(await second.messages.get('roundtrip-0')).toBeUndefined();
-                expect((await resolveThreadProjection(child.thread.id, second)).messages.map(row => row.id)).toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
+                // Display retains the saved summary, but requests must refuse
+                // inherited context whose project provenance was purged.
+                await expect(resolveThreadProjection(child.thread.id, second)).rejects.toMatchObject({ code: 'scope_incomplete' });
+                expect((await resolveThreadProjection(child.thread.id, second, undefined, { projectProvenance: false })).messages.map(row => row.id))
+                    .toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
                 expect(await second.pending_ops.count()).toBe(0);
                 expect(await local.messages.count()).toBe(5);
             } finally {
@@ -253,7 +303,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } },
             };
         }
-        const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & import('~~/server/utils/background-jobs/types').TerminalGenerationSnapshot => ({
+        const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & TerminalGenerationSnapshot => ({
             status, content: 'canonical answer', reasoning: 'canonical reason', usage, completedAt: 1_800_000_000_000,
             toolCalls: [{ id: 'call-1', name: 'tool', status: 'complete', result: 'result' }],
             error: status === 'error' ? 'upstream interrupted' : undefined,
@@ -1289,6 +1339,56 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('canonical storage queries', () => {
+        // Failure modes: retained queries accidentally read reference edges or the
+        // prunable log, leak live/foreign rows, invent placeholder sizes, or lose
+        // the metadata needed for read-only accounting after a winning delete.
+        it.each(['native', 'd1'] as const)('keyset-pages retained materialized metadata independently of sync history with %s', async (runtime) => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const hashes = ['a', 'b', 'c', 'd'].map((letter) => `sha256:${letter.repeat(64)}`);
+            const metadata = (hash: string) => makeOp({
+                tableName: 'file_meta', pk: hash,
+                payload: { hash, size_bytes: 321, storage_id: 'object-1', name: 'retained.png', mime_type: 'image/png', kind: 'image' },
+            });
+            await adapter.push(stubEvent, makeBatch([
+                metadata(hashes[0]!), metadata(hashes[2]!),
+                makeOp({ tableName: 'messages', pk: 'reference', payload: { id: 'reference', file_hashes: JSON.stringify([hashes[2]]) } }),
+            ]));
+            const deletion = (hash: string) => makeOp({
+                tableName: 'file_meta', pk: hash, operation: 'delete',
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
+            });
+            await adapter.push(stubEvent, makeBatch([deletion(hashes[0]!), deletion(hashes[1]!)]));
+            await adapter.push(stubEvent, { scope: { workspaceId: 'foreign' }, ops: [metadata(hashes[3]!), deletion(hashes[3]!)] });
+            await getSqliteDb().deleteFrom('change_log').execute();
+            await getSqliteDb().deleteFrom('tombstones').execute();
+
+            const query = { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata' as const, limit: 1 };
+            const first = await adapter.queryCanonicalStorage(makeSessionEvent('owner'), query);
+            expect(first).toMatchObject({
+                items: [{ kind: 'retained_metadata', hash: 'a'.repeat(64), sizeBytes: 321, storageId: 'object-1',
+                    name: 'retained.png', mimeType: 'image/png', fileKind: 'image', updatedAt: expect.any(Number) }],
+                hasMore: true, nextCursor: expect.any(String),
+            });
+            expect(adapter.capabilities.retainedStorageMetadata).toBe('v1');
+            const second = await adapter.queryCanonicalStorage(stubEvent, { ...query, cursor: first.nextCursor });
+            expect(second).toEqual({ items: [{ kind: 'retained_metadata', hash: 'b'.repeat(64), updatedAt: expect.any(Number) }], hasMore: false });
+            expect(await adapter.queryCanonicalStorage(stubEvent, { ...query, hash: hashes[0]!.toUpperCase() })).toEqual({ items: first.items, hasMore: false });
+            await expect(adapter.queryCanonicalStorage(stubEvent, { ...query, kind: 'live_metadata', cursor: first.nextCursor })).rejects.toThrow('Invalid canonical storage cursor');
+            await expect(adapter.queryCanonicalStorage(makeSessionEvent('owner'), { ...query, scope: { workspaceId: 'foreign' } })).rejects.toThrow('Forbidden');
+        });
+
+        // Unknown retained sizes are allowed only when absent, never when a
+        // stored value is malformed and would silently corrupt byte accounting.
+        it.each([null, -1, '321', Number.MAX_SAFE_INTEGER + 1])('rejects malformed retained size %s', async (size) => {
+            const hash = `sha256:${'a'.repeat(64)}`;
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: size } })]));
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            await expect(adapter.queryCanonicalStorage(stubEvent, {
+                scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
+            })).rejects.toThrow('Invalid canonical file size');
+        });
+
         it('reads live metadata from materialized state after logs are pruned and ignores a losing delete', async () => {
             const hash = `sha256:${'a'.repeat(64)}`;
             const put = makeOp({
@@ -1425,40 +1525,134 @@ describe('SqliteSyncGatewayAdapter', () => {
             });
         });
 
-        it('atomically rejects concurrent reservations that collectively exceed quota', async () => {
-            const now = Math.floor(Date.now() / 1000);
-            const reserve = (intentId: string, hash: string) => adapter.reserveUploadIntent(stubEvent, {
-                intentId, workspaceId: WORKSPACE_ID, hash, mimeType: 'image/png', sizeBytes: 60,
-                expiresAt: now + 60, workspaceQuotaBytes: 100,
+        describe.each(['native', 'd1'] as const)('upload-intent lifecycle with %s', (runtime) => {
+            beforeEach(async () => {
+                if (runtime === 'd1') await useD1TestDatabase();
             });
-            const results = await Promise.allSettled([
-                reserve('intent-a', `sha256:${'a'.repeat(64)}`),
-                reserve('intent-b', `sha256:${'b'.repeat(64)}`),
-            ]);
-            expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-            expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
-            const row = getRawDb().prepare(`SELECT COALESCE(SUM(reserved_bytes), 0) AS total
-                FROM upload_intents WHERE status = 'active'`).get() as { total: number };
-            expect(row.total).toBe(60);
-        });
 
-        it('consumes an intent once and rejects replay or metadata mismatch', async () => {
-            const now = Math.floor(Date.now() / 1000);
-            const request = {
-                intentId: 'intent-commit', workspaceId: WORKSPACE_ID,
-                hash: `sha256:${'c'.repeat(64)}`, mimeType: 'image/png', sizeBytes: 10,
-                expiresAt: now + 60,
-            };
-            await adapter.reserveUploadIntent(stubEvent, request);
-            await expect(adapter.consumeUploadIntent(stubEvent, {
-                ...request, sizeBytes: 11, storageId: 'object-1',
-            })).rejects.toMatchObject({ statusCode: 409 });
-            await expect(adapter.consumeUploadIntent(stubEvent, {
-                ...request, storageId: 'object-1',
-            })).resolves.toBeUndefined();
-            await expect(adapter.consumeUploadIntent(stubEvent, {
-                ...request, storageId: 'object-1',
-            })).rejects.toMatchObject({ statusCode: 409 });
+            // Failure modes: D1's asynchronous reads admit concurrent requests over
+            // quota, consumed uploads release their charge before metadata arrives,
+            // or a zero-byte duplicate loses its charge when the first is cancelled.
+            it('atomically rejects concurrent reservations that collectively exceed quota', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const reserve = (intentId: string, hash: string) => adapter.reserveUploadIntent(stubEvent, {
+                    intentId, workspaceId: WORKSPACE_ID, hash, mimeType: 'image/png', sizeBytes: 60,
+                    expiresAt: now + 60, workspaceQuotaBytes: 100,
+                });
+                const results = await Promise.allSettled([
+                    reserve('intent-a', `sha256:${'a'.repeat(64)}`),
+                    reserve('intent-b', `sha256:${'b'.repeat(64)}`),
+                ]);
+                expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+                expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+                const pending = await adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now,
+                });
+                expect(pending.items).toHaveLength(1);
+                expect(pending.items[0]).toMatchObject({ kind: 'reservation', sizeBytes: 60 });
+            });
+
+            it('holds consumed quota until canonical admission without double-counting live metadata', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'first', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' });
+                const pending = () => adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now,
+                });
+                expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'first', hash: 'a'.repeat(64), sizeBytes: 60, expiresAt: now + 60 }]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    payload: { hash: request.hash, size_bytes: 60 } })]));
+                expect((await pending()).items).toEqual([]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'third', hash: `sha256:${'c'.repeat(64)}`, sizeBytes: 40 })).resolves.toBeUndefined();
+            });
+
+            // A consumed receipt can retry only within the original authorization
+            // TTL. Releasing its charge and still replaying that receipt would
+            // allow an interrupted commit and a fresh upload to exceed quota.
+            it('expires consumed receipt replay together with its quota charge', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const currentTime = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+                try {
+                    const request = { intentId: 'interrupted', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                        mimeType: 'image/png', sizeBytes: 100, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                    await adapter.reserveUploadIntent(stubEvent, request);
+                    await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' });
+                    await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).resolves.toBeUndefined();
+                    currentTime.mockReturnValue((now + 61) * 1000);
+                    await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).rejects.toMatchObject({ statusCode: 409 });
+                    await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second',
+                        hash: `sha256:${'b'.repeat(64)}`, expiresAt: now + 120 })).resolves.toBeUndefined();
+                    const pending = () => adapter.queryCanonicalStorage(stubEvent, {
+                        scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now: now + 61,
+                    });
+                    expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'second',
+                        hash: 'b'.repeat(64), sizeBytes: 100, expiresAt: now + 120 }]);
+                    const receipt = await getSqliteDb().selectFrom('upload_intents').select('expires_at').where('id', '=', request.intentId).executeTakeFirstOrThrow();
+                    expect(receipt.expires_at).toBe(now + 60);
+                } finally {
+                    currentTime.mockRestore();
+                }
+            });
+
+            it('retains a same-hash reservation after its first intent is cancelled and releases it on expiry', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'first', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'duplicate' });
+                await adapter.cancelUploadIntent(stubEvent, request);
+                const pending = () => adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now,
+                });
+                expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'duplicate', hash: 'a'.repeat(64), sizeBytes: 60, expiresAt: now + 60 }]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
+                await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', 'duplicate').execute();
+                expect((await pending()).items).toEqual([]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).resolves.toBeUndefined();
+            });
+
+            // Exact persisted receipts let storage commit retry after interruption.
+            // A changed tuple must never turn the consumed intent into a fresh grant.
+            it('accepts exact consumed receipt retries and rejects changed authorization fields', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = {
+                    intentId: 'intent-commit', workspaceId: WORKSPACE_ID,
+                    hash: `sha256:${'c'.repeat(64)}`, mimeType: 'image/png', sizeBytes: 10,
+                    expiresAt: now + 60,
+                };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await expect(adapter.consumeUploadIntent(stubEvent, {
+                    ...request, sizeBytes: 11, storageId: 'object-1',
+                })).rejects.toMatchObject({ statusCode: 409 });
+                await expect(adapter.consumeUploadIntent(stubEvent, {
+                    ...request, storageId: 'object-1',
+                })).resolves.toBeUndefined();
+                const before = await getSqliteDb().selectFrom('upload_intents').selectAll().where('id', '=', request.intentId).executeTakeFirstOrThrow();
+                await expect(adapter.consumeUploadIntent(stubEvent, {
+                    ...request, hash: request.hash.toUpperCase(), storageId: 'object-1',
+                })).resolves.toBeUndefined();
+                for (const changed of [
+                    { intentId: 'missing' }, { workspaceId: 'foreign' }, { hash: `sha256:${'d'.repeat(64)}` },
+                    { mimeType: 'image/jpeg' }, { sizeBytes: 11 }, { storageId: 'object-2' },
+                ]) {
+                    await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1', ...changed })).rejects.toMatchObject({ statusCode: 409 });
+                }
+                const after = await getSqliteDb().selectFrom('upload_intents').selectAll().where('id', '=', request.intentId).executeTakeFirstOrThrow();
+                expect(after).toEqual(before);
+            });
+
+            it.each(['expired', 'cancelled'] as const)('rejects a %s unconsumed authorization', async (status) => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'invalid', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                if (status === 'cancelled') await adapter.cancelUploadIntent(stubEvent, request);
+                else await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', request.intentId).execute();
+                await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).rejects.toMatchObject({ statusCode: 409 });
+            });
         });
     });
 

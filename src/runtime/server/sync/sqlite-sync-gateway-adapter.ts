@@ -71,6 +71,26 @@ const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
 const MAX_SYNC_RETENTION_SECONDS = 365 * 24 * 60 * 60;
 const MAX_SYNC_PAYLOAD_BYTES = 256 * 1024;
 
+// Consumed uploads occupy quota until canonical metadata arrives or their
+// authorization expires. Exact receipt retries share that original lifetime.
+// Grouping content hashes preserves duplicate intents'
+// charge when another intent is cancelled, without charging the bytes twice.
+const PENDING_UPLOAD_RESERVATIONS_SQL = `
+    SELECT MIN(intent.id) AS id, intent.hash,
+           MAX(intent.size_bytes) AS reserved_bytes, MAX(intent.expires_at) AS expires_at
+    FROM upload_intents AS intent
+    WHERE intent.workspace_id = ? AND intent.status IN ('active', 'consumed')
+      AND intent.expires_at > ? AND intent.size_bytes > 0
+      AND NOT EXISTS (
+          SELECT 1 FROM s_file_meta AS metadata
+          WHERE metadata.workspace_id = intent.workspace_id AND metadata.deleted = 0
+            AND lower(CASE WHEN instr(trim(metadata.id), ':') > 0
+                THEN substr(trim(metadata.id), instr(trim(metadata.id), ':') + 1)
+                ELSE trim(metadata.id) END) = intent.hash
+      )
+    GROUP BY intent.hash
+`;
+
 type SnapshotKind = 'row' | 'tombstone';
 
 type SnapshotPageToken = {
@@ -683,6 +703,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             ? ({
                   snapshotBootstrap: 'snapshot-v1',
                   historyRetention: 'snapshot-v1',
+                  retainedStorageMetadata: 'v1',
               } as const)
             : ({
                   snapshotBootstrap: 'snapshot-v1',
@@ -691,6 +712,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   canonicalChatHistory: 'v1',
                   projectOwnership: 'v1',
                   workspaceItems: 'v1',
+                  retainedStorageMetadata: 'v1',
               } as const);
     }
 
@@ -721,8 +743,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 const row = raw.prepare('SELECT id, data_json, clock, deleted FROM s_threads WHERE workspace_id = ? AND id = ?')
                     .get(actor.workspaceId, query.thread_id) as StoredRow | undefined;
                 const thread = row ? parse(row) : undefined;
-                if (!thread || thread.project_id) return { status: 'ok' as const, project_ownership: 'resolved' as const,
+                if (!thread) return { status: 'ok' as const, project_ownership: 'resolved' as const,
                     revision: String(threadRevision?.value ?? 0), thread };
+                if (thread.project_id) {
+                    const owner = raw.prepare('SELECT id FROM s_projects WHERE workspace_id = ? AND id = ? AND COALESCE(deleted, 0) = 0')
+                        .get(actor.workspaceId, thread.project_id);
+                    // Deletion releases ownership even if a concurrent LWW
+                    // thread write retained its pointer. Never fall back to
+                    // legacy folders when an explicit pointer was supplied.
+                    return { status: 'ok' as const, project_ownership: 'resolved' as const,
+                        revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: owner ? thread.project_id : null } };
+                }
                 // Legacy folder membership is authoritative when the chat has no
                 // pointer. Resolve it in this same authorized SQLite snapshot.
                 const projects = raw.prepare('SELECT id, data_json FROM s_projects WHERE workspace_id = ? AND COALESCE(deleted, 0) = 0')
@@ -731,8 +762,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     const payload = JSON.parse(project.data_json);
                     const entries: unknown = typeof payload.data === 'string' ? JSON.parse(payload.data) : payload.data ?? [];
                     if (!Array.isArray(entries)) throw new Error('Canonical project membership is unresolved.');
-                    return entries.some(entry => typeof entry === 'string' ? entry === query.thread_id
-                        : entry && typeof entry === 'object' && !Array.isArray(entry) && (entry.kind === undefined || entry.kind === 'chat') && entry.id === query.thread_id);
+                    return entries.some(entry => {
+                        if (typeof entry === 'string') return entry.trim() === query.thread_id;
+                        if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.id !== 'string') return false;
+                        const kind = typeof entry.kind === 'string' ? entry.kind.trim().toLowerCase() : entry.kind;
+                        return (kind === undefined || kind === 'chat') && entry.id.trim() === query.thread_id;
+                    });
                 });
                 return { status: 'ok' as const, project_ownership: owners.length > 1 ? 'conflict' as const : 'resolved' as const,
                     revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: owners[0]?.id ?? null } };
@@ -1131,23 +1166,30 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 }>;
             let usedBytes = 0;
             let alreadyStored = false;
+            const liveSizes = new Map<string, number>();
             for (const row of liveRows) {
                 const payload = JSON.parse(row.data_json) as Record<string, unknown>;
                 const size = payload.size_bytes ?? payload.sizeBytes;
                 if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
                     throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
                 }
-                usedBytes += size;
-                if (normalizeStorageHash(row.id) === hash) alreadyStored = true;
+                const liveHash = normalizeStorageHash(row.id);
+                const previousSize = liveSizes.get(liveHash);
+                if (previousSize !== undefined && previousSize !== size) {
+                    throw createError({ statusCode: 500, statusMessage: 'Conflicting canonical file size' });
+                }
+                if (previousSize === undefined) usedBytes += size;
+                liveSizes.set(liveHash, size);
+                if (liveHash === hash) alreadyStored = true;
             }
-            const totals = raw.prepare(`SELECT
+            const totals = raw.prepare(`WITH pending AS (${PENDING_UPLOAD_RESERVATIONS_SQL}) SELECT
                     COALESCE(SUM(reserved_bytes), 0) AS reserved_bytes,
-                    MAX(CASE WHEN hash = ? AND reserved_bytes > 0 THEN 1 ELSE 0 END) AS same_hash
-                FROM upload_intents WHERE workspace_id = ? AND status = 'active' AND expires_at > ?`)
-                .get(hash, input.workspaceId, now) as { reserved_bytes: number; same_hash: number | null };
-            const reservedBytes = alreadyStored || totals.same_hash === 1 ? 0 : input.sizeBytes;
+                    COALESCE(MAX(CASE WHEN hash = ? THEN reserved_bytes END), 0) AS same_hash
+                FROM pending`)
+                .get(input.workspaceId, now, hash) as { reserved_bytes: number; same_hash: number };
+            const addedBytes = alreadyStored ? 0 : Math.max(0, input.sizeBytes - totals.same_hash);
             if (input.workspaceQuotaBytes !== undefined &&
-                usedBytes + totals.reserved_bytes + reservedBytes > input.workspaceQuotaBytes) {
+                usedBytes + totals.reserved_bytes + addedBytes > input.workspaceQuotaBytes) {
                 throw createError({ statusCode: 413, statusMessage: 'Workspace storage quota exceeded' });
             }
             raw.prepare(`INSERT INTO upload_intents (
@@ -1155,41 +1197,37 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     expires_at, status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)`)
                 .run(input.intentId, input.workspaceId, hash, input.mimeType, input.sizeBytes,
-                    reservedBytes, input.expiresAt, now);
+                    input.sizeBytes, input.expiresAt, now);
         })();
     }
 
     async consumeUploadIntent(event: H3Event, input: UploadIntentConsumptionRequest): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.workspaceId);
-        if (isD1Driver()) {
-            const now = nowEpoch();
-            const result = await d1Run(
-                `UPDATE upload_intents
-                 SET status = 'consumed', storage_id = ?, consumed_at = ?
-                 WHERE id = ? AND workspace_id = ? AND status = 'active' AND expires_at > ?
-                   AND hash = ? AND mime_type = ? AND size_bytes = ?`,
-                input.storageId,
-                now,
-                input.intentId,
-                input.workspaceId,
-                now,
-                normalizeStorageHash(input.hash),
-                input.mimeType,
-                input.sizeBytes
-            );
-            if ((result.meta?.changes ?? 0) !== 1) {
-                throw createError({ statusCode: 409, statusMessage: 'Upload intent expired, mismatched, or already consumed' });
-            }
-            return;
-        }
-        const raw = getRawDb();
-        const result = raw.prepare(`UPDATE upload_intents
+        const now = nowEpoch();
+        const hash = normalizeStorageHash(input.hash);
+        const raw = isD1Driver() ? null : getRawDb();
+        const sql = `UPDATE upload_intents
             SET status = 'consumed', storage_id = ?, consumed_at = ?
             WHERE id = ? AND workspace_id = ? AND status = 'active' AND expires_at > ?
-              AND hash = ? AND mime_type = ? AND size_bytes = ?`)
-            .run(input.storageId, nowEpoch(), input.intentId, input.workspaceId, nowEpoch(),
-                normalizeStorageHash(input.hash), input.mimeType, input.sizeBytes);
-        if (result.changes !== 1) {
+              AND hash = ? AND mime_type = ? AND size_bytes = ?`;
+        const parameters = [input.storageId, now, input.intentId, input.workspaceId, now,
+            hash, input.mimeType, input.sizeBytes];
+        const changes = raw
+            ? raw.prepare(sql).run(...parameters).changes
+            : (await d1Run(sql, ...parameters)).meta?.changes;
+        if (changes === 1) return;
+
+        // The durable consumed tuple is the receipt for interrupted storage
+        // commits. Replays never rewrite its timestamp or grant another object.
+        const receiptSql = `SELECT 1 FROM upload_intents
+            WHERE id = ? AND workspace_id = ? AND status = 'consumed' AND expires_at > ?
+              AND hash = ? AND mime_type = ? AND size_bytes = ? AND storage_id = ?`;
+        const receiptParameters = [input.intentId, input.workspaceId, now, hash,
+            input.mimeType, input.sizeBytes, input.storageId];
+        const receipt = raw
+            ? raw.prepare(receiptSql).get(...receiptParameters)
+            : (await d1All(receiptSql, ...receiptParameters))[0];
+        if (!receipt) {
             throw createError({ statusCode: 409, statusMessage: 'Upload intent expired, mismatched, or already consumed' });
         }
     }
@@ -1247,10 +1285,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             const now = input.now ?? nowEpoch();
             const rows = await all<{
                 id: string; hash: string; reserved_bytes: number; expires_at: number;
-            }>(`SELECT id, hash, reserved_bytes, expires_at
-                FROM upload_intents
-                WHERE workspace_id = ? AND status = 'active' AND expires_at > ?
-                  AND id > ? AND reserved_bytes > 0 AND (? IS NULL OR hash = ?)
+            }>(`WITH pending AS (${PENDING_UPLOAD_RESERVATIONS_SQL})
+                SELECT id, hash, reserved_bytes, expires_at FROM pending
+                WHERE id > ? AND (? IS NULL OR hash = ?)
                 ORDER BY id ASC LIMIT ?`, workspaceId, now, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
             const hasMore = rows.length > limit;
             const page = hasMore ? rows.slice(0, limit) : rows;
@@ -1270,7 +1307,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             };
         }
 
-        if (input.kind === 'live_metadata') {
+        if (input.kind === 'live_metadata' || input.kind === 'retained_metadata') {
+            const retained = input.kind === 'retained_metadata';
             if (after.length > 1) {
                 throw createError({ statusCode: 400, statusMessage: 'Invalid canonical storage cursor' });
             }
@@ -1282,7 +1320,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 SELECT id, data_json, updated_at
                 FROM s_file_meta
                 WHERE workspace_id = ?
-                  AND deleted = 0
+                  AND deleted = ?
                   AND id > ?
                   AND (? IS NULL OR lower(
                     CASE
@@ -1293,7 +1331,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   ) = ?)
                 ORDER BY id ASC
                 LIMIT ?
-            `, workspaceId, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
+            `, workspaceId, retained ? 1 : 0, after[0] ?? '', hash ?? null, hash ?? null, limit + 1);
 
             const hasMore = rows.length > limit;
             const page = hasMore ? rows.slice(0, limit) : rows;
@@ -1305,7 +1343,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file metadata' });
                 }
                 const size = payload.size_bytes ?? payload.sizeBytes;
-                if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+                const missingSize = !('size_bytes' in payload) && !('sizeBytes' in payload);
+                if (!(retained && missingSize) &&
+                    (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0)) {
                     throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
                 }
                 const storageId = payload.storage_id ?? payload.storageId;
@@ -1317,10 +1357,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                           : payload.kind === 'file'
                             ? ('file' as const)
                             : undefined;
-                return {
-                    kind: 'metadata' as const,
+                const metadata = {
                     hash: normalizeStorageHash(row.id),
-                    sizeBytes: size,
                     ...(typeof storageId === 'string' && storageId ? { storageId } : {}),
                     ...(typeof (payload.mime_type ?? payload.mimeType) === 'string'
                         ? { mimeType: String(payload.mime_type ?? payload.mimeType) }
@@ -1329,6 +1367,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     ...(fileKind ? { fileKind } : {}),
                     updatedAt: row.updated_at,
                 };
+                return retained
+                    ? { ...metadata, kind: 'retained_metadata' as const,
+                        ...(typeof size === 'number' ? { sizeBytes: size } : {}) }
+                    : { ...metadata, kind: 'metadata' as const, sizeBytes: size as number };
             });
             const last = page[page.length - 1];
             return {
@@ -2512,61 +2554,77 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
              WHERE workspace_id = ? AND deleted = 0`,
             input.workspaceId
         );
-        let usedBytes = 0;
-        let alreadyStored = false;
+        const liveSizes = new Map<string, number>();
         for (const row of liveRows) {
             const payload = JSON.parse(row.data_json) as Record<string, unknown>;
             const size = payload.size_bytes ?? payload.sizeBytes;
             if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
                 throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
             }
-            usedBytes += size;
-            if (normalizeStorageHash(row.id) === hash) alreadyStored = true;
+            const liveHash = normalizeStorageHash(row.id);
+            const previousSize = liveSizes.get(liveHash);
+            if (previousSize !== undefined && previousSize !== size) {
+                throw createError({ statusCode: 500, statusMessage: 'Conflicting canonical file size' });
+            }
+            liveSizes.set(liveHash, size);
         }
-        const [totals] = await d1All<{
-            reserved_bytes: number;
-            same_hash: number | null;
-        }>(
-            `SELECT COALESCE(SUM(reserved_bytes), 0) AS reserved_bytes,
-                    MAX(CASE WHEN hash = ? AND reserved_bytes > 0 THEN 1 ELSE 0 END) AS same_hash
-             FROM upload_intents
-             WHERE workspace_id = ? AND status = 'active' AND expires_at > ?`,
-            hash,
-            input.workspaceId,
-            now
-        );
-        const reservedBytes = alreadyStored || totals?.same_hash === 1
-            ? 0
-            : input.sizeBytes;
-        if (
-            input.workspaceQuotaBytes !== undefined &&
-            usedBytes + (totals?.reserved_bytes ?? 0) + reservedBytes > input.workspaceQuotaBytes
-        ) {
-            throw createError({ statusCode: 413, statusMessage: 'Workspace storage quota exceeded' });
-        }
-        await d1Batch([
+        const results = await d1Batch([
             {
                 sql: `UPDATE upload_intents SET status = 'expired'
                       WHERE workspace_id = ? AND status = 'active' AND expires_at <= ?`,
                 parameters: [input.workspaceId, now],
             },
             {
-                sql: `INSERT INTO upload_intents (
+                // Keep the quota decision in the write statement: D1's async
+                // preflight reads cannot serialize concurrent reservations.
+                sql: `WITH pending AS (${PENDING_UPLOAD_RESERVATIONS_SQL}), live AS (
+                    SELECT lower(CASE WHEN instr(trim(id), ':') > 0
+                        THEN substr(trim(id), instr(trim(id), ':') + 1)
+                        ELSE trim(id) END) AS hash,
+                        COALESCE(json_extract(data_json, '$.size_bytes'),
+                                 json_extract(data_json, '$.sizeBytes')) AS size_bytes
+                    FROM s_file_meta WHERE workspace_id = ? AND deleted = 0
+                ), quota AS (
+                    SELECT
+                        (SELECT COALESCE(SUM(size_bytes), 0) FROM (
+                            SELECT MAX(size_bytes) AS size_bytes FROM live GROUP BY hash
+                        )) AS used_bytes,
+                        (SELECT COALESCE(SUM(reserved_bytes), 0) FROM pending) AS pending_bytes,
+                        CASE WHEN EXISTS (SELECT 1 FROM live WHERE hash = ?) THEN 0
+                             ELSE MAX(0, ? - (SELECT COALESCE(MAX(reserved_bytes), 0)
+                                 FROM pending WHERE hash = ?)) END AS added_bytes
+                ) INSERT INTO upload_intents (
                     id, workspace_id, hash, mime_type, size_bytes, reserved_bytes,
                     expires_at, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)`,
+                ) SELECT ?, ?, ?, ?, ?, ?, ?, 'active', ? FROM quota
+                  WHERE (? IS NULL OR used_bytes + pending_bytes + added_bytes <= ?)
+                    AND NOT EXISTS (SELECT 1 FROM live WHERE size_bytes IS NULL
+                        OR typeof(size_bytes) NOT IN ('integer', 'real')
+                        OR size_bytes < 0 OR size_bytes > 9007199254740991
+                        OR size_bytes != CAST(size_bytes AS INTEGER))`,
                 parameters: [
+                    input.workspaceId,
+                    now,
+                    input.workspaceId,
+                    hash,
+                    input.sizeBytes,
+                    hash,
                     input.intentId,
                     input.workspaceId,
                     hash,
                     input.mimeType,
                     input.sizeBytes,
-                    reservedBytes,
+                    input.sizeBytes,
                     input.expiresAt,
                     now,
+                    input.workspaceQuotaBytes ?? null,
+                    input.workspaceQuotaBytes ?? null,
                 ],
             },
         ]);
+        if (results[1]?.meta?.changes !== 1) {
+            throw createError({ statusCode: 413, statusMessage: 'Workspace storage quota exceeded' });
+        }
     }
 
     private async snapshotInD1(

@@ -487,8 +487,8 @@ describe('SQLite background jobs', () => {
             body: settled.body,
             workspaceId: 'workspace-1',
         });
-        expect(resumed?.execution?.clientToolCall).toBeUndefined();
-        expect(resumed?.execution?.pendingToolCalls).toBeUndefined();
+        expect(resumed?.execution).not.toHaveProperty('clientToolCall');
+        expect(resumed?.execution).not.toHaveProperty('pendingToolCalls');
     });
 });
 

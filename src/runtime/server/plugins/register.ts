@@ -3,7 +3,7 @@
  *
  * Runs migrations at startup for local runtimes and on the first Worker
  * request for D1, then registers the relevant adapters.
- * Activates for SQLite account workspaces, sync, Connect or background jobs.
+ * Activates for SQLite account workspaces, sync, Connect, background jobs or limits.
  */
 import { defineNitroPlugin } from 'nitropack/runtime/plugin';
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
@@ -40,6 +40,7 @@ type RuntimeConfigWithSync = {
     sync?: { enabled?: boolean; provider?: string };
     connect?: { enabled?: boolean; provider?: string };
     backgroundJobs?: { enabled?: boolean; storageProvider?: string };
+    limits?: { enabled?: boolean; storageProvider?: string };
 };
 
 export default defineNitroPlugin(async (nitroApp) => {
@@ -55,7 +56,10 @@ export default defineNitroPlugin(async (nitroApp) => {
     const backgroundJobsSelected =
         config.backgroundJobs?.enabled === true &&
         config.backgroundJobs?.storageProvider === SQLITE_PROVIDER_ID;
-    if (!workspaceSelected && !connectSelected && !backgroundJobsSelected)
+    const limitsSelected =
+        config.limits?.enabled === true &&
+        config.limits?.storageProvider === SQLITE_PROVIDER_ID;
+    if (!workspaceSelected && !connectSelected && !backgroundJobsSelected && !limitsSelected)
         return;
 
     const driver = getSqliteDriver();
