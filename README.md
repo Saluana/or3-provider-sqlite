@@ -27,6 +27,10 @@ reservation; mismatched hash, MIME, size, workspace, or storage ID is rejected.
 Quota measures logical live metadata plus pending authorizations, not retained
 physical disk usage.
 
+## Atomic webhook registration quotas
+
+The webhook store advertises `registrationLimit: 'atomic-v1'`. `createWebhook(input, limit)` checks the user/workspace quota (or instance-wide admin quota) in the same immediate transaction as insertion. Independent connections share the limit; exhaustion throws `WEBHOOK_LIMIT_EXCEEDED`. The optional argument leaves non-quota internal calls unchanged. OR3 Chat requires this capability for registration; ship this provider change before integrating the coordinated host change.
+
 ## Install
 
 ```bash
