@@ -2060,16 +2060,26 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         };
     }
 
-    async snapshot(
+    async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+        return this.captureSnapshot(event, input, false);
+    }
+
+    /** Archives retain full Trash metadata; normal sync still emits tombstones. */
+    async backupSnapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+        return this.captureSnapshot(event, input, true);
+    }
+
+    private async captureSnapshot(
         event: H3Event,
-        input: SnapshotRequest
+        input: SnapshotRequest,
+        retainedFiles: boolean
     ): Promise<SnapshotResponse> {
         const workspaceId = input.scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
         const pageSize = resolveSnapshotPageSize(input.pageSize);
         const snapshotUserId = resolveSessionUserId(event);
         if (isD1Driver()) {
-            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId);
+            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles);
         }
         const raw = getRawDb();
         const now = nowEpoch();
@@ -2118,11 +2128,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 });
             }
 
+            if (existing.id.startsWith('backup:') !== retainedFiles) {
+                throw createError({ statusCode: 400, statusMessage: 'Snapshot mode cannot change between pages' });
+            }
             header = existing;
             after = token.after;
         } else {
             const tables = normalizeSnapshotTables(input.tables);
-            const snapshotId = uid();
+            const snapshotId = `${retainedFiles ? 'backup:' : ''}${uid()}`;
             const expiresAt = now + SNAPSHOT_TTL_SECONDS;
 
             const capture = raw.transaction((): SnapshotHeaderRow => {
@@ -2193,7 +2206,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                             clock, hlc, op_id, server_deleted_at
                         )
                         SELECT
-                            ?, ?, materialized.id, 'tombstone', NULL,
+                            ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
+                            ${retainedFiles && tableName === 'file_meta' ? "json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.updated_at', materialized.updated_at)" : 'NULL'},
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc
@@ -2631,7 +2645,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         workspaceId: string,
         input: SnapshotRequest,
         pageSize: number,
-        snapshotUserId: string | undefined
+        snapshotUserId: string | undefined,
+        retainedFiles: boolean
     ): Promise<SnapshotResponse> {
         const now = nowEpoch();
         let header: SnapshotHeaderRow;
@@ -2665,11 +2680,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     statusMessage: 'Snapshot table filter cannot change between pages',
                 });
             }
+            if (existing.id.startsWith('backup:') !== retainedFiles) {
+                throw createError({ statusCode: 400, statusMessage: 'Snapshot mode cannot change between pages' });
+            }
             header = existing;
             after = token.after;
         } else {
             const tables = normalizeSnapshotTables(input.tables);
-            const snapshotId = uid();
+            const snapshotId = `${retainedFiles ? 'backup:' : ''}${uid()}`;
             const expiresAt = now + SNAPSHOT_TTL_SECONDS;
             const tablesJson = JSON.stringify(tables);
             const statements: D1SqlStatement[] = [
@@ -2738,7 +2756,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                             clock, hlc, op_id, server_deleted_at
                         )
                         SELECT
-                            ?, ?, materialized.id, 'tombstone', NULL,
+                            ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
+                            ${retainedFiles && tableName === 'file_meta' ? "json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.updated_at', materialized.updated_at)" : 'NULL'},
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc

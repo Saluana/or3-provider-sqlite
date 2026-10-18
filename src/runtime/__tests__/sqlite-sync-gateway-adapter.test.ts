@@ -1118,6 +1118,39 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('snapshot', () => {
+        // Failure inventory: Trash payloads disappear in normal sync snapshots;
+        // paging can mix archive/sync modes or observe later writes. Exercise the
+        // real SQLite and D1 transaction paths; no snapshot implementation mocks.
+        it.each(['sqlite', 'd1'] as const)('retains Trash metadata in a frozen, mode-bound %s backup', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const scope = { workspaceId: WORKSPACE_ID };
+            const hashes = ['a', 'b'].map(character => `sha256:${character.repeat(64)}`);
+            const ops = hashes.map(hash => makeOp({ tableName: 'file_meta', pk: hash, payload: {
+                hash, name: 'original.txt', mime_type: 'text/plain', kind: 'file', size_bytes: 8,
+                storage_id: `object-${hash}`, storage_provider_id: 'fs', ref_count: 0,
+                created_at: 1, updated_at: 1, clock: 1, deleted: false,
+            } }));
+            const deletion = makeOp({ tableName: 'file_meta', pk: hashes[1]!, operation: 'delete',
+                stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } });
+            await adapter.push(stubEvent, { scope, ops: [...ops, deletion], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
+            const request = { scope, tables: ['file_meta'], pageSize: 1, fileKindCapability: 'v1' as const, workspaceItemCapability: 'v1' as const };
+            const normal = await adapter.snapshot(stubEvent, { ...request, pageSize: 10 });
+            expect(normal.items).toContainEqual(expect.objectContaining({ kind: 'tombstone', pk: hashes[1] }));
+            const first = await adapter.backupSnapshot(stubEvent, request);
+            expect(first.nextPageToken).toBeTruthy();
+            await expect(adapter.snapshot(stubEvent, { ...request, pageToken: first.nextPageToken! })).rejects.toThrow(/mode/i);
+            const syncFirst = await adapter.snapshot(stubEvent, request);
+            await expect(adapter.backupSnapshot(stubEvent, { ...request, pageToken: syncFirst.nextPageToken! })).rejects.toThrow(/mode/i);
+            await adapter.push(stubEvent, { scope, ops: [makeOp({ ...ops[1]!, payload: { ...ops[1]!.payload as object, name: 'later.txt' },
+                stamp: { clock: 3, hlc: '2025-01-03T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
+            const next = await adapter.backupSnapshot(stubEvent, { ...request, pageToken: first.nextPageToken! });
+            expect(next.highWatermark).toBe(first.highWatermark);
+            expect(next.nextPageToken).toBeNull();
+            expect([...first.items, ...next.items]).toEqual([
+                expect.objectContaining({ kind: 'row', pk: hashes[0] }),
+                expect.objectContaining({ kind: 'row', pk: hashes[1], payload: expect.objectContaining({ deleted: true, name: 'original.txt', storage_id: `object-${hashes[1]}` }) }),
+            ]);
+        });
         async function collectRemainingPages(first: SnapshotResponse): Promise<{
             pages: SnapshotResponse[];
             items: SnapshotItem[];

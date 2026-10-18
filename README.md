@@ -228,6 +228,11 @@ model execution there; ordinary sync and other D1 features are unchanged.
 
 ## Backup
 
+Workspace archives use `backupSnapshot` to include retained Trash file metadata
+and originals. Normal sync snapshots continue to emit tombstones. Archive pages
+share a frozen SQLite/D1 transaction snapshot and reject tokens from another
+snapshot mode. Backup reads do not remove originals or unfinished uploads.
+
 For local-file and Bun runtimes, everything lives in a single SQLite file:
 
 ```bash
