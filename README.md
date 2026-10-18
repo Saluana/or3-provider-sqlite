@@ -267,6 +267,14 @@ mismatched source rather than falling back to fixtures. See the
 - No real-time subscriptions (gateway polling only)
 - Migrations run on boot, or on the first Worker request for D1; schema changes require restart
 
+## Admin maintenance
+
+**Operations → Maintenance** labels the history tools **Clear old sync history**
+(`sync.gc-change-log`) and **Clear old deletion history** (`sync.gc-tombstones`).
+Descriptions explain the retention period and active-device requirements without
+internal terminology. They wrap fully on narrow screens. These tools preserve
+current chats and files; they do not empty Trash or remove stored files.
+
 ## Troubleshooting
 
 - **`OR3_SQLITE_DB_PATH is required in non-test environments`** — set a file
@@ -315,6 +323,10 @@ Persistent Projects uses this same capability for opaque `or3:project-settings`,
 
 Explicit ownership requires a live project in the same workspace. A missing or deleted project releases the chat even if a concurrent thread write retained its former pointer; legacy folders do not override that explicit release. Canonical reads leave the persisted pointer untouched.
 
+Current hosts refuse server tools and workflows when the reader cannot return
+resolved canonical ownership. Older providers require an upgrade even for chats
+with no explicit project pointer, because legacy folder membership may own them.
+
 Version 0.0.15 declares `projectOwnership: 'v1'` on the native canonical-history adapter. D1 does not advertise this contract. Projects qualification: `OR3_PROJECT_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/sqlite-sync-gateway-adapter.test.ts`. This explicit lane uses the host's canonical-reader query contract while retaining the pinned standalone fixture for existing contracts. Qualify the published exact version with the disposable host cloud journey.
 
 Native synchronous adapters advertise workspace-item capability v1. Canonical
@@ -336,3 +348,9 @@ the supported profile is qualified.
 The updated host distinguishes signup invites from existing team invites. Signup invites create a private workspace with only the recipient as owner; team invites retain their selected workspace and role. This requires the updated host and rebuilt provider artifacts, rather than the existing published release alone.
 
 Native SQLite implements five optional AuthWorkspaceStore methods with one additive signup_invites migration and one immediate acceptance transaction. User, identity mapping, recipient-only workspace membership, active pointer, and acceptance receipt commit together. Replay performs no provisioning writes. D1 deliberately does not advertise these methods. Dates are milliseconds; history pages contain at most 100 rows without hashes, with 90-day terminal retention and cleanup capped at 100 records per create/list call.
+
+### Short signup codes
+
+New signup invitations use eight random characters (shown as `K7MP-4X9Q`) and retain clickable invite links. Lowercase, spaces, and an optional dash are accepted. The host hashes codes with HMAC using `OR3_AUTH_INVITE_TOKEN_SECRET`, shares a 20/minute/IP lookup limit across invitation entry points, and preserves email binding, expiry, revocation, and atomic single use. Previously issued signed links remain supported. Codes and hashes are omitted from invitation history.
+
+`findSignupInviteByTokenHash` resolves pending proofs through the existing unique `token_hash` index and returns only ID, email, and expiry to the host. No new migration is required. D1 continues to omit signup invitation capabilities.

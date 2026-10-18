@@ -34,7 +34,7 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         // D1 has no synchronous transaction spanning validation and all inserts.
         if (isD1Driver()) {
             Object.assign(this, { createSignupInvite: undefined, listSignupInvites: undefined,
-                revokeSignupInvite: undefined, validateSignupInvite: undefined,
+                revokeSignupInvite: undefined, validateSignupInvite: undefined, findSignupInviteByTokenHash: undefined,
                 acceptSignupInviteAndProvisionUser: undefined });
         }
     }
@@ -49,6 +49,12 @@ export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
         getRawDb().prepare('INSERT INTO signup_invites (id, email, token_hash, expires_at, created_at, created_by_admin, retain_until) VALUES (?, ?, ?, ?, ?, ?, ?)')
             .run(input.id, normalizeEmail(input.email), input.token_hash, input.expires_at, Date.now(), input.created_by_admin, input.expires_at + 90 * 86400_000);
         return { id: input.id };
+    }
+
+    async findSignupInviteByTokenHash(input: { token_hash: string }): Promise<Pick<SignupInviteSummary, 'id' | 'email' | 'expires_at'> | null> {
+        this.db;
+        return getRawDb().prepare("SELECT id, email, expires_at FROM signup_invites WHERE token_hash = ? AND status = 'pending'")
+            .get(input.token_hash) as Pick<SignupInviteSummary, 'id' | 'email' | 'expires_at'> | undefined ?? null;
     }
 
     async listSignupInvites(input: { limit: number; cursor?: string }): Promise<{ invites: SignupInviteSummary[]; next_cursor: string | null }> {
