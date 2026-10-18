@@ -336,3 +336,11 @@ the supported profile is qualified.
 The updated host distinguishes signup invites from existing team invites. Signup invites create a private workspace with only the recipient as owner; team invites retain their selected workspace and role. This requires the updated host and rebuilt provider artifacts, rather than the existing published release alone.
 
 Native SQLite implements five optional AuthWorkspaceStore methods with one additive signup_invites migration and one immediate acceptance transaction. User, identity mapping, recipient-only workspace membership, active pointer, and acceptance receipt commit together. Replay performs no provisioning writes. D1 deliberately does not advertise these methods. Dates are milliseconds; history pages contain at most 100 rows without hashes, with 90-day terminal retention and cleanup capped at 100 records per create/list call.
+
+## Dashboard restart drain accounting
+
+The background provider implements `getShutdownBlockerCount`: streaming jobs
+(including browser-tool handoffs and workflows), pending admission and terminal
+history delivery prevent replacement. Database failures propagate so the host
+cancels preparation and restores admission rather than treating failure as idle.
+An additive covering index migration keeps counts off stored response bodies.

@@ -60,6 +60,7 @@ const REQUIRED_SCHEMA_TABLES = [
 ] as const;
 
 import * as m024 from './migrations/024_signup_invites';
+import * as m025 from './migrations/025_background_shutdown_accounting';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -85,7 +86,8 @@ const migrations: Record<string, Migration> = {
     '021_background_request_usage': m021,
     '022_canonical_chat_reader': m022,
     '023_legacy_chat_seek_index': m023,
-    '024_signup_invites': m024
+    '024_signup_invites': m024,
+    '025_background_shutdown_accounting': m025
 };
 
 class StaticMigrationProvider implements MigrationProvider {

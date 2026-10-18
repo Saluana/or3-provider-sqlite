@@ -41,6 +41,40 @@ describe('SQLite durable request usage', () => {
         provider = new SqliteBackgroundJobProvider();
     }
 
+    // Drain failure inventory: parked and workflow jobs omitted by worker counts;
+    // terminal history delivery mistaken for idle; double counting; state lost at
+    // reopen; a missing/unavailable database mistaken for an empty database.
+    it('keeps restart blocked across reopen until every durable job and history delivery settles', async () => {
+        expect(await provider.getShutdownBlockerCount()).toBe(0);
+        const parked = await provider.createJob({ ...params, execution: {
+            ...execution, clientToolCall: { callId: 'parked' } as never,
+        } });
+        const workflow = await provider.createJob({ ...params, kind: 'workflow', generationId: undefined });
+        const admission = await provider.createJob({ ...params, historyPhase: 'admission_pending' });
+        expect(await provider.getShutdownBlockerCount()).toBe(3);
+        await provider.abortJob(admission, params.userId);
+        const terminal = [];
+        for (const status of ['complete', 'error', 'aborted'] as const) {
+            const id = await provider.createJob(params);
+            await provider.saveTerminalSnapshot(id, { status, content: 'saved', reasoning: '', completedAt: Date.now() });
+            terminal.push(id);
+        }
+        await reopen();
+        expect(await provider.getActiveJobCount()).toBe(1);
+        expect(await provider.getShutdownBlockerCount()).toBe(6);
+        await provider.abortJob(parked, params.userId);
+        await provider.abortJob(workflow, params.userId);
+        expect(await provider.getShutdownBlockerCount()).toBe(5);
+        for (const id of [parked, admission, ...terminal]) {
+            await provider.setHistoryPhase(id, 'committed');
+        }
+        await reopen();
+        expect(await provider.getShutdownBlockerCount()).toBe(0);
+        expect((await provider.getJob(terminal[0]!, params.userId))?.content).toBe('saved');
+        await destroySqliteDb();
+        await expect(provider.getShutdownBlockerCount()).rejects.toThrow();
+    });
+
     beforeEach(async () => {
         vi.spyOn(Date, 'now').mockReturnValue(1_800_000_000_000);
         directory = await mkdtemp(join(tmpdir(), 'or3-sqlite-usage-'));
