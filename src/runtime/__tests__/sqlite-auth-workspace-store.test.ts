@@ -573,6 +573,17 @@ describe('private signup invitations', () => {
     const invite = { id: 'signup-invite', email: identity.email, token_hash: 'signup-hash', expires_at: Date.now() + 3600_000, created_by_admin: 'admin' };
     const accept = () => store.acceptSignupInviteAndProvisionUser!({ ...identity, invite_id: invite.id, token_hash: invite.token_hash });
 
+    it('looks up signup proof by hash without exposing stored hashes or history receipts', async () => {
+        await store.createSignupInvite!(invite);
+        expect(await store.findSignupInviteByTokenHash!({ token_hash: 'wrong' })).toBeNull();
+        expect(await store.findSignupInviteByTokenHash!({ token_hash: invite.token_hash }))
+            .toEqual({ id: invite.id, email: invite.email, expires_at: invite.expires_at });
+        const history = await store.listSignupInvites!({ limit: 10 });
+        expect(JSON.stringify(history)).not.toContain(invite.token_hash);
+        expect(await accept()).toMatchObject({ ok: true, created: true });
+        expect(await store.findSignupInviteByTokenHash!({ token_hash: invite.token_hash })).toBeNull();
+    });
+
     it('creates one private owner workspace and replays without resetting a later selection', async () => {
         await store.createSignupInvite!(invite);
         const results = await Promise.all([accept(), accept()]);
