@@ -367,3 +367,5 @@ The background provider implements `getShutdownBlockerCount`: streaming jobs
 history delivery prevent replacement. Database failures propagate so the host
 cancels preparation and restores admission rather than treating failure as idle.
 An additive covering index migration keeps counts off stored response bodies.
+
+Admin workspace summaries, workspace details, and deployment-admin lists expose `createdAt` in Unix milliseconds for the host UI. SQLite continues to store the underlying creation timestamps in Unix seconds; no data migration is needed.

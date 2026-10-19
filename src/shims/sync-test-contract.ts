@@ -10,7 +10,7 @@ type SnapshotItem = {
     kind: 'row' | 'tombstone';
     tableName: string;
     pk: string;
-    payload?: Record<string, unknown>;
+    payload?: unknown;
     revision: SyncRevision;
     serverDeletedAt?: number;
 };

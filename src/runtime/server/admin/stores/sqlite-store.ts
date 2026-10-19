@@ -7,6 +7,7 @@ import type {
 } from '~~/server/admin/stores/types';
 import { getSqliteDb } from '../../db/kysely';
 
+/** Rows store unix seconds; `createdAt` fields handed to the admin UI are milliseconds. */
 function nowEpoch(): number {
     return Math.floor(Date.now() / 1000);
 }
@@ -376,7 +377,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
                 id: row.id,
                 name: row.name,
                 description: row.description ?? undefined,
-                createdAt: row.created_at,
+                createdAt: row.created_at * 1000,
                 deleted: row.deleted === 1,
                 deletedAt: row.deleted_at ?? undefined,
                 ownerUserId: row.owner_user_id ?? undefined,
@@ -415,7 +416,7 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             id: row.id,
             name: row.name,
             description: row.description ?? undefined,
-            createdAt: row.created_at,
+            createdAt: row.created_at * 1000,
             deleted: row.deleted === 1,
             deletedAt: row.deleted_at ?? undefined,
             ownerUserId: row.owner_user_id ?? undefined,
@@ -612,7 +613,7 @@ class SqliteAdminUserStore implements AdminUserStore {
             userId: row.user_id,
             email: row.email ?? undefined,
             displayName: row.display_name ?? undefined,
-            createdAt: row.created_at,
+            createdAt: row.created_at * 1000,
         }));
     }
 
