@@ -128,7 +128,9 @@ jobs:
             if (response.ok) {
               const metadata = await response.json();
               if (metadata.version !== version || metadata.dist?.integrity !== expected) throw Error('Published package identity differs from the qualified archive.');
-              const tarball = await fetch(metadata.dist.tarball, { signal: AbortSignal.timeout(10000) });
+              const archiveUrl = new URL(metadata.dist.tarball);
+              archiveUrl.searchParams.set('or3_verify', `${Date.now()}-${attempt}`);
+              const tarball = await fetch(archiveUrl, { signal: AbortSignal.timeout(10000) });
               if (tarball.ok) {
                 if (integrity(Buffer.from(await tarball.arrayBuffer())) !== expected) throw Error('Published archive integrity mismatch.');
                 console.log(`Verified ${name}@${version}: ${expected}`);
