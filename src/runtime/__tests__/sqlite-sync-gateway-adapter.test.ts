@@ -1566,6 +1566,41 @@ describe('SqliteSyncGatewayAdapter', () => {
             // Failure modes: D1's asynchronous reads admit concurrent requests over
             // quota, consumed uploads release their charge before metadata arrives,
             // or a zero-byte duplicate loses its charge when the first is cancelled.
+            // Retained bytes still incur storage charges after logical deletion.
+            // Reservation expiry must not make a consumed original free either.
+            it('keeps retained originals charged after Trash and receipt expiry', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'retained', workspaceId: WORKSPACE_ID,
+                    hash: `sha256:${'e'.repeat(64)}`, mimeType: 'image/png', sizeBytes: 60,
+                    expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'retained-object' });
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    payload: { hash: request.hash, size_bytes: 60, storage_id: 'retained-object' } })]));
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    operation: 'delete', stamp: { deviceId: DEVICE_A, opId: randomUUID(), hlc: '2025-01-01T00:00:00.000Z-0001', clock: 2 } })]));
+                await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', request.intentId).execute();
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request,
+                    intentId: 'over-quota', hash: `sha256:${'f'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
+                // Restoring/deduplicating the same immutable content adds no bytes.
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request,
+                    intentId: 'restore' })).resolves.toBeUndefined();
+            });
+
+            it('reserves size increases above retained metadata and keeps duplicate holds charged', async () => {
+                const hash = `sha256:${'a'.repeat(64)}`;
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
+                    payload: { hash, size_bytes: 10, storage_id: 'legacy-original' } })]));
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'larger', workspaceId: WORKSPACE_ID, hash,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 50 };
+                await expect(adapter.reserveUploadIntent(stubEvent, request)).rejects.toMatchObject({ statusCode: 413 });
+                await adapter.reserveUploadIntent(stubEvent, { ...request, workspaceQuotaBytes: 100 });
+                await adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'duplicate', workspaceQuotaBytes: 100 });
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'other',
+                    hash: `sha256:${'b'.repeat(64)}`, sizeBytes: 41, workspaceQuotaBytes: 100 })).rejects.toMatchObject({ statusCode: 413 });
+            });
+
             it('atomically rejects concurrent reservations that collectively exceed quota', async () => {
                 const now = Math.floor(Date.now() / 1000);
                 const reserve = (intentId: string, hash: string) => adapter.reserveUploadIntent(stubEvent, {
@@ -1603,9 +1638,8 @@ describe('SqliteSyncGatewayAdapter', () => {
             });
 
             // A consumed receipt can retry only within the original authorization
-            // TTL. Releasing its charge and still replaying that receipt would
-            // allow an interrupted commit and a fresh upload to exceed quota.
-            it('expires consumed receipt replay together with its quota charge', async () => {
+            // TTL. Its physically retained bytes remain charged after that TTL.
+            it('expires consumed receipt replay while retaining its physical storage charge', async () => {
                 const now = Math.floor(Date.now() / 1000);
                 const currentTime = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
                 try {
@@ -1617,12 +1651,11 @@ describe('SqliteSyncGatewayAdapter', () => {
                     currentTime.mockReturnValue((now + 61) * 1000);
                     await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).rejects.toMatchObject({ statusCode: 409 });
                     await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second',
-                        hash: `sha256:${'b'.repeat(64)}`, expiresAt: now + 120 })).resolves.toBeUndefined();
+                        hash: `sha256:${'b'.repeat(64)}`, expiresAt: now + 120 })).rejects.toMatchObject({ statusCode: 413 });
                     const pending = () => adapter.queryCanonicalStorage(stubEvent, {
                         scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now: now + 61,
                     });
-                    expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'second',
-                        hash: 'b'.repeat(64), sizeBytes: 100, expiresAt: now + 120 }]);
+                    expect((await pending()).items).toEqual([]);
                     const receipt = await getSqliteDb().selectFrom('upload_intents').select('expires_at').where('id', '=', request.intentId).executeTakeFirstOrThrow();
                     expect(receipt.expires_at).toBe(now + 60);
                 } finally {
@@ -1687,6 +1720,30 @@ describe('SqliteSyncGatewayAdapter', () => {
                 await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).rejects.toMatchObject({ statusCode: 409 });
             });
         });
+    });
+
+    it('shares a bounded version watcher and releases it after the last subscriber', async () => {
+        vi.useFakeTimers();
+        const first: number[] = [], second: number[] = [];
+        const fail = vi.fn();
+        let stopFirst: (() => void) | undefined, stopSecond: (() => void) | undefined;
+        try {
+            stopFirst = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, version => first.push(version), fail);
+            stopSecond = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, version => second.push(version), fail);
+            await vi.advanceTimersByTimeAsync(0);
+            expect(first).toEqual([0]);
+            expect(second).toEqual([0]);
+            setWorkspaceVersion(2);
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(first).toEqual([0, 2]);
+            expect(second).toEqual([0, 2]);
+            stopFirst(); stopSecond();
+            setWorkspaceVersion(3);
+            await vi.advanceTimersByTimeAsync(4000);
+            expect(first).toEqual([0, 2]);
+            expect(second).toEqual([0, 2]);
+            expect(fail).not.toHaveBeenCalled();
+        } finally { stopFirst?.(); stopSecond?.(); vi.useRealTimers(); }
     });
 
     describe('workspace scope authorization', () => {

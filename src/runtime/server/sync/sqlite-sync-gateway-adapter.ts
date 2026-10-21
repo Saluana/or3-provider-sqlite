@@ -91,6 +91,14 @@ const PENDING_UPLOAD_RESERVATIONS_SQL = `
     GROUP BY intent.hash
 `;
 
+// Active holds are grouped by digest; retained bytes are already in the ledger.
+const QUOTA_RESERVATIONS_SQL = `SELECT intent.hash, MAX(intent.size_bytes) AS reserved_bytes,
+        MAX(0, MAX(intent.size_bytes) - COALESCE(retained.size_bytes, 0)) AS held_bytes
+    FROM upload_intents AS intent LEFT JOIN retained_storage AS retained
+        ON retained.workspace_id = intent.workspace_id AND retained.hash = intent.hash
+    WHERE intent.workspace_id = ? AND intent.status = 'active' AND intent.expires_at > ?
+    GROUP BY intent.hash`;
+
 type SnapshotKind = 'row' | 'tombstone';
 
 type SnapshotPageToken = {
@@ -698,12 +706,57 @@ async function currentWinnerD1(
 
 export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'sqlite';
+    private versionWatchers = new Map<string, {
+        listeners: Map<(version: number) => void, (error: unknown) => void>;
+        version?: number; timer?: ReturnType<typeof setTimeout>; running: boolean;
+    }>();
+
+    async watchVersion(event: H3Event, scope: { workspaceId: string }, onVersion: (version: number) => void,
+        onError: (error: unknown) => void): Promise<() => void> {
+        await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
+        let watcher = this.versionWatchers.get(scope.workspaceId);
+        if (!watcher) {
+            watcher = { listeners: new Map(), running: false };
+            this.versionWatchers.set(scope.workspaceId, watcher);
+        }
+        const current = watcher;
+        current.listeners.set(onVersion, onError);
+        if (current.version !== undefined) onVersion(current.version);
+        const poll = async () => {
+            if (current.running || this.versionWatchers.get(scope.workspaceId) !== current) return;
+            current.running = true;
+            try {
+                const row = await getSqliteDb().selectFrom('server_version_counter').select('value')
+                    .where('workspace_id', '=', scope.workspaceId).executeTakeFirst();
+                const version = row?.value ?? 0;
+                if (current.version !== version) {
+                    current.version = version;
+                    for (const notify of [...current.listeners.keys()]) notify(version);
+                }
+            } catch (error) {
+                for (const fail of [...current.listeners.values()]) fail(error);
+            } finally { current.running = false; }
+            if (this.versionWatchers.get(scope.workspaceId) === current && current.listeners.size) {
+                current.timer = setTimeout(() => { void poll(); }, 2000);
+                current.timer.unref?.();
+            }
+        };
+        if (!current.running && !current.timer) void poll();
+        return () => {
+            current.listeners.delete(onVersion);
+            if (current.listeners.size) return;
+            if (current.timer) clearTimeout(current.timer);
+            if (this.versionWatchers.get(scope.workspaceId) === current) this.versionWatchers.delete(scope.workspaceId);
+        };
+    }
+
     get capabilities() {
         return isD1Driver()
             ? ({
                   snapshotBootstrap: 'snapshot-v1',
                   historyRetention: 'snapshot-v1',
                   retainedStorageMetadata: 'v1',
+                  atomicUploadQuota: 'retained-v1',
               } as const)
             : ({
                   snapshotBootstrap: 'snapshot-v1',
@@ -713,6 +766,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   projectOwnership: 'v1',
                   workspaceItems: 'v1',
                   retainedStorageMetadata: 'v1',
+                  atomicUploadQuota: 'retained-v1',
               } as const);
     }
 
@@ -1160,34 +1214,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             raw.prepare(`UPDATE upload_intents SET status = 'expired'
                 WHERE workspace_id = ? AND status = 'active' AND expires_at <= ?`)
                 .run(input.workspaceId, now);
-            const liveRows = raw.prepare(`SELECT id, data_json FROM s_file_meta
-                WHERE workspace_id = ? AND deleted = 0`).all(input.workspaceId) as Array<{
-                    id: string; data_json: string;
-                }>;
-            let usedBytes = 0;
-            let alreadyStored = false;
-            const liveSizes = new Map<string, number>();
-            for (const row of liveRows) {
-                const payload = JSON.parse(row.data_json) as Record<string, unknown>;
-                const size = payload.size_bytes ?? payload.sizeBytes;
-                if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
-                    throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
-                }
-                const liveHash = normalizeStorageHash(row.id);
-                const previousSize = liveSizes.get(liveHash);
-                if (previousSize !== undefined && previousSize !== size) {
-                    throw createError({ statusCode: 500, statusMessage: 'Conflicting canonical file size' });
-                }
-                if (previousSize === undefined) usedBytes += size;
-                liveSizes.set(liveHash, size);
-                if (liveHash === hash) alreadyStored = true;
-            }
-            const totals = raw.prepare(`WITH pending AS (${PENDING_UPLOAD_RESERVATIONS_SQL}) SELECT
-                    COALESCE(SUM(reserved_bytes), 0) AS reserved_bytes,
+            const usedBytes = (raw.prepare('SELECT used_bytes FROM storage_usage WHERE workspace_id = ?')
+                .get(input.workspaceId) as { used_bytes: number } | undefined)?.used_bytes ?? 0;
+            const retainedBytes = (raw.prepare('SELECT size_bytes FROM retained_storage WHERE workspace_id = ? AND hash = ?')
+                .get(input.workspaceId, hash) as { size_bytes: number } | undefined)?.size_bytes ?? 0;
+            const totals = raw.prepare(`WITH pending AS (${QUOTA_RESERVATIONS_SQL}) SELECT
+                    COALESCE(SUM(held_bytes), 0) AS reserved_bytes,
                     COALESCE(MAX(CASE WHEN hash = ? THEN reserved_bytes END), 0) AS same_hash
                 FROM pending`)
                 .get(input.workspaceId, now, hash) as { reserved_bytes: number; same_hash: number };
-            const addedBytes = alreadyStored ? 0 : Math.max(0, input.sizeBytes - totals.same_hash);
+            const addedBytes = Math.max(0, input.sizeBytes - Math.max(retainedBytes, totals.same_hash));
             if (input.workspaceQuotaBytes !== undefined &&
                 usedBytes + totals.reserved_bytes + addedBytes > input.workspaceQuotaBytes) {
                 throw createError({ statusCode: 413, statusMessage: 'Workspace storage quota exceeded' });
@@ -2563,25 +2599,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         hash: string
     ): Promise<void> {
         const now = nowEpoch();
-        const liveRows = await d1All<{ id: string; data_json: string }>(
-            `SELECT id, data_json FROM s_file_meta
-             WHERE workspace_id = ? AND deleted = 0`,
-            input.workspaceId
-        );
-        const liveSizes = new Map<string, number>();
-        for (const row of liveRows) {
-            const payload = JSON.parse(row.data_json) as Record<string, unknown>;
-            const size = payload.size_bytes ?? payload.sizeBytes;
-            if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
-                throw createError({ statusCode: 500, statusMessage: 'Invalid canonical file size' });
-            }
-            const liveHash = normalizeStorageHash(row.id);
-            const previousSize = liveSizes.get(liveHash);
-            if (previousSize !== undefined && previousSize !== size) {
-                throw createError({ statusCode: 500, statusMessage: 'Conflicting canonical file size' });
-            }
-            liveSizes.set(liveHash, size);
-        }
         const results = await d1Batch([
             {
                 sql: `UPDATE upload_intents SET status = 'expired'
@@ -2591,37 +2608,24 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             {
                 // Keep the quota decision in the write statement: D1's async
                 // preflight reads cannot serialize concurrent reservations.
-                sql: `WITH pending AS (${PENDING_UPLOAD_RESERVATIONS_SQL}), live AS (
-                    SELECT lower(CASE WHEN instr(trim(id), ':') > 0
-                        THEN substr(trim(id), instr(trim(id), ':') + 1)
-                        ELSE trim(id) END) AS hash,
-                        COALESCE(json_extract(data_json, '$.size_bytes'),
-                                 json_extract(data_json, '$.sizeBytes')) AS size_bytes
-                    FROM s_file_meta WHERE workspace_id = ? AND deleted = 0
-                ), quota AS (
+                sql: `WITH pending AS (${QUOTA_RESERVATIONS_SQL}), quota AS (
                     SELECT
-                        (SELECT COALESCE(SUM(size_bytes), 0) FROM (
-                            SELECT MAX(size_bytes) AS size_bytes FROM live GROUP BY hash
-                        )) AS used_bytes,
-                        (SELECT COALESCE(SUM(reserved_bytes), 0) FROM pending) AS pending_bytes,
-                        CASE WHEN EXISTS (SELECT 1 FROM live WHERE hash = ?) THEN 0
-                             ELSE MAX(0, ? - (SELECT COALESCE(MAX(reserved_bytes), 0)
-                                 FROM pending WHERE hash = ?)) END AS added_bytes
+                        COALESCE((SELECT used_bytes FROM storage_usage WHERE workspace_id = ?), 0) AS used_bytes,
+                        (SELECT COALESCE(SUM(held_bytes), 0) FROM pending) AS pending_bytes,
+                        MAX(0, ? - MAX(COALESCE((SELECT size_bytes FROM retained_storage WHERE workspace_id = ? AND hash = ?), 0),
+                            (SELECT COALESCE(MAX(reserved_bytes), 0) FROM pending WHERE hash = ?))) AS added_bytes
                 ) INSERT INTO upload_intents (
                     id, workspace_id, hash, mime_type, size_bytes, reserved_bytes,
                     expires_at, status, created_at
                 ) SELECT ?, ?, ?, ?, ?, ?, ?, 'active', ? FROM quota
-                  WHERE (? IS NULL OR used_bytes + pending_bytes + added_bytes <= ?)
-                    AND NOT EXISTS (SELECT 1 FROM live WHERE size_bytes IS NULL
-                        OR typeof(size_bytes) NOT IN ('integer', 'real')
-                        OR size_bytes < 0 OR size_bytes > 9007199254740991
-                        OR size_bytes != CAST(size_bytes AS INTEGER))`,
+                  WHERE (? IS NULL OR used_bytes + pending_bytes + added_bytes <= ?)`,
                 parameters: [
                     input.workspaceId,
                     now,
                     input.workspaceId,
-                    hash,
                     input.sizeBytes,
+                    input.workspaceId,
+                    hash,
                     hash,
                     input.intentId,
                     input.workspaceId,
