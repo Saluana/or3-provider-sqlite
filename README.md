@@ -19,13 +19,23 @@ Canonical storage queries include bounded retained deleted metadata pages and
 advertise `retainedStorageMetadata: 'v1'` on native SQLite and D1. Missing sizes in
 delete-before-put rows remain unknown; these reads never replay sync history.
 
-Upload quota admission groups pending authorizations by hash, keeps consumed
-uploads charged until their original expiry or canonical metadata admission,
-and runs atomically on native SQLite and D1. Exact consumed receipts can retry
-within that lifetime without consuming twice. After expiry, obtain a fresh
-reservation; mismatched hash, MIME, size, workspace, or storage ID is rejected.
-Quota measures logical live metadata plus pending authorizations, not retained
-physical disk usage.
+Upload quota admission groups unexpired pending authorizations by hash and
+reserves atomically on native SQLite and D1. Migration 026 backfills retained
+hashes from metadata (including Trash) and consumed receipts into an indexed
+usage total. Trash, logical deletion and receipt expiry do not release retained
+charges; a restore of the same hash does not double-charge. A larger upload
+reserves the difference above the retained size, even when historical metadata
+understated it. This provider
+advertises `atomicUploadQuota: 'retained-v1'`, allowing the host to omit its full
+catalog preflight. Physical filesystem/S3 GC remains disabled, so retained
+charges intentionally remain conservative. Configure
+`OR3_STORAGE_WORKSPACE_QUOTA_BYTES`; its host default remains unlimited.
+
+`watchVersion` shares one indexed workspace version-counter read every two
+seconds per workspace per process across notification listeners. The host can
+wake its ordinary sync pull immediately when the counter changes and use a
+one-minute safety pull while connected. Last-listener teardown stops the timer;
+unsupported notification routes retain normal gateway polling.
 
 ## Atomic webhook registration quotas
 
@@ -269,7 +279,7 @@ mismatched source rather than falling back to fixtures. See the
 ### Known differences vs Convex
 
 - Single-process SQLite vs distributed Convex backend
-- No real-time subscriptions (gateway polling only)
+- Gateway version notifications use a shared counter poll; no native reactive SQLite subscription
 - Migrations run on boot, or on the first Worker request for D1; schema changes require restart
 
 ## Admin maintenance

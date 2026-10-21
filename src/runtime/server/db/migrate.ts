@@ -51,6 +51,8 @@ const REQUIRED_SCHEMA_TABLES = [
     'sync_snapshots',
     'sync_snapshot_items',
     'upload_intents',
+    'retained_storage',
+    'storage_usage',
     'connect_device_authorizations',
     'connect_environments',
     'rate_limits',
@@ -61,6 +63,7 @@ const REQUIRED_SCHEMA_TABLES = [
 
 import * as m024 from './migrations/024_signup_invites';
 import * as m025 from './migrations/025_background_shutdown_accounting';
+import * as m026 from './migrations/026_retained_storage_usage';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -87,7 +90,8 @@ const migrations: Record<string, Migration> = {
     '022_canonical_chat_reader': m022,
     '023_legacy_chat_seek_index': m023,
     '024_signup_invites': m024,
-    '025_background_shutdown_accounting': m025
+    '025_background_shutdown_accounting': m025,
+    '026_retained_storage_usage': m026
 };
 
 class StaticMigrationProvider implements MigrationProvider {
