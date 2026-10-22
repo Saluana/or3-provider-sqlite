@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { sql } from 'kysely';
 import { initializeSqliteDb, getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { createD1TestDatabase } from '../../../test/support/d1-test-database';
 import { runMigrations } from '../server/db/migrate';
@@ -1568,6 +1569,34 @@ describe('SqliteSyncGatewayAdapter', () => {
             // or a zero-byte duplicate loses its charge when the first is cancelled.
             // Retained bytes still incur storage charges after logical deletion.
             // Reservation expiry must not make a consumed original free either.
+            it('keeps metadata-only sizes out of another writer\'s upload quota', async () => {
+                const hash = `sha256:${'d'.repeat(64)}`;
+                const result = await adapter.push(makeSessionEvent('writer-a'), makeBatch([makeOp({
+                    tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: 1_000_000, storage_id: 'unverified' },
+                })]));
+                expect(result.results[0]).toMatchObject({ success: true });
+                await expect(adapter.reserveUploadIntent(makeSessionEvent('writer-b'), {
+                    intentId: 'honest-upload', workspaceId: WORKSPACE_ID, hash: `sha256:${'e'.repeat(64)}`,
+                    mimeType: 'text/plain', sizeBytes: 1, expiresAt: Math.floor(Date.now() / 1000) + 60, workspaceQuotaBytes: 10,
+                })).resolves.toBeUndefined();
+            });
+
+            it('reconciles old metadata-derived charges from persisted commit receipts on upgrade', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'verified-old', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'text/plain', sizeBytes: 5, expiresAt: now + 60 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'verified-blob' });
+                const db = getSqliteDb();
+                await sql`UPDATE retained_storage SET size_bytes = 999`.execute(db);
+                await sql`DELETE FROM kysely_migration WHERE name >= '027'`.execute(db);
+                await runMigrations(db);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'after-upgrade',
+                    hash: `sha256:${'b'.repeat(64)}`, sizeBytes: 5, workspaceQuotaBytes: 10 })).resolves.toBeUndefined();
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'over-verified-quota',
+                    hash: `sha256:${'c'.repeat(64)}`, sizeBytes: 1, workspaceQuotaBytes: 10 })).rejects.toMatchObject({ statusCode: 413 });
+            });
+
             it('keeps retained originals charged after Trash and receipt expiry', async () => {
                 const now = Math.floor(Date.now() / 1000);
                 const request = { intentId: 'retained', workspaceId: WORKSPACE_ID,
@@ -1883,14 +1912,24 @@ describe('SqliteSyncGatewayAdapter', () => {
             })).rejects.toMatchObject({ statusCode: 400 });
         });
 
-        it('binds a device cursor to its first authenticated owner', async () => {
-            setWorkspaceVersion(5);
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
-                scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 3,
-            });
-            await expect(adapter.updateCursor(makeSessionEvent('user-b'), {
+        it.each(['native', 'd1'] as const)('keeps same-device acknowledgements independent per user on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            await getSqliteDb().insertInto('server_version_counter').values({ workspace_id: WORKSPACE_ID, value: 5 }).execute();
+            await getSqliteDb().insertInto('device_cursors').values({ id: 'legacy', workspace_id: WORKSPACE_ID,
+                device_id: DEVICE_A, owner_user_id: null, last_seen_version: 0, updated_at: 1 }).execute();
+            await adapter.updateCursor(makeSessionEvent('user-b'), { scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 3 });
+            await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 4,
-            })).rejects.toMatchObject({ statusCode: 403 });
+            })).resolves.toBeUndefined();
+            const rows = await getSqliteDb().selectFrom('device_cursors').selectAll().where('workspace_id', '=', WORKSPACE_ID).execute();
+            expect(rows).toEqual(expect.arrayContaining([
+                expect.objectContaining({ owner_user_id: 'user-a', last_seen_version: 4 }),
+                expect.objectContaining({ owner_user_id: 'user-b', last_seen_version: 3 }),
+            ]));
+            expect(rows.find(row => row.id === 'legacy')?.owner_user_id).toBeNull();
+            await expect(adapter.updateCursor(makeSessionEvent('user-b'), {
+                scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 2,
+            })).rejects.toMatchObject({ statusCode: 409 });
         });
 
         it('rejects a cross-workspace cursor claim', async () => {
