@@ -2104,6 +2104,158 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('notification ownership', () => {
+        // A denied concurrent write must neither consume a version nor leave
+        // gaps between successful operations in the same atomic push.
+        it('keeps D1 notification ownership atomic across concurrent first puts', async () => {
+            await useD1TestDatabase();
+            const database = d1TestDatabase!.database;
+            const batch = database.batch.bind(database);
+            let raced = false;
+            database.batch = async statements => {
+                if (!raced) {
+                    raced = true;
+                    await adapter.push(makeSessionEvent('user-alice'), makeBatch([makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'private' } })]));
+                }
+                return batch(statements);
+            };
+            const result = await adapter.push(makeSessionEvent('user-bob'), makeBatch([
+                makeOp({ tableName: 'threads', pk: 'before' }),
+                makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'stolen' },
+                    stamp: { clock: 10, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } }),
+                makeOp({ tableName: 'threads', pk: 'after' }),
+            ]));
+            expect(result.results[1]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
+            expect(result.results[1]).not.toHaveProperty('winner');
+            expect(result.results[1]).not.toHaveProperty('payload');
+            expect(result.serverVersion).toBe(3);
+            expect((await database.prepare('SELECT server_version FROM change_log ORDER BY server_version').all()).results)
+                .toEqual([{ server_version: 1 }, { server_version: 2 }, { server_version: 3 }]);
+            const deleted = await adapter.push(makeSessionEvent('user-bob'), makeBatch([
+                makeOp({ tableName: 'threads', pk: 'after', operation: 'delete',
+                    stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } }),
+            ]));
+            expect(deleted.serverVersion).toBe(4);
+            expect((await database.prepare('SELECT server_version FROM tombstones WHERE pk = ?').bind('after').all()).results)
+                .toEqual([{ server_version: 4 }]);
+            const alice = await adapter.snapshot(makeSessionEvent('user-alice'), { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
+            expect(alice.items).toEqual([expect.objectContaining({ payload: expect.objectContaining({ title: 'private' }) })]);
+        });
+
+        // Eviction after the header read must be reported as expiry, never an
+        // empty final page that a consumer could accept as a complete snapshot.
+        it.each(['snapshot', 'backupSnapshot'] as const)('rejects %s evicted during a D1 page read', async method => {
+            await useD1TestDatabase();
+            const actor = makeSessionEvent('user-alice');
+            const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
+            await adapter.push(actor, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))));
+            const first = await adapter[method](actor, request);
+            expect(first.nextPageToken).toBeTruthy();
+            const database = d1TestDatabase!.database;
+            await database.prepare('UPDATE sync_snapshots SET created_at = 0 WHERE id = ?').bind(first.snapshotId).run();
+            const prepare = database.prepare.bind(database);
+            let raced = false;
+            database.prepare = sql => {
+                const statement = prepare(sql);
+                if (sql.includes('FROM sync_snapshot_items')) {
+                    const bind = statement.bind.bind(statement);
+                    statement.bind = (...args) => {
+                        const bound = bind(...args);
+                        const all = bound.all.bind(bound);
+                        bound.all = async <T>() => {
+                            if (!raced) {
+                                raced = true;
+                                for (let i = 0; i < 4; i++) await adapter[method](actor, request);
+                            }
+                            return all<T>();
+                        };
+                        return bound;
+                    };
+                }
+                return statement;
+            };
+            await expect(adapter[method](actor, { ...request, pageToken: first.nextPageToken! }))
+                .rejects.toMatchObject({ statusCode: 410 });
+            expect(raced).toBe(true);
+        });
+
+        // Failure inventory: high-clock puts steal rows, low-clock puts leak
+        // winners, and a stolen snapshot token reads another user's frozen rows.
+        it.each(['sqlite', 'd1'] as const)('rejects foreign notification puts without leaking winners on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                payload: { id: 'owned', title: 'private' },
+                stamp: { clock: 5, hlc: '2025-01-05T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            for (const clock of [1, 10]) {
+                const result = await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                    payload: { id: 'owned', title: 'stolen' },
+                    stamp: { clock, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } })]));
+                expect(result.results[0]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
+                expect(result.results[0]).not.toHaveProperty('winner');
+                expect(result.results[0]).not.toHaveProperty('payload');
+                expect(result.serverVersion).toBe(1);
+            }
+            const page = await adapter.snapshot(alice, { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
+            expect(page.items).toEqual([expect.objectContaining({ payload: expect.objectContaining({ title: 'private', user_id: 'user-alice' }) })]);
+            const ownUpdate = await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                payload: { id: 'owned', title: 'updated' },
+                stamp: { clock: 20, hlc: '2025-01-20T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            expect(ownUpdate.results[0]).toMatchObject({ success: true, applied: true });
+        });
+
+        it.each(['sqlite', 'd1'] as const)('binds sync and backup continuation to the capturing user on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk, payload: { id: pk, title: 'private' } }))));
+            for (const method of ['snapshot', 'backupSnapshot'] as const) {
+                const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
+                const first = await adapter[method](alice, request);
+                expect(first.nextPageToken).toBeTruthy();
+                await expect(adapter[method](bob, { ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 403 });
+                const next = await adapter[method](alice, { ...request, pageToken: first.nextPageToken! });
+                expect(next.items).toEqual([expect.objectContaining({ pk: 'b' })]);
+            }
+        });
+
+        // Repeated first pages must have bounded retained copies, independent
+        // users must still bootstrap, and expiry must remove copied rows too.
+        it.each(['sqlite', 'd1'] as const)('bounds retained copies per user and prunes expired copies on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))));
+            const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
+            const first = await adapter.snapshot(alice, request);
+            const bobFirst = await adapter.snapshot(bob, request);
+            let last = first;
+            for (let i = 0; i < 7; i++) last = await adapter[i % 2 ? 'backupSnapshot' : 'snapshot'](alice, request);
+            const sql = 'SELECT count(*) AS count FROM sync_snapshots';
+            const count = runtime === 'd1'
+                ? (await d1TestDatabase!.database.prepare(sql).all<{ count: number }>()).results![0]!.count
+                : (getRawDb().prepare(sql).get() as { count: number }).count;
+            expect(count).toBeLessThanOrEqual(5);
+            await expect(adapter.snapshot(alice, { ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 410 });
+            expect(last.nextPageToken).toBeTruthy();
+            expect((await adapter.snapshot(alice, { ...request, pageToken: last.nextPageToken! })).items).toHaveLength(1);
+            const retainedBob = runtime === 'd1'
+                ? (await d1TestDatabase!.database.prepare('SELECT id FROM sync_snapshots WHERE id = ?').bind(bobFirst.snapshotId).all()).results
+                : getRawDb().prepare('SELECT id FROM sync_snapshots WHERE id = ?').all(bobFirst.snapshotId);
+            expect(retainedBob).toHaveLength(1);
+            if (runtime === 'd1') await d1TestDatabase!.database.prepare('UPDATE sync_snapshots SET expires_at = 0').run();
+            else getRawDb().prepare('UPDATE sync_snapshots SET expires_at = 0').run();
+            const { pruneExpiredSyncSnapshots } = await import('../server/sync/sqlite-sync-gateway-adapter');
+            await pruneExpiredSyncSnapshots();
+            for (const table of ['sync_snapshots', 'sync_snapshot_items']) {
+                const query = `SELECT count(*) AS count FROM ${table}`;
+                const remaining = runtime === 'd1'
+                    ? (await d1TestDatabase!.database.prepare(query).all<{ count: number }>()).results![0]!.count
+                    : (getRawDb().prepare(query).get() as { count: number }).count;
+                expect(remaining).toBe(0);
+            }
+        });
+
         it('binds user_id, rejects spoofed owners, and scopes pull/snapshot', async () => {
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');

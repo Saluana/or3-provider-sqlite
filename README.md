@@ -219,12 +219,22 @@ All tables use snake_case aligned with the sync wire format.
 
 ### Sync semantics
 
-- **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` block → writes change_log → applies LWW to materialized tables → upserts tombstones for deletes
+- **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` values for admitted change-log entries → applies LWW to materialized tables → upserts tombstones for deletes. D1 admission and version allocation share one atomic batch; rejected notification races consume no versions.
 - **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, `oldestRetainedVersion`, and `requiresSnapshot` when the cursor is behind retained history
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
 - **Cursor**: forward-only tracking per authenticated user and device within a workspace. Migration 028 changes the unique key so accounts sharing a browser device ID cannot claim each other’s acknowledgements. Legacy unowned rows are never adopted and expire through normal cursor GC.
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
 - **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
+
+Snapshot continuations are bound to the capturing user and workspace, including
+backup snapshots. Each user retains at most four copies per workspace across
+both modes. A newer capture can supersede the oldest chain; expired,
+superseded, and pre-upgrade tokens return HTTP 410 and require a fresh capture.
+Copies expire after one hour. Native runtimes prune expired copies at startup
+and every minute; D1 prunes on requests at most once per minute. Deleting a
+snapshot also removes its copied items.
+If a D1 snapshot is evicted while a page is being read, that request also returns
+HTTP 410 instead of acknowledging a truncated final page.
 
 LWW conflict resolution: incoming wins when `clock` is higher, then when clocks are equal and `hlc` is lexicographically greater, then when `op_id` is greater. Tombstones use the same `(clock, hlc, op_id)` tuple. LWW losers return `applied: false` with the current winner as either `{ kind: 'put', payload, revision }` or `{ kind: 'delete', revision, serverDeletedAt? }`. Idempotent `op_id` retries return `replayed: true` and, if superseded, the current winner. A replay does not allocate another server version.
 

@@ -66,6 +66,12 @@ const MAX_SNAPSHOT_PAGE_SIZE = 1000;
 const DEFAULT_CANONICAL_STORAGE_PAGE_SIZE = 100;
 const MAX_CANONICAL_STORAGE_PAGE_SIZE = 500;
 const SNAPSHOT_TTL_SECONDS = 60 * 60;
+const MAX_RETAINED_SNAPSHOTS_PER_USER = 4;
+const PRUNE_USER_SNAPSHOTS_SQL = `DELETE FROM sync_snapshots WHERE id IN (
+    SELECT id FROM sync_snapshots
+    WHERE workspace_id = ? AND (id LIKE ? OR id LIKE ?)
+    ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?
+)`;
 const SESSION_CONTEXT_KEY_PREFIX = '__or3_session_context_';
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
 const MAX_SYNC_RETENTION_SECONDS = 365 * 24 * 60 * 60;
@@ -148,6 +154,30 @@ function uid(): string {
 
 function nowEpoch(): number {
     return Math.floor(Date.now() / 1000);
+}
+
+function snapshotOwnerPrefix(userId: string | undefined): string {
+    // Persist ownership in the server-generated ID, never in caller token claims.
+    return `user:${createHash('sha256').update(userId ?? '').digest('hex')}:`;
+}
+
+function assertSnapshotOwner(id: string, userId: string | undefined): void {
+    const scopedId = id.replace(/^backup:/, '');
+    // Pre-upgrade copies have no authenticated owner. Restart those chains.
+    if (!scopedId.startsWith('user:')) {
+        throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
+    }
+    if (!scopedId.startsWith(snapshotOwnerPrefix(userId))) {
+        throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
+    }
+}
+
+export async function pruneExpiredSyncSnapshots(): Promise<void> {
+    if (isD1Driver()) {
+        await d1Run('DELETE FROM sync_snapshots WHERE expires_at <= ?', nowEpoch());
+    } else {
+        getRawDb().prepare('DELETE FROM sync_snapshots WHERE expires_at <= ?').run(nowEpoch());
+    }
 }
 
 function stableJson(value: unknown): string {
@@ -684,7 +714,8 @@ function currentWinnerNative(
 async function currentWinnerD1(
     workspaceId: string,
     tableName: string,
-    pk: string
+    pk: string,
+    userId: string | undefined
 ): Promise<PushWinner | undefined> {
     const materializedTable = SYNCED_TABLE_MAP[tableName];
     if (!materializedTable) return undefined;
@@ -694,6 +725,9 @@ async function currentWinnerD1(
         pk,
         workspaceId
     );
+    if (tableName === 'notifications' && row && notificationPayloadUserId(JSON.parse(row.data_json)) !== userId) {
+        return undefined;
+    }
     const [tombstone] = await d1All<TombstoneWinnerRow>(
         `SELECT clock, hlc, op_id, deleted_at FROM tombstones
          WHERE workspace_id = ? AND table_name = ? AND pk = ?`,
@@ -1661,7 +1695,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
             const failedBeforeAlloc = new Set<string>();
             for (const op of uniqueOps) {
-                if (op.tableName !== 'notifications' || op.operation !== 'delete') continue;
+                if (op.tableName !== 'notifications') continue;
                 const materializedTable = SYNCED_TABLE_MAP[op.tableName];
                 if (!materializedTable) continue;
                 const owned = raw
@@ -1672,7 +1706,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 const owner = owned
                     ? notificationPayloadUserId(JSON.parse(owned.data_json))
                     : undefined;
-                if (!owned || owner !== userId) {
+                if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                     failedBeforeAlloc.add(op.stamp.opId);
                     uniqueResults.push({
                         opId: op.stamp.opId,
@@ -2154,6 +2188,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     statusMessage: 'Forbidden',
                 });
             }
+            assertSnapshotOwner(existing.id, snapshotUserId);
             if (
                 input.tables &&
                 existing.tables_json !== JSON.stringify(normalizeSnapshotTables(input.tables))
@@ -2171,13 +2206,19 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             after = token.after;
         } else {
             const tables = normalizeSnapshotTables(input.tables);
-            const snapshotId = `${retainedFiles ? 'backup:' : ''}${uid()}`;
+            const ownerPrefix = snapshotOwnerPrefix(snapshotUserId);
+            const snapshotId = `${retainedFiles ? 'backup:' : ''}${ownerPrefix}${uid()}`;
             const expiresAt = now + SNAPSHOT_TTL_SECONDS;
 
             const capture = raw.transaction((): SnapshotHeaderRow => {
                 // Opportunistic bounded-lifetime cleanup. Cascading deletion removes
                 // immutable item rows for abandoned or completed snapshots.
                 raw.prepare('DELETE FROM sync_snapshots WHERE expires_at <= ?').run(now);
+                // Keep several simultaneous tab/backup chains; superseded chains
+                // restart with 410 rather than retaining unlimited full copies.
+                raw.prepare(PRUNE_USER_SNAPSHOTS_SQL).run(
+                    workspaceId, `${ownerPrefix}%`, `backup:${ownerPrefix}%`, MAX_RETAINED_SNAPSHOTS_PER_USER - 1
+                );
 
                 const counter = raw
                     .prepare(
@@ -2671,6 +2712,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (existing.workspace_id !== workspaceId) {
                 throw createError({ statusCode: 403, statusMessage: 'Forbidden' });
             }
+            assertSnapshotOwner(existing.id, snapshotUserId);
             if (
                 input.tables &&
                 existing.tables_json !== JSON.stringify(normalizeSnapshotTables(input.tables))
@@ -2687,13 +2729,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             after = token.after;
         } else {
             const tables = normalizeSnapshotTables(input.tables);
-            const snapshotId = `${retainedFiles ? 'backup:' : ''}${uid()}`;
+            const ownerPrefix = snapshotOwnerPrefix(snapshotUserId);
+            const snapshotId = `${retainedFiles ? 'backup:' : ''}${ownerPrefix}${uid()}`;
             const expiresAt = now + SNAPSHOT_TTL_SECONDS;
             const tablesJson = JSON.stringify(tables);
             const statements: D1SqlStatement[] = [
                 {
                     sql: 'DELETE FROM sync_snapshots WHERE expires_at <= ?',
                     parameters: [now],
+                },
+                {
+                    sql: PRUNE_USER_SNAPSHOTS_SQL,
+                    parameters: [workspaceId, `${ownerPrefix}%`, `backup:${ownerPrefix}%`, MAX_RETAINED_SNAPSHOTS_PER_USER - 1],
                 },
                 {
                     sql: `INSERT INTO sync_snapshots (
@@ -2823,7 +2870,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                  FROM sync_snapshots WHERE id = ?`,
                 snapshotId
             );
-            if (!created) throw new Error('D1 did not create a sync snapshot.');
+            if (!created) throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
             header = created;
         }
 
@@ -2857,6 +2904,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 header.id,
                 pageSize + 1
             );
+        // Captures and maintenance can evict a snapshot between these awaited
+        // reads. Never acknowledge an incomplete copy as a final page.
+        const [retained] = await d1All<{ expires_at: number }>(
+            'SELECT expires_at FROM sync_snapshots WHERE id = ?', header.id
+        );
+        if (!retained || retained.expires_at <= nowEpoch()) {
+            throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
+        }
         const hasMore = rows.length > pageSize;
         const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
         const items: SnapshotItem[] = pageRows.map((row) => {
@@ -3011,8 +3066,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
 
         for (const op of uniqueOps) {
-            if (op.tableName !== 'notifications' || op.operation !== 'delete') continue;
-            if (existingOps.has(op.stamp.opId) || rejected.has(op.stamp.opId)) continue;
+            if (op.tableName !== 'notifications') continue;
+            if (rejected.has(op.stamp.opId)) continue;
             const materializedTable = SYNCED_TABLE_MAP[op.tableName];
             if (!materializedTable) continue;
             const [owned] = await d1All<{ data_json: string }>(
@@ -3023,7 +3078,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             const owner = owned
                 ? notificationPayloadUserId(JSON.parse(owned.data_json))
                 : undefined;
-            if (!owned || owner !== userId) {
+            if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                 rejected.add(op.stamp.opId);
                 for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
                     resultSlots[index] = {
@@ -3039,10 +3094,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const newOps = uniqueOps.filter(
             (op) => !existingOps.has(op.stamp.opId) && !rejected.has(op.stamp.opId)
         );
-        const versionOffsets = new Map<string, number>();
-        newOps.forEach((op, index) => {
-            versionOffsets.set(op.stamp.opId, index + 1);
-        });
 
         const existingMaterializedKeys = new Set<string>();
         const opsByTable = new Map<string, PendingOp[]>();
@@ -3103,19 +3154,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const now = nowEpoch();
         const statements: D1SqlStatement[] = [];
         if (newOps.length > 0) {
-            // Allocate the block inside the same D1 batch as the mutations so
-            // a failed write rolls the counter back with the rest of the push.
-            statements.push(
-                {
-                    sql: `INSERT OR IGNORE INTO server_version_counter (workspace_id, value)
+            statements.push({
+                sql: `INSERT OR IGNORE INTO server_version_counter (workspace_id, value)
                           VALUES (?, 0)`,
-                    parameters: [workspaceId],
-                },
-                {
-                    sql: 'UPDATE server_version_counter SET value = value + ? WHERE workspace_id = ?',
-                    parameters: [newOps.length, workspaceId],
-                }
-            );
+                parameters: [workspaceId],
+            });
         }
         const materializedStatementIndex = new Map<string, number>();
         const materializedWasExisting = new Map<string, boolean>();
@@ -3123,8 +3166,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         for (const op of newOps) {
             const materializedTable = SYNCED_TABLE_MAP[op.tableName];
             if (!materializedTable) continue;
-            const versionOffset = versionOffsets.get(op.stamp.opId);
-            if (versionOffset === undefined) continue;
             const payloadJson = op.payload == null ? null : JSON.stringify(op.payload);
             const materializedKey = `${materializedTable}\u0000${op.pk}`;
             materializedWasExisting.set(
@@ -3138,16 +3179,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 sql: `INSERT INTO change_log (
                     id, workspace_id, server_version, table_name, pk, op,
                     payload_json, clock, hlc, device_id, op_id, created_at
-                ) VALUES (
+                ) SELECT
                     ?, ?,
-                    (SELECT value - ? + ? FROM server_version_counter WHERE workspace_id = ?),
+                    (SELECT value + 1 FROM server_version_counter WHERE workspace_id = ?),
                     ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )`,
+                ${op.tableName === 'notifications' ? `WHERE NOT EXISTS (
+                    SELECT 1 FROM s_notifications WHERE id = ? AND workspace_id = ?
+                    AND json_extract(data_json, '$.user_id') IS NOT ?
+                )` : ''}`,
                 parameters: [
                     uid(),
                     workspaceId,
-                    newOps.length,
-                    versionOffset,
                     workspaceId,
                     op.tableName,
                     op.pk,
@@ -3158,7 +3200,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     op.stamp.deviceId,
                     op.stamp.opId,
                     now,
+                    ...(op.tableName === 'notifications' ? [op.pk, workspaceId, userId] : []),
                 ],
+            });
+
+            // Only an admitted log entry consumes a version. This statement
+            // immediately follows its INSERT in the atomic D1 batch, so
+            // changes() is 0 for a denied notification and 1 for an accepted op.
+            statements.push({
+                sql: 'UPDATE server_version_counter SET value = value + changes() WHERE workspace_id = ?',
+                parameters: [workspaceId],
             });
 
             if (skipMaterialize.has(op.stamp.opId)) continue;
@@ -3178,7 +3229,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op_id = excluded.op_id,
                         deleted = 0,
                         updated_at = excluded.updated_at
-                    WHERE ${lwwExcludedWins(`"${materializedTable}"`)}`,
+                    WHERE ${lwwExcludedWins(`"${materializedTable}"`)}
+                    ${op.tableName === 'notifications' ? `AND json_extract("${materializedTable}".data_json, '$.user_id') = json_extract(excluded.data_json, '$.user_id')` : ''}`,
                     parameters: [
                         op.pk,
                         workspaceId,
@@ -3222,7 +3274,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         hlc, op_id, server_version, created_at
                     ) VALUES (
                         ?, ?, ?, ?, ?, ?, ?, ?,
-                        (SELECT value - ? + ? FROM server_version_counter WHERE workspace_id = ?),
+                        (SELECT value FROM server_version_counter WHERE workspace_id = ?),
                         ?
                     )
                     ON CONFLICT(workspace_id, table_name, pk) DO UPDATE SET
@@ -3241,8 +3293,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op.stamp.clock,
                         op.stamp.hlc,
                         op.stamp.opId,
-                        newOps.length,
-                        versionOffset,
                         workspaceId,
                         now,
                     ],
@@ -3289,9 +3339,20 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const emissions: HookEmission[] = [];
         for (const op of uniqueOps) {
             if (rejected.has(op.stamp.opId)) continue;
+            if (op.tableName === 'notifications') {
+                const [owned] = await d1All<{ data_json: string }>(
+                    'SELECT data_json FROM s_notifications WHERE id = ? AND workspace_id = ?', op.pk, workspaceId
+                );
+                if (owned && notificationPayloadUserId(JSON.parse(owned.data_json)) !== userId) {
+                    for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
+                        resultSlots[index] = { opId: op.stamp.opId, success: false, error: 'Forbidden: notification owner mismatch', errorCode: 'UNAUTHORIZED' };
+                    }
+                    continue;
+                }
+            }
             const existing = existingOps.get(op.stamp.opId);
             if (existing) {
-                const winner = await currentWinnerD1(workspaceId, op.tableName, op.pk);
+                const winner = await currentWinnerD1(workspaceId, op.tableName, op.pk, userId);
                 const applied = winner?.revision.opId === op.stamp.opId;
                 const result: PushResult['results'][number] = {
                     opId: op.stamp.opId,
@@ -3323,7 +3384,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         workspaceId
                     );
                     if (winner?.data_json) {
-                        winnerPayload = JSON.parse(winner.data_json);
+                        const payload = JSON.parse(winner.data_json);
+                        if (op.tableName !== 'notifications' || notificationPayloadUserId(payload) === userId) winnerPayload = payload;
                     }
                 }
             }
@@ -3334,7 +3396,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 applied,
                 ...(applied ? {} : { payload: winnerPayload }),
                 ...(applied ? {} : {
-                    winner: await currentWinnerD1(workspaceId, op.tableName, op.pk),
+                    winner: await currentWinnerD1(workspaceId, op.tableName, op.pk, userId),
                 }),
             };
             for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
