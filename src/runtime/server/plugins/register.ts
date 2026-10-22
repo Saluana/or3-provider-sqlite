@@ -16,7 +16,7 @@ import { registerPluginConnectionStore } from '~~/server/utils/plugins/connectio
 import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
 import { registerBackgroundJobProvider } from '~~/server/utils/background-jobs/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
-import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
+import { createSqliteSyncGatewayAdapter, pruneExpiredSyncSnapshots } from '../sync/sqlite-sync-gateway-adapter';
 import { createSqliteWebhookStore } from '../webhooks/sqlite-webhook-store';
 import {
     createSqliteAdminUserStore,
@@ -142,9 +142,14 @@ export default defineNitroPlugin(async (nitroApp) => {
     // but their I/O must happen inside a Worker request context. Keep normal
     // runtimes eager and make D1 initialization/migrations first-request work.
     if (driver === 'd1') {
+        let nextSnapshotCleanup = 0;
         nitroApp.hooks.hook('request', async () => {
             d1RuntimeInitialization ??= initializeSqliteDb().then(runMigrations);
             await d1RuntimeInitialization;
+            if (Date.now() >= nextSnapshotCleanup) {
+                nextSnapshotCleanup = Date.now() + 60_000;
+                await pruneExpiredSyncSnapshots();
+            }
         });
         return;
     }
@@ -153,4 +158,12 @@ export default defineNitroPlugin(async (nitroApp) => {
     // initialization awaits for strict provider validation to observe it.
     const db = await initializeSqliteDb();
     await runMigrations(db);
+    await pruneExpiredSyncSnapshots();
+    const snapshotCleanup = globalThis.setInterval(() => {
+        void pruneExpiredSyncSnapshots().catch(error => {
+            console.warn('[or3-sqlite] Snapshot cleanup failed', error);
+        });
+    }, 60_000);
+    snapshotCleanup.unref?.();
+    nitroApp.hooks.hook('close', () => { globalThis.clearInterval(snapshotCleanup); });
 });

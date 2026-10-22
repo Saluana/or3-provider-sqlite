@@ -220,6 +220,14 @@ All tables use snake_case aligned with the sync wire format.
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
 - **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
 
+Snapshot continuations are bound to the capturing user and workspace, including
+backup snapshots. Each user retains at most four copies per workspace across
+both modes. A newer capture can supersede the oldest chain; expired,
+superseded, and pre-upgrade tokens return HTTP 410 and require a fresh capture.
+Copies expire after one hour. Native runtimes prune expired copies at startup
+and every minute; D1 prunes on requests at most once per minute. Deleting a
+snapshot also removes its copied items.
+
 LWW conflict resolution: incoming wins when `clock` is higher, then when clocks are equal and `hlc` is lexicographically greater, then when `op_id` is greater. Tombstones use the same `(clock, hlc, op_id)` tuple. LWW losers return `applied: false` with the current winner as either `{ kind: 'put', payload, revision }` or `{ kind: 'delete', revision, serverDeletedAt? }`. Idempotent `op_id` retries return `replayed: true` and, if superseded, the current winner. A replay does not allocate another server version.
 
 Local, Bun, and Turso runtimes use `BEGIN IMMEDIATE` transactions. D1 uses its
