@@ -64,6 +64,8 @@ const REQUIRED_SCHEMA_TABLES = [
 import * as m024 from './migrations/024_signup_invites';
 import * as m025 from './migrations/025_background_shutdown_accounting';
 import * as m026 from './migrations/026_retained_storage_usage';
+import * as m027 from './migrations/027_verified_storage_usage';
+import * as m028 from './migrations/028_user_scoped_device_cursors';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -91,7 +93,9 @@ const migrations: Record<string, Migration> = {
     '023_legacy_chat_seek_index': m023,
     '024_signup_invites': m024,
     '025_background_shutdown_accounting': m025,
-    '026_retained_storage_usage': m026
+    '026_retained_storage_usage': m026,
+    '027_verified_storage_usage': m027,
+    '028_user_scoped_device_cursors': m028
 };
 
 class StaticMigrationProvider implements MigrationProvider {

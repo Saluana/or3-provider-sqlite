@@ -2428,14 +2428,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
             const existing = raw.prepare(
                 `SELECT owner_user_id, last_seen_version
-                 FROM device_cursors WHERE workspace_id = ? AND device_id = ?`
-            ).get(input.scope.workspaceId, deviceId) as {
+                 FROM device_cursors WHERE workspace_id = ? AND owner_user_id = ? AND device_id = ?`
+            ).get(input.scope.workspaceId, ownerUserId, deviceId) as {
                 owner_user_id: string | null;
                 last_seen_version: number;
             } | undefined;
-            if (existing?.owner_user_id && existing.owner_user_id !== ownerUserId) {
-                throw createError({ statusCode: 403, statusMessage: 'Device cursor belongs to another user' });
-            }
             if (existing && input.version < existing.last_seen_version) {
                 throw createError({ statusCode: 409, statusMessage: 'Device cursor cannot regress' });
             }
@@ -2444,8 +2441,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 `INSERT INTO device_cursors (
                     id, workspace_id, device_id, owner_user_id, last_seen_version, updated_at
                  ) VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(workspace_id, device_id) DO UPDATE SET
-                   owner_user_id = COALESCE(device_cursors.owner_user_id, excluded.owner_user_id),
+                 ON CONFLICT(workspace_id, owner_user_id, device_id) DO UPDATE SET
                    last_seen_version = excluded.last_seen_version,
                    updated_at = excluded.updated_at`
             ).run(uid(), input.scope.workspaceId, deviceId, ownerUserId, input.version, now);
@@ -2921,13 +2917,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             last_seen_version: number;
         }>(
             `SELECT owner_user_id, last_seen_version
-             FROM device_cursors WHERE workspace_id = ? AND device_id = ?`,
+             FROM device_cursors WHERE workspace_id = ? AND owner_user_id = ? AND device_id = ?`,
             workspaceId,
+            ownerUserId,
             deviceId
         );
-        if (existing?.owner_user_id && existing.owner_user_id !== ownerUserId) {
-            throw createError({ statusCode: 403, statusMessage: 'Device cursor belongs to another user' });
-        }
         if (existing && version < existing.last_seen_version) {
             throw createError({ statusCode: 409, statusMessage: 'Device cursor cannot regress' });
         }
@@ -2935,19 +2929,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             `INSERT INTO device_cursors (
                 id, workspace_id, device_id, owner_user_id, last_seen_version, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(workspace_id, device_id) DO UPDATE SET
-                owner_user_id = COALESCE(device_cursors.owner_user_id, excluded.owner_user_id),
+             ON CONFLICT(workspace_id, owner_user_id, device_id) DO UPDATE SET
                 last_seen_version = excluded.last_seen_version,
                 updated_at = excluded.updated_at
-             WHERE (device_cursors.owner_user_id IS NULL OR device_cursors.owner_user_id = ?)
-               AND excluded.last_seen_version >= device_cursors.last_seen_version`,
+             WHERE excluded.last_seen_version >= device_cursors.last_seen_version`,
             uid(),
             workspaceId,
             deviceId,
             ownerUserId,
             version,
-            now,
-            ownerUserId
+            now
         );
         if ((result.meta?.changes ?? 0) !== 1) {
             throw createError({ statusCode: 409, statusMessage: 'Device cursor changed concurrently' });

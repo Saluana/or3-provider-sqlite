@@ -22,16 +22,22 @@ advertise `retainedStorageMetadata: 'v1'` on native SQLite and D1. Missing sizes
 delete-before-put rows remain unknown; these reads never replay sync history.
 
 Upload quota admission groups unexpired pending authorizations by hash and
-reserves atomically on native SQLite and D1. Migration 026 backfills retained
-hashes from metadata (including Trash) and consumed receipts into an indexed
-usage total. Trash, logical deletion and receipt expiry do not release retained
-charges; a restore of the same hash does not double-charge. A larger upload
-reserves the difference above the retained size, even when historical metadata
-understated it. This provider
-advertises `atomicUploadQuota: 'retained-v1'`, allowing the host to omit its full
-catalog preflight. Physical filesystem/S3 GC remains disabled, so retained
-charges intentionally remain conservative. Configure
-`OR3_STORAGE_WORKSPACE_QUOTA_BYTES`; its host default remains unlimited.
+reserves atomically on native SQLite and D1. Migration 027 replaces the
+metadata-derived charges from migration 026 with persisted, verified consumed
+upload receipts. Client-authored file sizes cannot create retained charges.
+Trash, logical deletion and receipt replay expiry do not release verified
+charges; restoring the same hash does not double-charge it. A larger upload
+reserves the difference above its verified retained size.
+
+Pre-receipt files and raw incomplete uploads are outside this verified ledger;
+metadata alone cannot prove their physical size. Existing consumed receipts are
+retained and reconciled during upgrade. Physical filesystem/S3 GC remains
+disabled. The provider advertises `atomicUploadQuota: 'retained-v1'`; configure
+`OR3_STORAGE_WORKSPACE_QUOTA_BYTES` to enforce a quota (the default is unlimited).
+
+Migrations 027–028 are forward-only. Keep a pre-upgrade database backup;
+rolling back the provider requires restoring that snapshot because the old
+adapter expects the previous device-cursor unique key.
 
 `watchVersion` shares one indexed workspace version-counter read every two
 seconds per workspace per process across notification listeners. The host can
@@ -216,7 +222,7 @@ All tables use snake_case aligned with the sync wire format.
 - **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` block → writes change_log → applies LWW to materialized tables → upserts tombstones for deletes
 - **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, `oldestRetainedVersion`, and `requiresSnapshot` when the cursor is behind retained history
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
-- **Cursor**: forward-only per-device cursor tracking
+- **Cursor**: forward-only tracking per authenticated user and device within a workspace. Migration 028 changes the unique key so accounts sharing a browser device ID cannot claim each other’s acknowledgements. Legacy unowned rows are never adopted and expire through normal cursor GC.
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
 - **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
 
