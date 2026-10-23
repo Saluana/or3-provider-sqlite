@@ -1,6 +1,7 @@
 /** Startup wiring must make account storage usable without enabling transfer. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SqliteAuthWorkspaceStore } from '../server/auth/sqlite-auth-workspace-store';
+import type { RateLimitProvider } from '~~/server/utils/rate-limit/types';
 import type * as ChatRuntime from '../../shims/or3-chat-test-runtime';
 import register from '../server/plugins/register';
 import * as sqliteDb from '../server/db/kysely';
@@ -11,6 +12,7 @@ const registrations = vi.hoisted(() => ({
     sync: new Set<string>(),
     connect: new Set<string>(),
     jobs: new Set<string>(),
+    limits: new Map<string, RateLimitProvider>(),
 }));
 
 // Canonical-history tests use the actual pinned registry through this exact
@@ -32,7 +34,8 @@ vi.mock('../../shims/or3-chat-test-runtime', async (importOriginal) => ({
     registerConnectStore: (entry: { id: string }) =>
         registrations.connect.add(entry.id),
     registerBackgroundJobProvider: (id: string) => registrations.jobs.add(id),
-    registerRateLimitProvider: () => {},
+    registerRateLimitProvider: (id: string, provider: RateLimitProvider) =>
+        registrations.limits.set(id, provider),
     registerProviderAdminAdapter: () => {},
     registerAdminStoreProvider: () => {},
     registerWebhookStore: () => {},
@@ -45,6 +48,7 @@ function config() {
         sync: { enabled: false, provider: 'sqlite' },
         connect: { enabled: false, provider: 'sqlite' },
         backgroundJobs: { enabled: false, storageProvider: 'sqlite' },
+        limits: { enabled: false, storageProvider: 'sqlite' },
         public: { sync: { provider: 'sqlite' }, storage: { provider: 'fs' } },
     };
 }
@@ -129,11 +133,31 @@ describe('SQLite Nitro startup registration', () => {
         }
     );
 
+    // Limits are selected independently from sync and jobs. Startup must both
+    // register and migrate their durable store; otherwise strict startup fails
+    // or enforcement silently uses another provider.
+    it('enforces durable limits when SQLite is selected only for limits', async () => {
+        runtime.sync.provider = 'convex';
+        runtime.limits.enabled = true;
+        await start();
+        const provider = registrations.limits.get('sqlite');
+        expect(provider, 'startup must register the selected limits provider').toBeDefined();
+        const config = { maxRequests: 1, windowMs: 60_000 };
+        await expect(provider!.checkAndRecord('limits-only', config)).resolves.toMatchObject({
+            allowed: true, remaining: 0,
+        });
+        await expect(provider!.checkAndRecord('limits-only', config)).resolves.toMatchObject({
+            allowed: false, remaining: 0,
+        });
+        expect(registrations.sync.size).toBe(0);
+    });
+
     it('leaves all SQLite roles inactive when accounts are disabled', async () => {
         runtime.auth.enabled = false;
         runtime.sync.enabled = true;
         runtime.connect.enabled = true;
         runtime.backgroundJobs.enabled = true;
+        runtime.limits.enabled = true;
         await start();
         for (const registry of Object.values(registrations)) expect(registry.size).toBe(0);
         expect(() => sqliteDb.getSqliteDb()).toThrow('SQLite DB not initialized');

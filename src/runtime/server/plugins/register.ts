@@ -3,7 +3,7 @@
  *
  * Runs migrations at startup for local runtimes and on the first Worker
  * request for D1, then registers the relevant adapters.
- * Activates for SQLite account workspaces, sync, Connect or background jobs.
+ * Activates for SQLite account workspaces, sync, Connect, background jobs or limits.
  */
 import { defineNitroPlugin } from 'nitropack/runtime/plugin';
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
@@ -16,7 +16,7 @@ import { registerPluginConnectionStore } from '~~/server/utils/plugins/connectio
 import { registerRateLimitProvider } from '~~/server/utils/rate-limit/registry';
 import { registerBackgroundJobProvider } from '~~/server/utils/background-jobs/registry';
 import { createSqliteAuthWorkspaceStore } from '../auth/sqlite-auth-workspace-store';
-import { createSqliteSyncGatewayAdapter } from '../sync/sqlite-sync-gateway-adapter';
+import { createSqliteSyncGatewayAdapter, pruneExpiredSyncSnapshots } from '../sync/sqlite-sync-gateway-adapter';
 import { createSqliteWebhookStore } from '../webhooks/sqlite-webhook-store';
 import {
     createSqliteAdminUserStore,
@@ -40,6 +40,7 @@ type RuntimeConfigWithSync = {
     sync?: { enabled?: boolean; provider?: string };
     connect?: { enabled?: boolean; provider?: string };
     backgroundJobs?: { enabled?: boolean; storageProvider?: string };
+    limits?: { enabled?: boolean; storageProvider?: string };
 };
 
 export default defineNitroPlugin(async (nitroApp) => {
@@ -55,7 +56,10 @@ export default defineNitroPlugin(async (nitroApp) => {
     const backgroundJobsSelected =
         config.backgroundJobs?.enabled === true &&
         config.backgroundJobs?.storageProvider === SQLITE_PROVIDER_ID;
-    if (!workspaceSelected && !connectSelected && !backgroundJobsSelected)
+    const limitsSelected =
+        config.limits?.enabled === true &&
+        config.limits?.storageProvider === SQLITE_PROVIDER_ID;
+    if (!workspaceSelected && !connectSelected && !backgroundJobsSelected && !limitsSelected)
         return;
 
     const driver = getSqliteDriver();
@@ -138,9 +142,14 @@ export default defineNitroPlugin(async (nitroApp) => {
     // but their I/O must happen inside a Worker request context. Keep normal
     // runtimes eager and make D1 initialization/migrations first-request work.
     if (driver === 'd1') {
+        let nextSnapshotCleanup = 0;
         nitroApp.hooks.hook('request', async () => {
             d1RuntimeInitialization ??= initializeSqliteDb().then(runMigrations);
             await d1RuntimeInitialization;
+            if (Date.now() >= nextSnapshotCleanup) {
+                nextSnapshotCleanup = Date.now() + 60_000;
+                await pruneExpiredSyncSnapshots();
+            }
         });
         return;
     }
@@ -149,4 +158,12 @@ export default defineNitroPlugin(async (nitroApp) => {
     // initialization awaits for strict provider validation to observe it.
     const db = await initializeSqliteDb();
     await runMigrations(db);
+    await pruneExpiredSyncSnapshots();
+    const snapshotCleanup = setInterval(() => {
+        void pruneExpiredSyncSnapshots().catch(error => {
+            console.warn('[or3-sqlite] Snapshot cleanup failed', error);
+        });
+    }, 60_000);
+    snapshotCleanup.unref?.();
+    nitroApp.hooks.hook('close', () => { clearInterval(snapshotCleanup); });
 });
