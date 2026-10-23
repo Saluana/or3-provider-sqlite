@@ -28,6 +28,8 @@ jobs:
           bun-version: 1.3.14
       - run: npm install --global npm@11
       - run: bun install --frozen-lockfile
+      - name: Test npm propagation verifier offline
+        run: bun test scripts/__tests__/npm-propagation.test.ts
       - name: Verify release version
         run: |
           set -euo pipefail
@@ -47,6 +49,19 @@ jobs:
       - run: bun run type-check:standalone
       - run: bun run test
       - run: bun run build
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Saluana/or3-chat
+          ref: 3aa7b3c0d251d4071c6520814cc5d823e05bfccf
+          path: qualification-host
+      - name: Install canonical host qualification dependencies
+        working-directory: qualification-host
+        run: bun install --frozen-lockfile
+      - name: Check complete provider types and canonical host integration
+        run: |
+          ln -s "$PWD/qualification-host" ../or3-chat
+          bun run type-check
+          OR3_CANONICAL_HOST_ROOT="$PWD/qualification-host" bunx vitest run --config vitest.canonical-history.config.ts
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
       - name: Create publish archive

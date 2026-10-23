@@ -16,6 +16,7 @@ for (const file of files) {
 }
 const hostRequire = createRequire(path.join(host, 'package.json'));
 const lane = mergeConfig(config, defineConfig({ resolve: { alias: [
+    { find: '~~/shared/testing/contracts/sync', replacement: path.join(import.meta.dirname, 'src/shims/sync-test-contract.ts') },
     ...files.map((file) => ({ find: `~~/${file}`, replacement: path.join(host, `${file}.ts`) })),
     { find: 'fake-indexeddb/auto', replacement: hostRequire.resolve('fake-indexeddb/auto') },
     { find: '#imports', replacement: path.join(host, 'tests/stubs/nuxt-imports.ts') },
