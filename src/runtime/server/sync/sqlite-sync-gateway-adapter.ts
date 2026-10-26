@@ -205,12 +205,23 @@ function backgroundHistoryOpId(
     return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
 }
 
+function fingerprintPayload(tableName: string, operation: string, payload: unknown): unknown {
+    if (tableName !== 'notifications' || operation !== 'delete') return payload;
+    if (payload == null) return undefined;
+    if (typeof payload !== 'object' || Array.isArray(payload)) return payload;
+    // The authenticated owner is server metadata, not delete intent. Older
+    // receipts omitted it; lost-ACK retries must remain idempotent on upgrade.
+    const intent = { ...(payload as Record<string, unknown>) };
+    delete intent.user_id;
+    return Object.keys(intent).length > 0 ? intent : undefined;
+}
+
 function operationFingerprint(op: PendingOp): string {
     return stableJson({
         tableName: op.tableName,
         operation: op.operation,
         pk: op.pk,
-        payload: op.payload,
+        payload: fingerprintPayload(op.tableName, op.operation, op.payload),
         clock: op.stamp.clock,
         hlc: op.stamp.hlc,
         deviceId: op.stamp.deviceId,
@@ -230,7 +241,7 @@ function changeLogFingerprint(row: {
         tableName: row.table_name,
         operation: row.op,
         pk: row.pk,
-        payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
+        payload: fingerprintPayload(row.table_name, row.op, row.payload_json ? JSON.parse(row.payload_json) : undefined),
         clock: row.clock,
         hlc: row.hlc,
         deviceId: row.device_id,
@@ -262,7 +273,6 @@ function scopeNotificationWrite(
     if (!userId) {
         return 'Unauthorized: notification writes require a session user';
     }
-    if (op.operation !== 'put') return op;
     const payload =
         op.payload && typeof op.payload === 'object' && !Array.isArray(op.payload)
             ? { ...(op.payload as Record<string, unknown>) }
@@ -271,6 +281,55 @@ function scopeNotificationWrite(
         return 'Forbidden: notification owner mismatch';
     }
     return { ...op, payload: { ...payload, user_id: userId } };
+}
+
+const WORKSPACE_ITEM_UPDATE_REQUIRED = 'OR3_WORKSPACE_ITEM_UPDATE_REQUIRED';
+
+function workspaceItemUpdateRequired() {
+    return createError({
+        statusCode: 426,
+        statusMessage: 'Update OR3 Chat to use workspace Files and Trash',
+        data: { code: WORKSPACE_ITEM_UPDATE_REQUIRED, requiredCapability: WORKSPACE_ITEM_CAPABILITY },
+    });
+}
+
+/**
+ * D1 has no interactive write transaction. Assert canonical capability inside
+ * its atomic batch, so a concurrent Files/Trash write cannot be overwritten by
+ * an older client after a preflight read. An invalid JSON path aborts the whole
+ * batch, including sibling operations and version allocation.
+ */
+function workspaceItemCapabilityAssertion(op: PendingOp, workspaceId: string): D1SqlStatement {
+    const field = op.tableName === 'posts' ? 'meta' : 'data';
+    const decoded = `CASE WHEN json_type(data_json, '$.${field}') = 'text'
+        THEN CASE WHEN json_valid(json_extract(data_json, '$.${field}'))
+            THEN json_extract(data_json, '$.${field}') ELSE 'null' END
+        ELSE COALESCE(json_extract(data_json, '$.${field}'), 'null') END`;
+    const semantics = op.tableName === 'posts'
+        ? `COALESCE(json_extract(data_json, '$.post_type'), json_extract(data_json, '$.postType')) = 'or3:file'
+            OR (json_type(metadata) = 'object' AND (
+                json_type(metadata, '$."or3.workspace-item"') IS NOT NULL
+                OR json_extract(metadata, '$.key') = 'or3.workspace-item'
+            ))
+            OR (json_type(metadata) = 'array' AND EXISTS (
+                SELECT 1 FROM json_each(metadata) AS entry
+                WHERE CASE WHEN entry.type = 'object'
+                    THEN json_extract(entry.value, '$.key') = 'or3.workspace-item' ELSE 0 END
+            ))`
+        : `json_type(metadata) = 'array' AND EXISTS (
+            SELECT 1 FROM json_each(metadata) AS entry
+            WHERE CASE WHEN entry.type = 'object'
+                THEN json_extract(entry.value, '$.kind') = 'file' ELSE 0 END
+        )`;
+    return {
+        sql: `SELECT json_extract('{}', CASE WHEN EXISTS (
+            SELECT 1 FROM (
+                SELECT data_json, ${decoded} AS metadata FROM "${SYNCED_TABLE_MAP[op.tableName]}"
+                WHERE workspace_id = ? AND id = ?
+            ) WHERE ${semantics}
+        ) THEN '${WORKSPACE_ITEM_UPDATE_REQUIRED}' ELSE '$' END)`,
+        parameters: [workspaceId, op.pk],
+    };
 }
 
 const LWW_EXCLUDED_WINS = `(
@@ -1624,6 +1683,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 resultSlots,
                 indicesByOpId,
                 userId,
+                workspaceItemCapability: input.workspaceItemCapability,
             });
         }
 
@@ -1645,8 +1705,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         .get(op.pk, workspaceId) as { data_json: string } | undefined;
                     if (hasWorkspaceItemSemantics(op.tableName, op.payload)
                         || hasWorkspaceItemSemantics(op.tableName, canonical ? JSON.parse(canonical.data_json) : undefined)) {
-                        throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat to use workspace Files and Trash',
-                            data: { code: 'OR3_WORKSPACE_ITEM_UPDATE_REQUIRED', requiredCapability: WORKSPACE_ITEM_CAPABILITY } });
+                        throw workspaceItemUpdateRequired();
                     }
                 }
             }
@@ -3007,6 +3066,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         resultSlots: Array<PushResult['results'][number] | undefined>;
         indicesByOpId: Map<string, number[]>;
         userId: string | undefined;
+        workspaceItemCapability: PushBatch['workspaceItemCapability'];
     }): Promise<PushResult> {
         const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId } = input;
         const existingOps = new Map<string, {
@@ -3153,6 +3213,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const now = nowEpoch();
         const statements: D1SqlStatement[] = [];
+        if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
+            for (const op of uniqueOps) {
+                if (!['posts', 'projects'].includes(op.tableName)) continue;
+                if (hasWorkspaceItemSemantics(op.tableName, op.payload)) {
+                    throw workspaceItemUpdateRequired();
+                }
+                statements.push(workspaceItemCapabilityAssertion(op, workspaceId));
+            }
+        }
         if (newOps.length > 0) {
             statements.push({
                 sql: `INSERT OR IGNORE INTO server_version_counter (workspace_id, value)
@@ -3307,7 +3376,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 parameters: [workspaceId],
             });
         }
-        const batchResults = statements.length > 0 ? await d1Batch(statements) : [];
+        let batchResults: Awaited<ReturnType<typeof d1Batch>>;
+        try {
+            batchResults = statements.length > 0 ? await d1Batch(statements) : [];
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (/JSON path/i.test(message) && message.includes(WORKSPACE_ITEM_UPDATE_REQUIRED)) {
+                throw workspaceItemUpdateRequired();
+            }
+            throw error;
+        }
         let finalServerVersion = 0;
         if (finalVersionResultIndex !== undefined) {
             const row = batchResults[finalVersionResultIndex]?.results?.[0] as
