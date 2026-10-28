@@ -45,6 +45,8 @@ wake its ordinary sync pull immediately when the counter changes and use a
 one-minute safety pull while connected. Last-listener teardown stops the timer;
 unsupported notification routes retain normal gateway polling.
 
+Background chat admissions emit the existing thread and user-message create hooks after commit when those rows are newly created. Replayed admissions do not emit them again; hook delivery failures do not fail admission.
+
 ## Atomic webhook registration quotas
 
 The webhook store advertises `registrationLimit: 'atomic-v1'`. `createWebhook(input, limit)` checks the user/workspace quota (or instance-wide admin quota) in the same immediate transaction as insertion. Independent connections share the limit; exhaustion throws `WEBHOOK_LIMIT_EXCEEDED`. The optional argument leaves non-quota internal calls unchanged. OR3 Chat requires this capability for registration; ship this provider change before integrating the coordinated host change.

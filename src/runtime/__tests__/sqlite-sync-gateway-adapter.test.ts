@@ -30,6 +30,11 @@ import type { CanonicalGenerationSnapshot, ChatGenerationAdmissionEnvelope } fro
 import type { RequestUsage } from '~~/shared/chat/compaction';
 import type { TerminalGenerationSnapshot } from '~~/server/utils/background-jobs/types';
 
+const webhookMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('~~/server/utils/webhooks/runtime', async (importOriginal) => ({
+    ...await importOriginal<Record<string, unknown>>(), emitWebhookSystemHook: webhookMock,
+}));
+
 const WORKSPACE_ID = 'ws-test-1';
 const DEVICE_A = 'device-a';
 const DEVICE_B = 'device-b';
@@ -343,6 +348,32 @@ describe('SqliteSyncGatewayAdapter', () => {
         afterEach(async () => {
             await destroySqliteDb();
             await rm(directory, { recursive: true, force: true });
+        });
+
+        it('emits created hooks once for admitted rows and does not create an existing thread', async () => {
+            webhookMock.mockClear();
+            const history = admission();
+            await adapter.admitChatGeneration(actor, history);
+            expect(webhookMock.mock.calls.map((call) => call[0])).toEqual([
+                'db.threads.create:action:after', 'db.messages.create:action:after',
+            ]);
+            expect(webhookMock).toHaveBeenCalledWith('db.messages.create:action:after',
+                expect.objectContaining({ id: 'usage-user', workspace_id: WORKSPACE_ID, user_id: actor.userId }));
+            webhookMock.mockClear();
+            await adapter.admitChatGeneration(actor, history);
+            expect(webhookMock).not.toHaveBeenCalled();
+            const next = admission();
+            next.admissionId = 'next-admission'; next.generationId = 'next-generation';
+            next.messageId = 'next-assistant'; next.assistantMessage.id = 'next-assistant';
+            next.assistantMessage.data = { generation_id: 'next-generation' };
+            next.thread!.clock = 2; next.userMessage!.id = 'next-user';
+            webhookMock.mockClear();
+            const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+            webhookMock.mockRejectedValueOnce(new Error('hook failed'));
+            try {
+                await expect(adapter.admitChatGeneration(actor, next)).resolves.toMatchObject({ status: 'admitted' });
+                expect(webhookMock.mock.calls.map((call) => call[0])).not.toContain('db.threads.create:action:after');
+            } finally { errorLog.mockRestore(); }
         });
 
         it.each(['complete', 'error', 'aborted'] as const)('reconciles real persisted %s jobs through host history and canonical pull/snapshot', async (status) => {

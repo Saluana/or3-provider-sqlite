@@ -974,7 +974,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const fingerprint = createHash('sha256')
             .update(stableJson(admission))
             .digest('hex');
-        return raw.transaction(() => {
+        const hookEmissions: HookEmission[] = [];
+        const result = raw.transaction(() => {
             this.assertCanonicalActor(actor);
             const receipt = raw
                 .prepare(
@@ -1097,7 +1098,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     payloadJson, entry.record.clock, hlc,
                     backgroundHistoryDeviceId(admission.generationId), opId, now
                 );
-                raw.prepare(
+                const existing = raw.prepare(`SELECT 1 FROM ${entry.materialized} WHERE workspace_id = ? AND id = ?`)
+                    .get(admission.workspaceId, entry.record.id);
+                const materialized = raw.prepare(
                     `INSERT INTO ${entry.materialized}
                      (id, workspace_id, data_json, clock, hlc, device_id, op_id,
                       deleted, created_at, updated_at)
@@ -1112,6 +1115,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     entry.record.clock, hlc,
                     backgroundHistoryDeviceId(admission.generationId), opId, now, now
                 );
+                if ((entry.table === 'threads' || entry.record.id !== admission.messageId) && !existing && materialized.changes > 0) {
+                    const op = { tableName: entry.table, operation: 'put', pk: entry.record.id, payload } as PendingOp;
+                    const emission = resolveHookEmission({ op, workspaceId: admission.workspaceId, now, userId: actor.userId, wasExisting: false, applied: true });
+                    if (emission) hookEmissions.push(emission);
+                }
             });
             const admittedAssistant = raw
                 .prepare(
@@ -1144,6 +1152,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, finalVersion, now);
             return { status: 'admitted' as const, replayed: false, serverVersion: finalVersion };
         }).immediate();
+        for (const emission of hookEmissions) {
+            try {
+                await emitWebhookSystemHook(emission.hookName, emission.payload);
+            } catch (error) {
+                console.error('[or3-sqlite] Background admission hook failed', error);
+            }
+        }
+        return result;
     }
 
     async finalizeChatGeneration(
