@@ -45,6 +45,8 @@ wake its ordinary sync pull immediately when the counter changes and use a
 one-minute safety pull while connected. Last-listener teardown stops the timer;
 unsupported notification routes retain normal gateway polling.
 
+Background chat admissions emit the existing thread and user-message create hooks after commit when those rows are newly created. Replayed admissions do not emit them again; hook delivery failures do not fail admission.
+
 ## Atomic webhook registration quotas
 
 The webhook store advertises `registrationLimit: 'atomic-v1'`. `createWebhook(input, limit)` checks the user/workspace quota (or instance-wide admin quota) in the same immediate transaction as insertion. Independent connections share the limit; exhaustion throws `WEBHOOK_LIMIT_EXCEEDED`. The optional argument leaves non-quota internal calls unchanged. OR3 Chat requires this capability for registration; ship this provider change before integrating the coordinated host change.
@@ -224,7 +226,8 @@ All tables use snake_case aligned with the sync wire format.
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
 - **Cursor**: forward-only tracking per authenticated user and device within a workspace. Migration 028 changes the unique key so accounts sharing a browser device ID cannot claim each other’s acknowledgements. Legacy unowned rows are never adopted and expire through normal cursor GC.
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
-- **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
+- **Notifications**: push forces `payload.user_id` to the session user on puts and deletes; foreign notification writes are rejected. Successful deletes remain visible to the owner's other devices while pull/snapshot omit other users' rows.
+- **Workspace Files/Trash admission**: a client without `workspaceItemCapability: 'v1'` cannot replace or delete a canonical post/project carrying workspace Files/Trash semantics, even if the submitted payload omits those fields. Native write transactions and the D1 atomic batch check canonical state before any operation or version allocation; a rejected batch returns HTTP 426 and leaves sibling writes unchanged.
 
 Snapshot continuations are bound to the capturing user and workspace, including
 backup snapshots. Each user retains at most four copies per workspace across

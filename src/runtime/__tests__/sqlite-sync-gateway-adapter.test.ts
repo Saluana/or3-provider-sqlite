@@ -30,6 +30,11 @@ import type { CanonicalGenerationSnapshot, ChatGenerationAdmissionEnvelope } fro
 import type { RequestUsage } from '~~/shared/chat/compaction';
 import type { TerminalGenerationSnapshot } from '~~/server/utils/background-jobs/types';
 
+const webhookMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('~~/server/utils/webhooks/runtime', async (importOriginal) => ({
+    ...await importOriginal<Record<string, unknown>>(), emitWebhookSystemHook: webhookMock,
+}));
+
 const WORKSPACE_ID = 'ws-test-1';
 const DEVICE_A = 'device-a';
 const DEVICE_B = 'device-b';
@@ -345,6 +350,32 @@ describe('SqliteSyncGatewayAdapter', () => {
             await rm(directory, { recursive: true, force: true });
         });
 
+        it('emits created hooks once for admitted rows and does not create an existing thread', async () => {
+            webhookMock.mockClear();
+            const history = admission();
+            await adapter.admitChatGeneration(actor, history);
+            expect(webhookMock.mock.calls.map((call) => call[0])).toEqual([
+                'db.threads.create:action:after', 'db.messages.create:action:after',
+            ]);
+            expect(webhookMock).toHaveBeenCalledWith('db.messages.create:action:after',
+                expect.objectContaining({ id: 'usage-user', workspace_id: WORKSPACE_ID, user_id: actor.userId }));
+            webhookMock.mockClear();
+            await adapter.admitChatGeneration(actor, history);
+            expect(webhookMock).not.toHaveBeenCalled();
+            const next = admission();
+            next.admissionId = 'next-admission'; next.generationId = 'next-generation';
+            next.messageId = 'next-assistant'; next.assistantMessage.id = 'next-assistant';
+            next.assistantMessage.data = { generation_id: 'next-generation' };
+            next.thread!.clock = 2; next.userMessage!.id = 'next-user';
+            webhookMock.mockClear();
+            const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+            webhookMock.mockRejectedValueOnce(new Error('hook failed'));
+            try {
+                await expect(adapter.admitChatGeneration(actor, next)).resolves.toMatchObject({ status: 'admitted' });
+                expect(webhookMock.mock.calls.map((call) => call[0])).not.toContain('db.threads.create:action:after');
+            } finally { errorLog.mockRestore(); }
+        });
+
         it.each(['complete', 'error', 'aborted'] as const)('reconciles real persisted %s jobs through host history and canonical pull/snapshot', async (status) => {
             let jobs = new SqliteBackgroundJobProvider();
             const history = admission();
@@ -432,11 +463,22 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
     });
 
-    it.each([
+    // The admitted canonical value is authoritative even when an old writer
+    // omits every identifying field. Rejection must roll back sibling writes.
+    it.each(['sqlite', 'd1'].flatMap(runtime => [
         { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', title: 'Trashed native document', content: '{"type":"doc","content":[]}', file_hashes: JSON.stringify(['shared-hash']), meta: JSON.stringify({ plugin_key: 'preserved', 'or3.workspace-item': { version: 1, trashed_at: 1 } }) }, omitted: { id: 'workspace-item', postType: 'doc', meta: '' } },
         { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'or3:file', title: 'Saved original', content: 'Indexed saffron prefix', file_hashes: JSON.stringify(['shared-hash']), meta: JSON.stringify({ plugin_key: 'preserved', 'or3.workspace-item': { version: 1, trashed_at: null, text: { coverage: 'prefix', indexed_bytes: 21 } } }) }, omitted: { id: 'workspace-item', postType: 'doc' } },
         { tableName: 'projects', payload: { id: 'workspace-item', name: 'Project', data: [{ kind: 'file', id: 'catalog', name: 'Original', extra: 'preserved' }, { kind: 'plugin-resource', id: 'opaque', plugin_field: 'preserved' }] }, omitted: { id: 'workspace-item', name: 'Project', data: [] } },
-    ])('rejects old-writer omission transactionally for $tableName', async ({ tableName, payload, omitted }) => {
+        ...[
+            { 'or3.workspace-item': null },
+            { key: 'or3.workspace-item', value: { version: 1 } },
+            [{ key: 'or3.workspace-item', value: { version: 1 } }],
+            JSON.stringify([{ key: 'or3.workspace-item', value: { version: 1 } }]),
+        ].map(meta => ({ tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', meta }, omitted: { id: 'workspace-item' } })),
+        { tableName: 'posts', payload: { id: 'workspace-item', postType: 'or3:file' }, omitted: { id: 'workspace-item' } },
+        { tableName: 'projects', payload: { id: 'workspace-item', data: JSON.stringify([{ kind: 'file', id: 'saved' }]) }, omitted: { id: 'workspace-item', data: [] } },
+    ].map(value => ({ ...value, runtime }))))('rejects old-writer omission transactionally for $tableName on $runtime', async ({ tableName, payload, omitted, runtime }) => {
+        if (runtime === 'd1') await useD1TestDatabase();
         const first = makeOp({ tableName, pk: 'workspace-item', payload });
         const admitted = { ...makeBatch([first]), workspaceItemCapability: 'v1' as const };
         const saved = await adapter.push(stubEvent, admitted);
@@ -447,10 +489,49 @@ describe('SqliteSyncGatewayAdapter', () => {
         expect(snapshot.items).toContainEqual(expect.objectContaining({ kind: 'row', tableName, pk: 'workspace-item', payload: expect.objectContaining(payload) }));
         const old = makeOp({ tableName, pk: 'workspace-item', payload: omitted,
             stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } });
-        await expect(adapter.push(stubEvent, makeBatch([old]))).rejects.toMatchObject({ statusCode: 426 });
-        const row = getRawDb().prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').get('workspace-item') as { data_json: string };
-        expect(JSON.parse(row.data_json)).toMatchObject(payload);
-        expect(getRawDb().prepare('SELECT count(*) AS total FROM change_log').get()).toMatchObject({ total: 1 });
+        await expect(adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'threads', pk: 'sibling' }), old]))).rejects.toMatchObject({ statusCode: 426 });
+        const rows = async <T,>(query: string): Promise<T[]> => runtime === 'd1'
+            ? (await d1TestDatabase!.database.prepare(query).all<T>()).results!
+            : getRawDb().prepare(query).all() as T[];
+        const [row] = await rows<{ data_json: string }>('SELECT data_json FROM s_' + tableName + " WHERE id = 'workspace-item'");
+        expect(row).toBeDefined();
+        expect(JSON.parse(row!.data_json)).toMatchObject(payload);
+        expect(await rows('SELECT count(*) AS total FROM change_log')).toEqual([{ total: 1 }]);
+        expect(await rows('SELECT value FROM server_version_counter')).toEqual([{ value: 1 }]);
+        expect(await rows('SELECT id FROM s_threads')).toEqual([]);
+    });
+
+    // A preflight-only guard loses this race: the canonical item acquires
+    // Files/Trash semantics after admission reads but before the atomic batch.
+    it.each(['posts', 'projects'])('guards canonical %s capability changes inside the D1 batch', async tableName => {
+        await useD1TestDatabase();
+        const first = makeOp({ tableName, pk: 'capability-race', payload: { id: 'capability-race' } });
+        await adapter.push(stubEvent, makeBatch([first]));
+        const canonical = tableName === 'posts'
+            ? { id: first.pk, post_type: 'or3:file', title: 'Saved file' }
+            : { id: first.pk, data: [{ kind: 'file', id: 'saved-file' }] };
+        const database = d1TestDatabase!.database;
+        const batch = database.batch.bind(database);
+        let raced = false;
+        database.batch = async statements => {
+            if (!raced) {
+                raced = true;
+                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName, pk: first.pk, payload: canonical,
+                    stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } })]), workspaceItemCapability: 'v1' });
+            }
+            return batch(statements);
+        };
+        await expect(adapter.push(stubEvent, makeBatch([
+            makeOp({ tableName: 'threads', pk: 'must-rollback' }),
+            makeOp({ tableName, pk: first.pk, payload: { id: first.pk, title: 'legacy overwrite' },
+                stamp: { ...first.stamp, opId: randomUUID(), clock: 3 } }),
+        ]))).rejects.toMatchObject({ statusCode: 426 });
+        expect(raced).toBe(true);
+        expect((await database.prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').bind(first.pk).all<{ data_json: string }>()).results?.map(row => JSON.parse(row.data_json)))
+            .toEqual([canonical]);
+        expect((await database.prepare('SELECT value FROM server_version_counter').all()).results).toEqual([{ value: 2 }]);
+        expect((await database.prepare('SELECT count(*) AS total FROM change_log').all()).results).toEqual([{ total: 2 }]);
+        expect((await database.prepare('SELECT id FROM s_threads').all()).results).toEqual([]);
     });
 
     it('executes the shared bootstrap and revision contract', async () => {
@@ -2104,6 +2185,44 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('notification ownership', () => {
+        // A cursor advances over other users' filtered changes. The owner's
+        // delete must remain visible after that gap, including ownerless wire
+        // payloads emitted by the host's delete capture.
+        it.each(['sqlite', 'd1'].flatMap(runtime => ['object', 'absent'].map(payloadMode => ({ runtime, payloadMode }))))('delivers an own notification delete with $payloadMode payload to the peer after filtered changes on $runtime', async ({ runtime, payloadMode }) => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'deleted-note' })]));
+            const peer = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 20 });
+            expect(peer.changes.map(change => change.pk)).toEqual(['deleted-note']);
+            await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'filtered-note' })]));
+            const deletion = makeOp({ tableName: 'notifications', pk: 'deleted-note', operation: 'delete',
+                payload: { id: 'deleted-note', deleted: true },
+                stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } });
+            if (payloadMode === 'absent') delete deletion.payload;
+            const result = await adapter.push(alice, makeBatch([deletion]));
+            expect(result.results[0]).toMatchObject({ success: true, applied: true, serverVersion: 3 });
+            const changes = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: peer.nextCursor, limit: 20 });
+            expect(changes.changes).toEqual([expect.objectContaining({ tableName: 'notifications', pk: 'deleted-note', op: 'delete',
+                payload: expect.objectContaining({ user_id: 'user-alice' }) })]);
+            expect(changes.nextCursor).toBe(3);
+            const foreign = await adapter.pull(bob, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 20 });
+            expect(foreign.changes).toEqual([]);
+            expect(foreign.nextCursor).toBe(3);
+            const replay = await adapter.push(alice, makeBatch([deletion]));
+            expect(replay.results[0]).toMatchObject({ success: true, replayed: true, serverVersion: 3 });
+            expect(replay.serverVersion).toBe(3);
+            // A lost acknowledgement can cross an upgrade. Earlier delete
+            // receipts lack the server-owned user_id; intent is still equal.
+            const query = 'UPDATE change_log SET payload_json = ? WHERE op_id = ?';
+            if (runtime === 'd1') await d1TestDatabase!.database.prepare(query).bind(JSON.stringify(deletion.payload) ?? null, deletion.stamp.opId).run();
+            else getRawDb().prepare(query).run(JSON.stringify(deletion.payload) ?? null, deletion.stamp.opId);
+            const upgradedReplay = await adapter.push(alice, makeBatch([deletion]));
+            expect(upgradedReplay.results[0]).toMatchObject({ success: true, replayed: true, serverVersion: 3 });
+            expect(upgradedReplay.serverVersion).toBe(3);
+            const foreignReplay = await adapter.push(bob, makeBatch([deletion]));
+            expect(foreignReplay.results[0]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
+        });
         // A denied concurrent write must neither consume a version nor leave
         // gaps between successful operations in the same atomic push.
         it('keeps D1 notification ownership atomic across concurrent first puts', async () => {
