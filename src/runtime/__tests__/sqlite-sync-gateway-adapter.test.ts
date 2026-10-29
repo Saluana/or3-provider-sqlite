@@ -440,7 +440,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 await expect(adapter.finalizeChatGeneration(intruder, { admission: history, snapshot: snapshot() })).rejects.toThrow();
             }
             getRawDb().prepare("UPDATE workspace_members SET role = 'viewer' WHERE id = 'usage-membership'").run();
-            await expect(adapter.finalizeChatGeneration(actor, { admission: history, snapshot: snapshot() })).rejects.toThrow('Forbidden');
+            await expect(adapter.finalizeChatGeneration(actor, { admission: history, snapshot: snapshot() })).rejects.toMatchObject({ code: 'FORBIDDEN' });
             expect((await readCanonical()).data).not.toHaveProperty('usage');
         });
 

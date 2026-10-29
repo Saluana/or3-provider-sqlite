@@ -152,6 +152,11 @@ function uid(): string {
     return globalThis.crypto.randomUUID();
 }
 
+function parseRequiredHistoryAdmission(input: unknown): ChatGenerationAdmissionEnvelope {
+    try { return parseChatGenerationAdmissionEnvelope(input); }
+    catch (cause) { throw Object.assign(new Error('Invalid background history admission', { cause }), { code: 'VALIDATION_ERROR' }); }
+}
+
 function nowEpoch(): number {
     return Math.floor(Date.now() / 1000);
 }
@@ -949,7 +954,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     private assertCanonicalActor(actor: CanonicalHistoryActor): void {
         if (isD1Driver()) {
-            throw new Error('SQLite D1 does not support background generation history v1');
+            throw Object.assign(new Error('SQLite D1 does not support background generation history v1'), { code: 'UNSUPPORTED' });
         }
         const membership = getRawDb()
             .prepare(
@@ -958,7 +963,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             )
             .get(actor.workspaceId, actor.userId) as { role: string } | undefined;
         if (!membership || (membership.role !== 'owner' && membership.role !== 'editor')) {
-            throw new Error('Forbidden background history actor');
+            throw Object.assign(new Error('Forbidden background history actor'), { code: 'FORBIDDEN' });
         }
     }
 
@@ -966,9 +971,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         actor: CanonicalHistoryActor,
         input: ChatGenerationAdmissionEnvelope
     ): Promise<AdmitChatGenerationResult> {
-        const admission = parseChatGenerationAdmissionEnvelope(input);
+        const admission = parseRequiredHistoryAdmission(input);
         if (actor.workspaceId !== admission.workspaceId) {
-            throw new Error('Invalid background history workspace');
+            throw Object.assign(new Error('Invalid background history workspace'), { code: 'VALIDATION_ERROR' });
         }
         const raw = getRawDb();
         const fingerprint = createHash('sha256')
@@ -988,7 +993,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 | undefined;
             if (receipt) {
                 if (receipt.fingerprint !== fingerprint) {
-                    throw new Error('Conflicting background admission replay');
+                    throw Object.assign(new Error('Conflicting background admission replay'), { code: 'CONFLICT' });
                 }
                 return {
                     status: 'admitted' as const,
@@ -1023,7 +1028,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         admission.expectedAssistant?.generationId !== undefined &&
                         generationId !== admission.expectedAssistant.generationId)
                 ) {
-                    throw new Error('Conflicting continuation admission');
+                    throw Object.assign(new Error('Conflicting continuation admission'), { code: 'CONFLICT' });
                 }
             }
 
@@ -1072,7 +1077,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     { clock: entry.record.clock, hlc, opId },
                     tombstone
                 )) {
-                    throw new Error('Background history record was superseded');
+                    throw Object.assign(new Error('Background history record was superseded'), { code: 'SUPERSEDED' });
                 }
                 const sanitized = sanitizePayloadForSync(
                     entry.table,
@@ -1080,12 +1085,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     'put'
                 );
                 if (!sanitized) {
-                    throw new Error('Invalid background history payload');
+                    throw Object.assign(new Error('Invalid background history payload'), { code: 'VALIDATION_ERROR' });
                 }
                 const payload = { ...sanitized, hlc, op_id: opId };
                 const payloadJson = JSON.stringify(payload);
                 if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
-                    throw new Error('Invalid background history payload size');
+                    throw Object.assign(new Error('Invalid background history payload size'), { code: 'VALIDATION_ERROR' });
                 }
                 const version = baseVersion + index + 1;
                 raw.prepare(
@@ -1142,7 +1147,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 admittedAssistant.clock !== admission.assistantMessage.clock ||
                 admittedData.generation_id !== admission.generationId
             ) {
-                throw new Error('Background assistant admission was superseded');
+                throw Object.assign(new Error('Background assistant admission was superseded'), { code: 'SUPERSEDED' });
             }
             raw.prepare(
                 `INSERT INTO background_generation_receipts
@@ -1169,9 +1174,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             snapshot: CanonicalGenerationSnapshot;
         }
     ): Promise<FinalizeChatGenerationResult> {
-        const admission = parseChatGenerationAdmissionEnvelope(input.admission);
+        const admission = parseRequiredHistoryAdmission(input.admission);
         if (actor.workspaceId !== admission.workspaceId) {
-            throw new Error('Invalid background history workspace');
+            throw Object.assign(new Error('Invalid background history workspace'), { code: 'VALIDATION_ERROR' });
         }
         const raw = getRawDb();
         const fingerprint = createHash('sha256')
@@ -1190,7 +1195,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 | undefined;
             if (receipt) {
                 if (receipt.fingerprint !== fingerprint) {
-                    throw new Error('Conflicting background finalization replay');
+                    throw Object.assign(new Error('Conflicting background finalization replay'), { code: 'CONFLICT' });
                 }
                 return receipt.outcome === 'committed'
                     ? {
@@ -1261,7 +1266,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             };
             const payloadJson = JSON.stringify(payload);
             if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
-                throw new Error('Invalid background history payload size');
+                throw Object.assign(new Error('Invalid background history payload size'), { code: 'VALIDATION_ERROR' });
             }
             const counter = raw
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
