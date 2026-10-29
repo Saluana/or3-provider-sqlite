@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { initializeSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { initializeSqliteDb, getSqliteDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { SqliteAuthWorkspaceStore } from '../server/auth/sqlite-auth-workspace-store';
 import {
@@ -42,12 +42,16 @@ describe('sqlite admin stores', () => {
         const members = await accessStore.listMembers({ workspaceId });
         expect(members.some((m) => m.email === 'member@example.com')).toBe(true);
 
+        await getSqliteDb().updateTable('workspaces')
+            .set({ created_at: 1_700_000_000 }).where('id', '=', workspaceId).execute();
         const workspaces = await accessStore.listWorkspaces({
             page: 1,
             perPage: 20,
         });
         expect(workspaces.total).toBe(1);
-        expect(workspaces.items[0]?.id).toBe(workspaceId);
+        expect(workspaces.items[0]).toMatchObject({ id: workspaceId, createdAt: 1_700_000_000_000 });
+        expect(await accessStore.getWorkspace({ workspaceId }))
+            .toMatchObject({ createdAt: 1_700_000_000_000 });
     });
 
     it('persists workspace settings', async () => {
@@ -226,8 +230,12 @@ describe('sqlite admin stores', () => {
         await adminStore.grantAdmin({ userId });
         expect(await adminStore.isAdmin({ userId })).toBe(true);
 
+        await getSqliteDb().updateTable('admin_users')
+            .set({ created_at: 1_700_000_000 }).where('user_id', '=', userId).execute();
         const admins = await adminStore.listAdmins();
-        expect(admins.some((admin) => admin.userId === userId)).toBe(true);
+        expect(admins).toContainEqual(expect.objectContaining({
+            userId, createdAt: 1_700_000_000_000,
+        }));
 
         await adminStore.revokeAdmin({ userId });
         await adminStore.revokeAdmin({ userId });

@@ -2,6 +2,8 @@
 
 SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, self-hosted alternative to Convex for SSR cloud mode.
 
+Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Development and CI pin **24.22.1** in `.node-version`.
+
 ## What it provides
 
 - **AuthWorkspaceStore** (`sqlite`) — user identity mapping, workspace CRUD, role resolution
@@ -10,6 +12,44 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 - **WebhookStore** (`sqlite`) — durable webhook registrations and delivery logs (local, Bun, and Turso runtimes)
 - **Admin stores** (`sqlite`) — workspace access/lifecycle, workspace settings, user search, and deployment-admin grants (local, Bun, and Turso runtimes)
 - **RateLimitProvider** (`sqlite`) — durable rate-limit counters
+
+SSR-authenticated deployments also activate SQLite when it is selected only by
+`OR3_LIMITS_ENABLED=true` and `OR3_LIMITS_STORAGE_PROVIDER=sqlite`, independently
+of the account workspace backend.
+
+Canonical storage queries include bounded retained deleted metadata pages and
+advertise `retainedStorageMetadata: 'v1'` on native SQLite and D1. Missing sizes in
+delete-before-put rows remain unknown; these reads never replay sync history.
+
+Upload quota admission groups unexpired pending authorizations by hash and
+reserves atomically on native SQLite and D1. Migration 027 replaces the
+metadata-derived charges from migration 026 with persisted, verified consumed
+upload receipts. Client-authored file sizes cannot create retained charges.
+Trash, logical deletion and receipt replay expiry do not release verified
+charges; restoring the same hash does not double-charge it. A larger upload
+reserves the difference above its verified retained size.
+
+Pre-receipt files and raw incomplete uploads are outside this verified ledger;
+metadata alone cannot prove their physical size. Existing consumed receipts are
+retained and reconciled during upgrade. Physical filesystem/S3 GC remains
+disabled. The provider advertises `atomicUploadQuota: 'retained-v1'`; configure
+`OR3_STORAGE_WORKSPACE_QUOTA_BYTES` to enforce a quota (the default is unlimited).
+
+Migrations 027–028 are forward-only. Keep a pre-upgrade database backup;
+rolling back the provider requires restoring that snapshot because the old
+adapter expects the previous device-cursor unique key.
+
+`watchVersion` shares one indexed workspace version-counter read every two
+seconds per workspace per process across notification listeners. The host can
+wake its ordinary sync pull immediately when the counter changes and use a
+one-minute safety pull while connected. Last-listener teardown stops the timer;
+unsupported notification routes retain normal gateway polling.
+
+Background chat admissions emit the existing thread and user-message create hooks after commit when those rows are newly created. Replayed admissions do not emit them again; hook delivery failures do not fail admission.
+
+## Atomic webhook registration quotas
+
+The webhook store advertises `registrationLimit: 'atomic-v1'`. `createWebhook(input, limit)` checks the user/workspace quota (or instance-wide admin quota) in the same immediate transaction as insertion. Independent connections share the limit; exhaustion throws `WEBHOOK_LIMIT_EXCEEDED`. The optional argument leaves non-quota internal calls unchanged. OR3 Chat requires this capability for registration; ship this provider change before integrating the coordinated host change.
 
 ## Install
 
@@ -181,12 +221,23 @@ All tables use snake_case aligned with the sync wire format.
 
 ### Sync semantics
 
-- **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` block → writes change_log → applies LWW to materialized tables → upserts tombstones for deletes
+- **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` values for admitted change-log entries → applies LWW to materialized tables → upserts tombstones for deletes. D1 admission and version allocation share one atomic batch; rejected notification races consume no versions.
 - **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, `oldestRetainedVersion`, and `requiresSnapshot` when the cursor is behind retained history
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
-- **Cursor**: forward-only per-device cursor tracking
+- **Cursor**: forward-only tracking per authenticated user and device within a workspace. Migration 028 changes the unique key so accounts sharing a browser device ID cannot claim each other’s acknowledgements. Legacy unowned rows are never adopted and expire through normal cursor GC.
 - **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
-- **Notifications**: push forces `payload.user_id` to the session user; foreign notification writes are rejected; pull/snapshot omit other users' rows
+- **Notifications**: push forces `payload.user_id` to the session user on puts and deletes; foreign notification writes are rejected. Successful deletes remain visible to the owner's other devices while pull/snapshot omit other users' rows.
+- **Workspace Files/Trash admission**: a client without `workspaceItemCapability: 'v1'` cannot replace or delete a canonical post/project carrying workspace Files/Trash semantics, even if the submitted payload omits those fields. Native write transactions and the D1 atomic batch check canonical state before any operation or version allocation; a rejected batch returns HTTP 426 and leaves sibling writes unchanged.
+
+Snapshot continuations are bound to the capturing user and workspace, including
+backup snapshots. Each user retains at most four copies per workspace across
+both modes. A newer capture can supersede the oldest chain; expired,
+superseded, and pre-upgrade tokens return HTTP 410 and require a fresh capture.
+Copies expire after one hour. Native runtimes prune expired copies at startup
+and every minute; D1 prunes on requests at most once per minute. Deleting a
+snapshot also removes its copied items.
+If a D1 snapshot is evicted while a page is being read, that request also returns
+HTTP 410 instead of acknowledging a truncated final page.
 
 LWW conflict resolution: incoming wins when `clock` is higher, then when clocks are equal and `hlc` is lexicographically greater, then when `op_id` is greater. Tombstones use the same `(clock, hlc, op_id)` tuple. LWW losers return `applied: false` with the current winner as either `{ kind: 'put', payload, revision }` or `{ kind: 'delete', revision, serverDeletedAt? }`. Idempotent `op_id` retries return `replayed: true` and, if superseded, the current winner. A replay does not allocate another server version.
 
@@ -207,6 +258,11 @@ model execution there; ordinary sync and other D1 features are unchanged.
 - Full workspace CRUD with role-based access checks
 
 ## Backup
+
+Workspace archives use `backupSnapshot` to include retained Trash file metadata
+and originals. Normal sync snapshots continue to emit tombstones. Archive pages
+share a frozen SQLite/D1 transaction snapshot and reject tokens from another
+snapshot mode. Backup reads do not remove originals or unfinished uploads.
 
 For local-file and Bun runtimes, everything lives in a single SQLite file:
 
@@ -244,8 +300,16 @@ mismatched source rather than falling back to fixtures. See the
 ### Known differences vs Convex
 
 - Single-process SQLite vs distributed Convex backend
-- No real-time subscriptions (gateway polling only)
+- Gateway version notifications use a shared counter poll; no native reactive SQLite subscription
 - Migrations run on boot, or on the first Worker request for D1; schema changes require restart
+
+## Admin maintenance
+
+**Operations → Maintenance** labels the history tools **Clear old sync history**
+(`sync.gc-change-log`) and **Clear old deletion history** (`sync.gc-tombstones`).
+Descriptions explain the retention period and active-device requirements without
+internal terminology. They wrap fully on narrow screens. These tools preserve
+current chats and files; they do not empty Trash or remove stored files.
 
 ## Troubleshooting
 
@@ -285,13 +349,19 @@ installed package, so local development does not publish these changes.
 
 `canonicalChatHistory: 'v1'` and `readChatHistory` read current `s_threads`/`s_messages`, with explicit workspace membership (owner/editor/viewer), bounded by-ID queries and canonical `(index, order_key, id)` keyset pages. Migration 022 adds transactional per-thread revision triggers. Migration 023 matches the index to legacy missing-order-key normalization and preserves the existing orphan-row cleanup lifecycle; revision bookkeeping does not add a foreign key to otherwise independent sync rows. Current-chat tool result writes do not invalidate ancestor search cursors. The reader never consults retained sync logs. D1 omits the capability.
 
-The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane covers three files, including the real gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. Missing ancestor project provenance must fail closed after a canonical purge. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. This compaction capability is not yet included in a published package.
+The additive local qualification command is `bun run build` followed by `bunx vitest run --config vitest.canonical-history.config.ts`. It checks committed current host contract bytes without replacing the older pinned fixture. The current-host lane passes 119 cases across three files, including the real gateway owner and source-built artifact reads after change-log deletion, legacy tie paging in both directions, bounded queries, revision changes, cancellation, revoked membership and an index plan without a temporary sort. These checks do not qualify a deployed rollout, second-client/background reconciliation or released pins. This compaction capability is not yet included in a published package.
 
 The canonical-history qualification lane defaults to a sibling `../or3-chat` checkout. For an isolated host worktree, set `OR3_CANONICAL_HOST_ROOT=/absolute/path/to/or3-chat` before the command. Install the host dependencies too; the two-client fixture resolves its IndexedDB test dependency from that checkout. Its contract-byte checks fail closed on uncommitted changes; this does not replace the pinned host fixture or certify deployed/released provider behavior.
 
 ## Workspace Files and Trash admission
 
-Persistent Projects uses this same capability for opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts. Preserve their JSON, metadata, and every original/extraction `file_hashes` reference. The project-aware canonical reader resolves `threads.project_id` or a single legacy membership in its authorized SQLite snapshot, returning `project_ownership: resolved | conflict`. String entries and JSON-encoded membership arrays remain supported; malformed or ambiguous memberships do not grant server execution. Hosts without this result must refuse project-sensitive server admission rather than infer ownership from the visible UI.
+Persistent Projects uses this same capability for opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts. Preserve their JSON, metadata, and every original/extraction `file_hashes` reference. The project-aware canonical reader resolves `threads.project_id` or a single legacy membership in its authorized SQLite snapshot, returning `project_ownership: resolved | conflict`. String entries and JSON-encoded membership arrays remain supported; chat IDs are trimmed and entry kinds ignore case and surrounding whitespace, matching the host's legacy normalization. Malformed or ambiguous memberships do not grant server execution. Hosts without this result must refuse project-sensitive server admission rather than infer ownership from the visible UI.
+
+Explicit ownership requires a live project in the same workspace. A missing or deleted project releases the chat even if a concurrent thread write retained its former pointer; legacy folders do not override that explicit release. Canonical reads leave the persisted pointer untouched.
+
+Current hosts refuse server tools and workflows when the reader cannot return
+resolved canonical ownership. Older providers require an upgrade even for chats
+with no explicit project pointer, because legacy folder membership may own them.
 
 Version 0.0.15 declares `projectOwnership: 'v1'` on the native canonical-history adapter. D1 does not advertise this contract. Projects qualification: `OR3_PROJECT_HOST_ROOT=/absolute/path/to/or3-chat bun x vitest run src/runtime/__tests__/sqlite-sync-gateway-adapter.test.ts`. This explicit lane uses the host's canonical-reader query contract while retaining the pinned standalone fixture for existing contracts. Qualify the published exact version with the disposable host cloud journey.
 
@@ -309,26 +379,24 @@ release/update workflow separately. Local qualification does not authorize
 publication or a production migration. Files cloud exposure remains gated until
 the supported profile is qualified.
 
-## Retained storage accounting (unreleased)
+## Instance signup invitations
 
-The adapter advertises `retainedStorageMetadata: 'v1'`. The read-only
-`retained_metadata` canonical storage query pages logically deleted
-`s_file_meta` rows within the requested workspace, using the existing hash
-filter and bounded keyset pagination. These observations survive change-log
-and tombstone pruning. A winning restoration moves the row back to
-`live_metadata`; it is not counted in both views.
+The updated host distinguishes signup invites from existing team invites. Signup invites create a private workspace with only the recipient as owner; team invites retain their selected workspace and role. This requires the updated host and rebuilt provider artifacts, rather than the existing published release alone.
 
-A retained row with a known nonnegative safe-integer size reports `sizeBytes`,
-including zero. A delete-before-put placeholder or invalid/missing size leaves
-`sizeBytes` absent. Consumers must report this uncertainty rather than treating
-it as zero bytes.
+Native SQLite implements five optional AuthWorkspaceStore methods with one additive signup_invites migration and one immediate acceptance transaction. User, identity mapping, recipient-only workspace membership, active pointer, and acceptance receipt commit together. Replay performs no provisioning writes. D1 deliberately does not advertise these methods. Dates are milliseconds; history pages contain at most 100 rows without hashes, with 90-day terminal retention and cleanup capped at 100 records per create/list call.
 
-Logical upload quota admission remains active metadata plus active reservations.
-Deleted metadata releases that logical quota while its stored object can still
-occupy disk. Retained metadata is an accounting observation, not proof that the
-object exists or a measurement of actual disk usage. Physical usage and
-incomplete uploads require storage-provider inventory.
+### Short signup codes
 
-This capability grants no physical deletion authority, adds no deletion
-coordinator, and does not qualify any provider profile for physical deletion.
-It does not change the existing D1 admission or concurrency guarantees.
+New signup invitations use eight random characters (shown as `K7MP-4X9Q`) and retain clickable invite links. Lowercase, spaces, and an optional dash are accepted. The host hashes codes with HMAC using `OR3_AUTH_INVITE_TOKEN_SECRET`, shares a 20/minute/IP lookup limit across invitation entry points, and preserves email binding, expiry, revocation, and atomic single use. Previously issued signed links remain supported. Codes and hashes are omitted from invitation history.
+
+`findSignupInviteByTokenHash` resolves pending proofs through the existing unique `token_hash` index and returns only ID, email, and expiry to the host. No new migration is required. D1 continues to omit signup invitation capabilities.
+
+## Dashboard restart drain accounting
+
+The background provider implements `getShutdownBlockerCount`: streaming jobs
+(including browser-tool handoffs and workflows), pending admission and terminal
+history delivery prevent replacement. Database failures propagate so the host
+cancels preparation and restores admission rather than treating failure as idle.
+An additive covering index migration keeps counts off stored response bodies.
+
+Admin workspace summaries, workspace details, and deployment-admin lists expose `createdAt` in Unix milliseconds for the host UI. SQLite continues to store the underlying creation timestamps in Unix seconds; no data migration is needed.

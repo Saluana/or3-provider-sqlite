@@ -25,6 +25,10 @@ export default [
                 console: 'readonly',
                 process: 'readonly',
                 Buffer: 'readonly',
+                setTimeout: 'readonly',
+                clearTimeout: 'readonly',
+                setInterval: 'readonly',
+                clearInterval: 'readonly',
 
                 // Nitro/Nuxt auto-import globals used by runtime/server/*
                 defineNitroPlugin: 'readonly',

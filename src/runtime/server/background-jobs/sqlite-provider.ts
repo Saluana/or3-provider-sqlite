@@ -838,6 +838,20 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         );
         return row?.total ?? 0;
     }
+
+    async getShutdownBlockerCount(): Promise<number> {
+        // Disjoint, covering-index counts avoid loading execution/response blobs.
+        // Terminal jobs still block while admission or history delivery is pending.
+        const row = await one<{ total: number }>(
+            `SELECT
+                (SELECT COUNT(*) FROM background_jobs WHERE status = 'streaming') +
+                (SELECT COUNT(*) FROM background_jobs
+                 WHERE history_phase IN ('admission_pending', 'finalization_pending')
+                   AND status != 'streaming') AS total`
+        );
+        if (!row) throw new Error('SQLite shutdown accounting unavailable');
+        return row.total;
+    }
 }
 
 export const sqliteBackgroundJobProvider = new SqliteBackgroundJobProvider();

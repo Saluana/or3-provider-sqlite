@@ -102,6 +102,7 @@ function toDeliveryLog(row: DeliveryLogRow): WebhookDeliveryLog {
 }
 
 class SqliteWebhookStore implements WebhookStore {
+    readonly registrationLimit = 'atomic-v1' as const;
     constructor(private readonly db: SqliteDatabase) {
         this.initialize();
     }
@@ -186,7 +187,8 @@ class SqliteWebhookStore implements WebhookStore {
         webhook: Omit<
             WebhookRegistration,
             'id' | 'health' | 'created_at' | 'updated_at'
-        >
+        >,
+        registrationLimit?: number
     ): Promise<WebhookRegistration> {
         const now = Date.now();
         const row: WebhookRegistration = {
@@ -198,6 +200,14 @@ class SqliteWebhookStore implements WebhookStore {
         };
 
         const create = this.db.transaction(() => {
+            if (registrationLimit !== undefined) {
+                if (!Number.isSafeInteger(registrationLimit) || registrationLimit < 1) throw new Error('Invalid webhook registration limit');
+                const count = this.db.prepare(webhook.scope === 'admin'
+                    ? "SELECT COUNT(*) AS count FROM webhook_registrations WHERE scope = 'admin'"
+                    : "SELECT COUNT(*) AS count FROM webhook_registrations WHERE scope = 'user' AND user_id = ? AND workspace_id = ?")
+                    .get(...(webhook.scope === 'admin' ? [] : [webhook.user_id, webhook.workspace_id])) as { count: number };
+                if (count.count >= registrationLimit) throw Object.assign(new Error('Webhook limit exceeded'), { code: 'WEBHOOK_LIMIT_EXCEEDED' });
+            }
             this.db
                 .prepare(
                     `
@@ -234,7 +244,7 @@ class SqliteWebhookStore implements WebhookStore {
             }
         });
 
-        create();
+        create.immediate();
         return row;
     }
 
@@ -711,15 +721,17 @@ class SqliteWebhookStore implements WebhookStore {
  * completes instead of creating a second database connection.
  */
 class LazySqliteWebhookStore implements WebhookStore {
+    readonly registrationLimit = 'atomic-v1' as const;
     constructor(private readonly store: Promise<SqliteWebhookStore>) {}
 
     createWebhook(
         webhook: Omit<
             WebhookRegistration,
             'id' | 'health' | 'created_at' | 'updated_at'
-        >
+        >,
+        registrationLimit?: number
     ) {
-        return this.store.then((store) => store.createWebhook(webhook));
+        return this.store.then((store) => store.createWebhook(webhook, registrationLimit));
     }
 
     updateWebhook(
