@@ -10,6 +10,7 @@ import {
     generationGuardTriggers, canonicalGuardSql, generationHashSql, validGenerationHashSql,
     validGenerationObjectSql, generationReferencesSql, validGenerationReferencesSql,
 } from '../db/storage-generation-guards';
+import { generationUploadGuardTriggers } from '../db/storage-generation-upload-guards';
 
 type GenerationRow = {
     generation_id: string; workspace_id: string; hash: string; storage_provider_id: string;
@@ -19,14 +20,14 @@ type GenerationRow = {
 };
 type Proof = 'in_use' | 'unknown_references' | 'proof_incomplete' | null;
 
-function identifier(value: string, name: string, max = 256): void {
+export function assertGenerationIdentifier(value: string, name: string, max = 256): void {
     if (typeof value !== 'string' || !value || value.length > max || value !== value.trim()
         || [...value].some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) {
         throw new Error(`Invalid storage generation ${name}`);
     }
 }
 
-function record(row: GenerationRow): ExternalStorageGenerationRecord {
+export function generationRecord(row: GenerationRow): ExternalStorageGenerationRecord {
     return {
         workspaceId: row.workspace_id, hash: row.hash, generationId: row.generation_id,
         storageId: row.storage_id, sizeBytes: row.size_bytes, state: row.state,
@@ -45,11 +46,11 @@ function record(row: GenerationRow): ExternalStorageGenerationRecord {
 export class SqliteExternalStorageGenerationCoordinator implements ExternalStorageGenerationCoordinatorV1 {
     readonly version = 1 as const;
     readonly storageProviderId: string;
-    private readonly raw: SqliteRawDatabase;
+    protected readonly raw: SqliteRawDatabase;
 
     constructor(options: { storageProviderId: string; database?: SqliteRawDatabase }) {
         this.assertSupportedDriver();
-        identifier(options.storageProviderId, 'storage provider');
+        assertGenerationIdentifier(options.storageProviderId, 'storage provider');
         this.storageProviderId = options.storageProviderId;
         this.raw = options.database ?? getRawDb();
     }
@@ -60,10 +61,10 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         }
     }
 
-    private key(input: ExternalStorageGenerationKey): ExternalStorageGenerationKey {
+    protected key(input: ExternalStorageGenerationKey): ExternalStorageGenerationKey {
         this.assertSupportedDriver();
-        identifier(input.workspaceId, 'workspace');
-        identifier(input.generationId, 'generation');
+        assertGenerationIdentifier(input.workspaceId, 'workspace');
+        assertGenerationIdentifier(input.generationId, 'generation');
         if (typeof input.hash !== 'string' || input.hash.length > 71) throw new Error('Invalid storage generation hash');
         const value = this.raw.prepare(`SELECT ${validGenerationHashSql('hash')} AS valid,
             ${generationHashSql('hash')} AS hash FROM (SELECT ? AS hash)`).get(input.hash) as { valid: number; hash: string };
@@ -74,7 +75,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
     private assertIntegrity(): void {
         const actual = new Map((this.raw.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger'").all() as
             { name: string; sql: string }[]).map(row => [row.name, canonicalGuardSql(row.sql)]));
-        for (const [name, sql] of Object.entries(generationGuardTriggers())) {
+        for (const [name, sql] of Object.entries({ ...generationGuardTriggers(), ...generationUploadGuardTriggers() })) {
             if (actual.get(name) !== canonicalGuardSql(sql)) throw new Error(`Storage generation guard integrity failure: ${name}`);
         }
     }
@@ -90,7 +91,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         }
     }
 
-    private mutate<T>(fn: () => T): T {
+    protected mutate<T>(fn: () => T): T {
         this.assertSupportedDriver();
         if (this.raw.inTransaction !== false) {
             throw new Error('Storage generation coordination requires its own durable transaction, not an outer transaction or unqualified connection.');
@@ -102,23 +103,23 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         }).immediate();
     }
 
-    private now(): number {
+    protected now(): number {
         return (this.raw.prepare('SELECT unixepoch() AS now').get() as { now: number }).now;
     }
 
-    private find(key: ExternalStorageGenerationKey): GenerationRow | undefined {
+    protected find(key: ExternalStorageGenerationKey): GenerationRow | undefined {
         return this.raw.prepare(`SELECT * FROM ${GENERATION_TABLE}
             WHERE workspace_id = ? AND hash = ? AND generation_id = ? AND storage_provider_id = ?`)
             .get(key.workspaceId, key.hash, key.generationId, this.storageProviderId) as GenerationRow | undefined;
     }
 
-    private head(key: ExternalStorageGenerationKey): GenerationRow | undefined {
+    protected head(key: ExternalStorageGenerationKey): GenerationRow | undefined {
         return this.raw.prepare(`SELECT generation.* FROM ${HEAD_TABLE} head
             JOIN ${GENERATION_TABLE} generation ON generation.generation_id = head.generation_id
             WHERE head.workspace_id = ? AND head.hash = ?`).get(key.workspaceId, key.hash) as GenerationRow | undefined;
     }
 
-    private metadataProof(key: ExternalStorageGenerationKey, includeDeleted: boolean, storageId?: string): Proof {
+    protected metadataProof(key: ExternalStorageGenerationKey, includeDeleted: boolean, storageId?: string): Proof {
         const rows = this.raw.prepare(`SELECT deleted, ${generationHashSql('id')} AS hash,
             ${validGenerationHashSql('id')} AS valid_hash,
             CASE WHEN ${validGenerationObjectSql('data_json')} = 0 THEN 0
@@ -137,7 +138,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         return relevant.some(row => row.hash === key.hash || (storageId !== undefined && row.storage_id === storageId)) ? 'in_use' : null;
     }
 
-    private referenceProof(key: ExternalStorageGenerationKey, includeDeleted: boolean): Proof {
+    protected referenceProof(key: ExternalStorageGenerationKey, includeDeleted: boolean): Proof {
         let totalRows = 0;
         let totalEdges = 0;
         let inUse = false;
@@ -166,7 +167,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         status: 'registered' | 'replayed'; generation: ExternalStorageGenerationRecord;
     }> {
         const key = this.key(input);
-        identifier(input.storageId, 'storage target', 2048);
+        assertGenerationIdentifier(input.storageId, 'storage target', 2048);
         if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) throw new Error('Invalid storage generation size');
         return this.mutate(() => {
             const existing = this.raw.prepare(`SELECT * FROM ${GENERATION_TABLE} WHERE generation_id = ? OR storage_id = ?`)
@@ -178,7 +179,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
                     || row.storage_id !== input.storageId || row.size_bytes !== input.sizeBytes) {
                     throw new Error('Storage generation identity or target cannot be reused');
                 }
-                return { status: 'replayed', generation: record(row) };
+                return { status: 'replayed', generation: generationRecord(row) };
             }
             const head = this.head(key);
             if (head && (head.storage_provider_id !== this.storageProviderId || head.state === 'verified')) {
@@ -197,7 +198,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
                 .run(key.generationId, key.workspaceId, key.hash);
             else this.raw.prepare(`INSERT INTO ${HEAD_TABLE} (workspace_id, hash, generation_id) VALUES (?, ?, ?)`)
                 .run(key.workspaceId, key.hash, key.generationId);
-            return { status: 'registered', generation: record(this.find(key)!) };
+            return { status: 'registered', generation: generationRecord(this.find(key)!) };
         });
     }
 
@@ -205,19 +206,19 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         const key = this.key(input);
         return this.mutate(() => {
             const row = this.find(key);
-            return row ? record(row) : null;
+            return row ? generationRecord(row) : null;
         });
     }
 
     async claimGeneration(input: ExternalStorageGenerationKey & { claimId: string; retentionSeconds: number }): Promise<ExternalStorageGenerationClaimResult> {
         const key = this.key(input);
-        identifier(input.claimId, 'claim');
+        assertGenerationIdentifier(input.claimId, 'claim');
         if (!Number.isSafeInteger(input.retentionSeconds) || input.retentionSeconds < 0) throw new Error('Invalid storage retention interval');
         return this.mutate(() => {
             const row = this.find(key);
             if (!row) return { status: 'blocked', reason: 'missing' };
             if (row.state !== 'verified') return row.claim_id === input.claimId
-                ? { status: 'replayed', generation: record(row) } : { status: 'blocked', reason: 'claim_conflict' };
+                ? { status: 'replayed', generation: generationRecord(row) } : { status: 'blocked', reason: 'claim_conflict' };
             if (this.head(key)?.generation_id !== key.generationId) return { status: 'blocked', reason: 'not_current' };
             const proof = this.metadataProof(key, false, row.storage_id) ?? this.referenceProof(key, false);
             if (proof) return { status: 'blocked', reason: proof };
@@ -243,7 +244,7 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
             }
             this.raw.prepare(`UPDATE ${GENERATION_TABLE} SET state = 'claimed', claim_id = ?, claimed_at = ?, last_activity_at = ?
                 WHERE generation_id = ? AND state = 'verified'`).run(input.claimId, now, lastActivity, key.generationId);
-            return { status: 'claimed', generation: record(this.find(key)!) };
+            return { status: 'claimed', generation: generationRecord(this.find(key)!) };
         });
     }
 
@@ -251,16 +252,16 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         status: 'deleted' | 'replayed'; generation: ExternalStorageGenerationRecord;
     }> {
         const key = this.key(input);
-        identifier(input.claimId, 'claim');
+        assertGenerationIdentifier(input.claimId, 'claim');
         return this.mutate(() => {
             const row = this.find(key);
             if (!row || row.claim_id !== input.claimId || row.state === 'verified') throw new Error('Storage generation claim mismatch');
-            if (row.state === 'deleted') return { status: 'replayed', generation: record(row) };
+            if (row.state === 'deleted') return { status: 'replayed', generation: generationRecord(row) };
             const now = this.now();
             if (row.claimed_at === null || now < row.claimed_at) throw new Error('Storage generation server clock regressed');
             this.raw.prepare(`UPDATE ${GENERATION_TABLE} SET state = 'deleted', deleted_at = ? WHERE generation_id = ?`)
                 .run(now, key.generationId);
-            return { status: 'deleted', generation: record(this.find(key)!) };
+            return { status: 'deleted', generation: generationRecord(this.find(key)!) };
         });
     }
 }

@@ -404,3 +404,5 @@ Admin workspace summaries, workspace details, and deployment-admin lists expose 
 ## Dormant immutable-generation foundation (unreleased)
 
 Migration 029 adds inert generation records, current-hash heads, and canonical write barriers after the released migrations. No runtime route creates these records, no adapter advertises `externalStorageGenerations`, and physical cleanup remains disabled. See [protocol invariants and activation blockers](docs/storage-generations.md).
+
+Migration 030 adds the dormant upload ledger and restore tickets. The optional coordinator remains unregistered. See [upload, restore, and recovery invariants](docs/storage-generation-uploads.md).

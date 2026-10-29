@@ -71,6 +71,16 @@ export type ExternalStorageGenerationKey<T = any, U = any, V = any, W = any, X =
 export const ExternalStorageGenerationKey: any = undefined;
 export type ExternalStorageGenerationRecord<T = any, U = any, V = any, W = any, X = any> = any;
 export const ExternalStorageGenerationRecord: any = undefined;
+export type ExternalStorageGenerationUploadClaimKey<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadClaimKey: any = undefined;
+export type ExternalStorageGenerationUploadClaimResult<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadClaimResult: any = undefined;
+export type ExternalStorageGenerationUploadCoordinatorV1<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadCoordinatorV1: any = undefined;
+export type ExternalStorageGenerationUploadIntent<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadIntent: any = undefined;
+export type ExternalStorageGenerationUploadKey<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationUploadKey: any = undefined;
 export type FinalizeChatGenerationResult<T = any, U = any, V = any, W = any, X = any> = any;
 export const FinalizeChatGenerationResult: any = undefined;
 export type GenerationHistoryPhase<T = any, U = any, V = any, W = any, X = any> = any;
