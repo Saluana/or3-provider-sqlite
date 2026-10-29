@@ -6,11 +6,15 @@
  */
 import type {
     AuthWorkspaceStore,
+    SignupInviteSummary,
+    SignupProvisionResult,
+    SignupValidationResult,
     InviteProvisionResult,
     InviteValidationResult,
 } from '~~/server/auth/store/types';
 import type { WorkspaceRole } from '~~/app/core/hooks/hook-types';
 import { getRawDb, getSqliteDb, isD1Driver } from '../db/kysely';
+import type { SignupInvitesTable } from '../db/schema';
 import { d1All, d1Batch, d1Run } from '../db/d1';
 
 function uid(): string {
@@ -26,6 +30,108 @@ function normalizeEmail(email: string): string {
 }
 
 export class SqliteAuthWorkspaceStore implements AuthWorkspaceStore {
+    constructor() {
+        // D1 has no synchronous transaction spanning validation and all inserts.
+        if (isD1Driver()) {
+            Object.assign(this, { createSignupInvite: undefined, listSignupInvites: undefined,
+                revokeSignupInvite: undefined, validateSignupInvite: undefined, findSignupInviteByTokenHash: undefined,
+                acceptSignupInviteAndProvisionUser: undefined });
+        }
+    }
+
+    private cleanupSignupInvites(): void {
+        getRawDb().prepare('DELETE FROM signup_invites WHERE id IN (SELECT id FROM signup_invites WHERE retain_until < ? ORDER BY retain_until LIMIT 100)').run(Date.now());
+    }
+
+    async createSignupInvite(input: { id: string; email: string; token_hash: string; expires_at: number; created_by_admin: string }): Promise<{ id: string }> {
+        this.db;
+        this.cleanupSignupInvites();
+        getRawDb().prepare('INSERT INTO signup_invites (id, email, token_hash, expires_at, created_at, created_by_admin, retain_until) VALUES (?, ?, ?, ?, ?, ?, ?)')
+            .run(input.id, normalizeEmail(input.email), input.token_hash, input.expires_at, Date.now(), input.created_by_admin, input.expires_at + 90 * 86400_000);
+        return { id: input.id };
+    }
+
+    async findSignupInviteByTokenHash(input: { token_hash: string }): Promise<Pick<SignupInviteSummary, 'id' | 'email' | 'expires_at'> | null> {
+        this.db;
+        return getRawDb().prepare("SELECT id, email, expires_at FROM signup_invites WHERE token_hash = ? AND status = 'pending'")
+            .get(input.token_hash) as Pick<SignupInviteSummary, 'id' | 'email' | 'expires_at'> | undefined ?? null;
+    }
+
+    async listSignupInvites(input: { limit: number; cursor?: string }): Promise<{ invites: SignupInviteSummary[]; next_cursor: string | null }> {
+        this.db;
+        this.cleanupSignupInvites();
+        let cursor: { created_at: number; id: string } | null = null;
+        if (input.cursor) {
+            try { cursor = JSON.parse(Buffer.from(input.cursor, 'base64url').toString()); } catch { throw new Error('Invalid invite cursor'); }
+            if (!cursor || !Number.isSafeInteger(cursor.created_at) || typeof cursor.id !== 'string') throw new Error('Invalid invite cursor');
+        }
+        const limit = Math.min(100, Math.max(1, Math.trunc(input.limit)));
+        const rows = getRawDb().prepare(
+            'SELECT id, email, status, expires_at, created_at, created_by_admin, revoked_at, accepted_at, user_id, workspace_id FROM signup_invites ' +
+            (cursor ? 'WHERE (created_at, id) < (?, ?) ' : '') + 'ORDER BY created_at DESC, id DESC LIMIT ?'
+        ).all(...(cursor ? [cursor.created_at, cursor.id] : []), limit + 1) as SignupInviteSummary[];
+        const page = rows.slice(0, limit);
+        const last = page.at(-1);
+        return { invites: page.map(row => ({ ...row, status: row.status === 'pending' && row.expires_at <= Date.now() ? 'expired' : row.status })),
+            next_cursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ created_at: last.created_at, id: last.id })).toString('base64url') : null };
+    }
+
+    async revokeSignupInvite(input: { id: string }): Promise<{ ok: true } | { ok: false; reason: 'not_found' | 'already_used' }> {
+        this.db;
+        const raw = getRawDb();
+        return raw.transaction(() => {
+            const invite = raw.prepare('SELECT status, expires_at FROM signup_invites WHERE id = ?').get(input.id) as SignupInvitesTable | undefined;
+            if (!invite) return { ok: false as const, reason: 'not_found' as const };
+            if (invite.status !== 'pending' || invite.expires_at <= Date.now()) return { ok: false as const, reason: 'already_used' as const };
+            const now = Date.now();
+            raw.prepare("UPDATE signup_invites SET status = 'revoked', revoked_at = ?, retain_until = ? WHERE id = ?").run(now, now + 90 * 86400_000, input.id);
+            return { ok: true as const };
+        }).immediate();
+    }
+
+    private checkSignupInvite(invite: SignupInvitesTable | undefined, input: { email: string; token_hash: string }): SignupValidationResult {
+        if (!invite) return { ok: false, reason: 'not_found' };
+        if (invite.token_hash !== input.token_hash) return { ok: false, reason: 'token_mismatch' };
+        if (invite.email !== normalizeEmail(input.email)) return { ok: false, reason: 'email_mismatch' };
+        if (invite.status === 'accepted') return { ok: false, reason: 'already_used' };
+        if (invite.status === 'revoked') return { ok: false, reason: 'revoked' };
+        if (invite.expires_at <= Date.now()) return { ok: false, reason: 'expired' };
+        return { ok: true };
+    }
+
+    async validateSignupInvite(input: { id: string; email: string; token_hash: string }): Promise<SignupValidationResult> {
+        this.db;
+        const invite = getRawDb().prepare('SELECT * FROM signup_invites WHERE id = ?').get(input.id) as SignupInvitesTable | undefined;
+        return this.checkSignupInvite(invite, input);
+    }
+
+    async acceptSignupInviteAndProvisionUser(input: { invite_id: string; token_hash: string; provider: string; provider_user_id: string; email: string; display_name?: string }): Promise<SignupProvisionResult> {
+        this.db;
+        const raw = getRawDb();
+        return raw.transaction((): SignupProvisionResult => {
+            const invite = raw.prepare('SELECT * FROM signup_invites WHERE id = ?').get(input.invite_id) as SignupInvitesTable | undefined;
+            if (invite?.status === 'accepted' && invite.token_hash === input.token_hash && invite.email === normalizeEmail(input.email)
+                && invite.accepted_provider === input.provider && invite.accepted_provider_user_id === input.provider_user_id) {
+                // A receipt is not membership: do not recreate deleted records or reset selection.
+                return { ok: true, user_id: invite.user_id!, workspace_id: invite.workspace_id!, workspace_name: 'My Workspace', created: false };
+            }
+            const validation = this.checkSignupInvite(invite, input);
+            if (!validation.ok) return validation;
+            const email = normalizeEmail(input.email);
+            if (raw.prepare('SELECT id FROM auth_accounts WHERE provider = ? AND provider_user_id = ?').get(input.provider, input.provider_user_id)
+                || raw.prepare('SELECT id FROM users WHERE lower(trim(email)) = ?').get(email)) return { ok: false, reason: 'account_exists' };
+            const userId = uid(); const workspaceId = uid(); const now = nowEpoch();
+            raw.prepare('INSERT INTO users (id, email, display_name, active_workspace_id, created_at) VALUES (?, ?, ?, ?, ?)').run(userId, email, input.display_name ?? null, workspaceId, now);
+            raw.prepare('INSERT INTO auth_accounts (id, user_id, provider, provider_user_id, created_at) VALUES (?, ?, ?, ?, ?)').run(uid(), userId, input.provider, input.provider_user_id, now);
+            raw.prepare('INSERT INTO workspaces (id, name, owner_user_id, created_at) VALUES (?, ?, ?, ?)').run(workspaceId, 'My Workspace', userId, now);
+            raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)').run(uid(), workspaceId, userId, 'owner', now);
+            const acceptedAt = Date.now();
+            raw.prepare("UPDATE signup_invites SET status = 'accepted', accepted_at = ?, user_id = ?, workspace_id = ?, accepted_provider = ?, accepted_provider_user_id = ?, retain_until = ? WHERE id = ?")
+                .run(acceptedAt, userId, workspaceId, input.provider, input.provider_user_id, acceptedAt + 90 * 86400_000, input.invite_id);
+            return { ok: true, user_id: userId, workspace_id: workspaceId, workspace_name: 'My Workspace', created: true };
+        }).immediate();
+    }
+
     private get db() {
         return getSqliteDb();
     }

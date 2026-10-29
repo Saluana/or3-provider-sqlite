@@ -21,13 +21,15 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 24
+          node-version: "24.22.1"
           registry-url: https://registry.npmjs.org
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.3.14
       - run: npm install --global npm@11
       - run: bun install --frozen-lockfile
+      - name: Test npm propagation verifier offline
+        run: bun test scripts/__tests__/npm-propagation.test.ts
       - name: Verify release version
         run: |
           set -euo pipefail
@@ -47,6 +49,19 @@ jobs:
       - run: bun run type-check:standalone
       - run: bun run test
       - run: bun run build
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Saluana/or3-chat
+          ref: 3aa7b3c0d251d4071c6520814cc5d823e05bfccf
+          path: qualification-host
+      - name: Install canonical host qualification dependencies
+        working-directory: qualification-host
+        run: bun install --frozen-lockfile
+      - name: Check complete provider types and canonical host integration
+        run: |
+          ln -s "$PWD/qualification-host" ../or3-chat
+          bun run type-check
+          OR3_CANONICAL_HOST_ROOT="$PWD/qualification-host" bunx vitest run --config vitest.canonical-history.config.ts
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
       - name: Create publish archive
@@ -81,7 +96,7 @@ jobs:
           path: ${{ runner.temp }}/or3-npm-package
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 24
+          node-version: "24.22.1"
           registry-url: https://registry.npmjs.org
       - run: npm install --global npm@11
       - name: Publish immutable package
@@ -90,15 +105,54 @@ jobs:
           archive="$(find "$RUNNER_TEMP/or3-npm-package" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
           test -n "$archive"
           npm publish "$archive" --access public --provenance
+
+  verify-published:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download qualified archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/or3-npm-package
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.22.1"
       - name: Verify exact npm propagation
         run: |
           set -euo pipefail
           package_json="$RUNNER_TEMP/or3-npm-package/package.json"
           name="$(node -e 'console.log(require(process.argv[1]).name)' "$package_json")"
           version="$(node -e 'console.log(require(process.argv[1]).version)' "$package_json")"
-          for attempt in {1..8}; do
-            if [[ "$(npm view "$name@$version" version 2>/dev/null || true)" == "$version" ]]; then exit 0; fi
-            sleep 5
-          done
-          echo "Timed out waiting for $name@$version to become visible on npm." >&2
-          exit 1
+          archive="$(find "$RUNNER_TEMP/or3-npm-package" -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          node --input-type=module - "$name" "$version" "$archive" <<'NODE'
+          import { createHash } from 'node:crypto';
+          import { readFile } from 'node:fs/promises';
+          import { setTimeout } from 'node:timers/promises';
+          const [name, version, archive] = process.argv.slice(2);
+          const integrity = bytes => 'sha512-' + createHash('sha512').update(bytes).digest('base64');
+          const expected = integrity(await readFile(archive));
+          for (let attempt = 0; attempt < 24; attempt++) {
+            // npm view can keep serving an old CDN packument after publication.
+            const url = new URL(`https://registry.npmjs.org/${encodeURIComponent(name)}/${version}`);
+            url.searchParams.set('or3_verify', `${Date.now()}-${attempt}`);
+            const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+            if (response.ok) {
+              const metadata = await response.json();
+              if (metadata.version !== version || metadata.dist?.integrity !== expected) throw Error('Published package identity differs from the qualified archive.');
+              const archiveUrl = new URL(metadata.dist.tarball);
+              archiveUrl.searchParams.set('or3_verify', `${Date.now()}-${attempt}`);
+              const tarball = await fetch(archiveUrl, { signal: AbortSignal.timeout(10000) });
+              if (tarball.ok) {
+                if (integrity(Buffer.from(await tarball.arrayBuffer())) !== expected) throw Error('Published archive integrity mismatch.');
+                console.log(`Verified ${name}@${version}: ${expected}`);
+                process.exit(0);
+              }
+            }
+            await setTimeout(5000);
+          }
+          throw Error(`Timed out verifying ${name}@${version} on npm.`);
+          NODE

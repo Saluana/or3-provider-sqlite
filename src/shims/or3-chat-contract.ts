@@ -149,6 +149,12 @@ export type ReserveConnectAuthorizationInput<T = any, U = any, V = any, W = any,
 export const ReserveConnectAuthorizationInput: any = undefined;
 export type sanitizePayloadForSync<T = any, U = any, V = any, W = any, X = any> = any;
 export const sanitizePayloadForSync: any = undefined;
+export type SignupInviteSummary<T = any, U = any, V = any, W = any, X = any> = any;
+export const SignupInviteSummary: any = undefined;
+export type SignupProvisionResult<T = any, U = any, V = any, W = any, X = any> = any;
+export const SignupProvisionResult: any = undefined;
+export type SignupValidationResult<T = any, U = any, V = any, W = any, X = any> = any;
+export const SignupValidationResult: any = undefined;
 export type SnapshotItem<T = any, U = any, V = any, W = any, X = any> = any;
 export const SnapshotItem: any = undefined;
 export type SnapshotRequest<T = any, U = any, V = any, W = any, X = any> = any;

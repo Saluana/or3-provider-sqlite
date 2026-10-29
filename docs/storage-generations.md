@@ -8,7 +8,7 @@ not registered on `SqliteSyncGatewayAdapter`. Neither adapter advertises the
 external-generation capability. No existing upload, restore, or GC route calls
 the coordinator, and the SQLite code never selects or removes filesystem bytes.
 
-Migration 024 is a normal ordered migration containing empty lifecycle tables
+Migration 029 is a normal ordered migration containing empty lifecycle tables
 and triggers. With no managed rows, existing canonical writers remain on their
 legacy path. Development executes the migration only on disposable test
 databases; this change does not perform a live migration or deploy a provider.
