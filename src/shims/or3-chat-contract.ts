@@ -63,6 +63,14 @@ export type emitWebhookSystemHook<T = any, U = any, V = any, W = any, X = any> =
 export const emitWebhookSystemHook: any = undefined;
 export type encodeCanonicalChatSeek<T = any, U = any, V = any, W = any, X = any> = any;
 export const encodeCanonicalChatSeek: any = undefined;
+export type ExternalStorageGenerationClaimResult<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationClaimResult: any = undefined;
+export type ExternalStorageGenerationCoordinatorV1<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationCoordinatorV1: any = undefined;
+export type ExternalStorageGenerationKey<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationKey: any = undefined;
+export type ExternalStorageGenerationRecord<T = any, U = any, V = any, W = any, X = any> = any;
+export const ExternalStorageGenerationRecord: any = undefined;
 export type FinalizeChatGenerationResult<T = any, U = any, V = any, W = any, X = any> = any;
 export const FinalizeChatGenerationResult: any = undefined;
 export type GenerationHistoryPhase<T = any, U = any, V = any, W = any, X = any> = any;

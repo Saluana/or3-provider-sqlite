@@ -400,3 +400,7 @@ cancels preparation and restores admission rather than treating failure as idle.
 An additive covering index migration keeps counts off stored response bodies.
 
 Admin workspace summaries, workspace details, and deployment-admin lists expose `createdAt` in Unix milliseconds for the host UI. SQLite continues to store the underlying creation timestamps in Unix seconds; no data migration is needed.
+
+## Dormant immutable-generation foundation (unreleased)
+
+Migration 029 adds inert generation records, current-hash heads, and canonical write barriers after the released migrations. No runtime route creates these records, no adapter advertises `externalStorageGenerations`, and physical cleanup remains disabled. See [protocol invariants and activation blockers](docs/storage-generations.md).

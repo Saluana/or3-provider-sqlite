@@ -8,10 +8,11 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { sql } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import { initializeSqliteDb, getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
 import { createD1TestDatabase } from '../../../test/support/d1-test-database';
 import { runMigrations } from '../server/db/migrate';
+import { up as reconcileVerifiedStorage } from '../server/db/migrations/027_verified_storage_usage';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import type {
     PendingOp,
@@ -1670,8 +1671,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'verified-blob' });
                 const db = getSqliteDb();
                 await sql`UPDATE retained_storage SET size_bytes = 999`.execute(db);
-                await sql`DELETE FROM kysely_migration WHERE name >= '027'`.execute(db);
-                await runMigrations(db);
+                await reconcileVerifiedStorage(db as unknown as Kysely<unknown>);
                 await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'after-upgrade',
                     hash: `sha256:${'b'.repeat(64)}`, sizeBytes: 5, workspaceQuotaBytes: 10 })).resolves.toBeUndefined();
                 await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'over-verified-quota',
