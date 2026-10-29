@@ -568,7 +568,7 @@ describe('upload operations require exact durable guard authority', () => {
         for (const operation of operations()) await expect(operation()).rejects.toThrow(/integrity/i);
     });
 
-    it('replaces historical migration-024 upload guards and fails closed under either mixed-version fingerprint', async () => {
+    it('replaces historical migration-029 upload guards and fails closed under either mixed-version fingerprint', async () => {
         await coordinator.reserveGenerationUpload(request);
         const actual = new Map((raw.prepare("SELECT name,sql FROM sqlite_master WHERE type = 'trigger'").all() as
             { name: string; sql: string }[]).map(row => [row.name, canonicalGuardSql(row.sql)]));
@@ -577,7 +577,7 @@ describe('upload operations require exact durable guard authority', () => {
             expect(actual.get(name)).not.toBe(canonicalGuardSql(generationGuardTriggers()[name]!));
         }
         // This is the historical exact-fingerprint algorithm, using unchanged
-        // production migration-024 definitions rather than a vendored old class.
+        // production migration-029 definitions rather than a vendored old class.
         expect(() => {
             for (const [name, sql] of Object.entries(generationGuardTriggers())) {
                 if (actual.get(name) !== canonicalGuardSql(sql)) throw new Error(`Historical guard integrity failure: ${name}`);

@@ -11,7 +11,7 @@ import type {
  * Cloudflare account in the unit-test suite.
  */
 export function createD1TestDatabase(): {
-    database: D1Database;
+    database: D1Database & Required<Pick<D1Database, 'batch'>>;
     close(): void;
 } {
     const local = new Database(':memory:');

@@ -27,8 +27,6 @@ import * as m020 from './migrations/020_background_generation_receipts';
 import * as m021 from './migrations/021_background_request_usage';
 import * as m022 from './migrations/022_canonical_chat_reader';
 import * as m023 from './migrations/023_legacy_chat_seek_index';
-import * as m024 from './migrations/024_storage_generations';
-import * as m025 from './migrations/025_storage_generation_uploads';
 
 const REQUIRED_SCHEMA_TABLES = [
     'users',
@@ -47,11 +45,14 @@ const REQUIRED_SCHEMA_TABLES = [
     's_file_meta',
     's_notifications',
     'auth_invites',
+    'signup_invites',
     'admin_users',
     'admin_workspace_settings',
     'sync_snapshots',
     'sync_snapshot_items',
     'upload_intents',
+    'retained_storage',
+    'storage_usage',
     'connect_device_authorizations',
     'connect_environments',
     'rate_limits',
@@ -62,6 +63,14 @@ const REQUIRED_SCHEMA_TABLES = [
     'storage_object_heads',
     'storage_generation_uploads'
 ] as const;
+
+import * as m024 from './migrations/024_signup_invites';
+import * as m025 from './migrations/025_background_shutdown_accounting';
+import * as m026 from './migrations/026_retained_storage_usage';
+import * as m027 from './migrations/027_verified_storage_usage';
+import * as m028 from './migrations/028_user_scoped_device_cursors';
+import * as m029 from './migrations/029_storage_generations';
+import * as m030 from './migrations/030_storage_generation_uploads';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -87,8 +96,13 @@ const migrations: Record<string, Migration> = {
     '021_background_request_usage': m021,
     '022_canonical_chat_reader': m022,
     '023_legacy_chat_seek_index': m023,
-    '024_storage_generations': m024,
-    '025_storage_generation_uploads': m025
+    '024_signup_invites': m024,
+    '025_background_shutdown_accounting': m025,
+    '026_retained_storage_usage': m026,
+    '027_verified_storage_usage': m027,
+    '028_user_scoped_device_cursors': m028,
+    '029_storage_generations': m029,
+    '030_storage_generation_uploads': m030
 };
 
 class StaticMigrationProvider implements MigrationProvider {

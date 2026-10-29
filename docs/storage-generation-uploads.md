@@ -2,7 +2,7 @@
 
 ## Scope
 
-Migration 025 and `SqliteExternalStorageGenerationUploadCoordinator` extend the
+Migration 030 and `SqliteExternalStorageGenerationUploadCoordinator` extend the
 test-only trusted-server generation foundation. There is no production registry
 entry, capability advertisement, route registration, deployment, live migration,
 or enabled garbage collector. The original v1 generation states remain exactly
@@ -128,7 +128,7 @@ step needs the exact qualified claim read.
 - Every method, including intent and claim reads, inherits file-backed WAL,
   FULL/EXTRA synchronous mode, foreign-keys, own-transaction and exact guard checks.
   D1 and Turso are refused. Operator defaults are not changed.
-- Migration 024 remains reproducible. Migration 025 narrowly replaces its legacy
+- Migration 029 remains reproducible. Migration 030 narrowly replaces its legacy
   active-intent guards with exact bound-projection exceptions and installs the
   additional barriers. Current integrity checks require both sets. Older compiled
   coordinators expecting the original SQL fail closed after this upgrade.

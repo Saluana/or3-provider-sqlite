@@ -3,13 +3,16 @@
  *
  * Covers push idempotency, LWW, pull pagination, cursor updates, and GC safety.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { initializeSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { sql, type Kysely } from 'kysely';
+import { initializeSqliteDb, getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { createD1TestDatabase } from '../../../test/support/d1-test-database';
 import { runMigrations } from '../server/db/migrate';
+import { up as reconcileVerifiedStorage } from '../server/db/migrations/027_verified_storage_usage';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import type {
     PendingOp,
@@ -28,6 +31,11 @@ import type { CanonicalGenerationSnapshot, ChatGenerationAdmissionEnvelope } fro
 import type { RequestUsage } from '~~/shared/chat/compaction';
 import type { TerminalGenerationSnapshot } from '~~/server/utils/background-jobs/types';
 
+const webhookMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock('~~/server/utils/webhooks/runtime', async (importOriginal) => ({
+    ...await importOriginal<Record<string, unknown>>(), emitWebhookSystemHook: webhookMock,
+}));
+
 const WORKSPACE_ID = 'ws-test-1';
 const DEVICE_A = 'device-a';
 const DEVICE_B = 'device-b';
@@ -36,6 +44,14 @@ const DEVICE_B = 'device-b';
 const stubEvent = {} as H3Event;
 
 let adapter: SqliteSyncGatewayAdapter;
+let d1TestDatabase: ReturnType<typeof createD1TestDatabase> | undefined;
+
+async function useD1TestDatabase(): Promise<void> {
+    await destroySqliteDb();
+    d1TestDatabase = createD1TestDatabase();
+    const db = await initializeSqliteDb({ driver: 'd1', d1Database: d1TestDatabase.database });
+    await runMigrations(db);
+}
 
 function makeOp(overrides: Partial<PendingOp> & { tableName: string; pk: string }): PendingOp {
     return {
@@ -91,12 +107,21 @@ beforeEach(async () => {
 
 afterEach(async () => {
     await destroySqliteDb();
+    d1TestDatabase?.close();
+    d1TestDatabase = undefined;
 });
 
 describe('SqliteSyncGatewayAdapter', () => {
-    // Security failures: legacy membership omitted, foreign/deleted projects included,
-    // ambiguous owners guessed, or an explicit pointer overridden by stale associations.
-    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT))('resolves canonical project ownership in the authorized storage snapshot', async () => {
+    // Security failures: normalized legacy membership omitted, extension/invalid
+    // entries counted as chats, ambiguous owners guessed, or explicit pointers
+    // overridden by stale associations.
+    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT)).each([
+        { label: 'plain strings', data: ['legacy'] },
+        { label: 'padded strings', data: [' legacy '] },
+        { label: 'padded object IDs', data: [{ id: ' legacy ' }] },
+        { label: 'normalized kinds', data: [{ id: ' legacy ', kind: ' CHAT ' }] },
+        { label: 'encoded normalized memberships', data: JSON.stringify([{ id: ' legacy ', kind: ' CHAT ' }]) },
+    ])('resolves canonical project ownership for $label in the authorized storage snapshot', async ({ data }) => {
         const raw = getRawDb();
         raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
         raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
@@ -104,13 +129,40 @@ describe('SqliteSyncGatewayAdapter', () => {
         await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',payload:{id:'legacy'}})]));
         const read = () => adapter.readChatHistory(actor, {kind:'thread',thread_id:'legacy'});
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
+        await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'projects', pk: 'extensions', payload: { id: 'extensions', data: [
+            { id: 'legacy', kind: 'plugin-resource' }, { id: 'legacy', kind: 'doc' }, { id: 'legacy', kind: 'file' },
+            { id: 'legacy', kind: null }, { id: 123, kind: 'chat' }, [], null,
+        ] } })]), workspaceItemCapability: 'v1' });
+        expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
         for (const id of ['one', 'two']) {
-            await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? ['legacy'] : JSON.stringify([{id:'legacy'}])}})]));
+            await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? data : JSON.stringify([{id:'legacy'}])}})]));
             expect(await read()).toMatchObject(id === 'one' ? {project_ownership:'resolved',thread:{project_id:'one'}} : {project_ownership:'conflict'});
         }
+        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:'chosen',payload:{id:'chosen',name:'Chosen',data:[]}})]));
         await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]));
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     });
+    // A deleted/missing owner releases the chat even if LWW preserved its old
+    // pointer. A same-ID project in another workspace cannot retain ownership,
+    // and legacy membership must not override an explicit released pointer.
+    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT)).each(['missing', 'deleted', 'foreign'] as const)(
+        'releases canonical chats with an explicit %s project owner', async (state) => {
+            const raw = getRawDb();
+            raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
+            raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+            await adapter.push(stubEvent, makeBatch([
+                makeOp({ tableName: 'threads', pk: 'released-chat', payload: { id: 'released-chat', project_id: 'old-owner' } }),
+                makeOp({ tableName: 'projects', pk: 'stale-folder', payload: { id: 'stale-folder', data: ['released-chat'] } }),
+            ]));
+            if (state !== 'missing') {
+                const scope = { workspaceId: state === 'foreign' ? 'another-workspace' : WORKSPACE_ID };
+                await adapter.push(stubEvent, { scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', payload: { id: 'old-owner', data: [] } })] });
+                if (state === 'deleted') await adapter.push(stubEvent, { scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', operation: 'delete',
+                    stamp: { deviceId: DEVICE_A, opId: randomUUID(), clock: 2, hlc: '2026-10-05T00:00:00.000Z-0000' } })] });
+            }
+            expect(await adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'thread', thread_id: 'released-chat' }))
+                .toMatchObject({ project_ownership: 'resolved', thread: { project_id: null } });
+        });
     describe.runIf(process.env.OR3_CANONICAL_ARTIFACTS === 'true')('source-built canonical history reader', () => {
         it('roundtrips a real local compacted fork through built canonical storage, partial second-client delivery and reconnect', async () => {
             const indexedDbFixture = 'fake-indexeddb/auto';
@@ -180,9 +232,11 @@ describe('SqliteSyncGatewayAdapter', () => {
                 do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); purgedPages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
                 await applySnapshotChain(second, purgedPages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
                 expect(await second.threads.get('roundtrip-root')).toBeUndefined(); expect(await second.messages.get('roundtrip-0')).toBeUndefined();
-                // Purging the ancestor also removes its project provenance.
-                // Current hosts must fail closed instead of trusting the summary alone.
+                // Display retains the saved summary, but requests must refuse
+                // inherited context whose project provenance was purged.
                 await expect(resolveThreadProjection(child.thread.id, second)).rejects.toMatchObject({ code: 'scope_incomplete' });
+                expect((await resolveThreadProjection(child.thread.id, second, undefined, { projectProvenance: false })).messages.map(row => row.id))
+                    .toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
                 expect(await second.pending_ops.count()).toBe(0);
                 expect(await local.messages.count()).toBe(5);
             } finally {
@@ -297,6 +351,32 @@ describe('SqliteSyncGatewayAdapter', () => {
             await rm(directory, { recursive: true, force: true });
         });
 
+        it('emits created hooks once for admitted rows and does not create an existing thread', async () => {
+            webhookMock.mockClear();
+            const history = admission();
+            await adapter.admitChatGeneration(actor, history);
+            expect(webhookMock.mock.calls.map((call) => call[0])).toEqual([
+                'db.threads.create:action:after', 'db.messages.create:action:after',
+            ]);
+            expect(webhookMock).toHaveBeenCalledWith('db.messages.create:action:after',
+                expect.objectContaining({ id: 'usage-user', workspace_id: WORKSPACE_ID, user_id: actor.userId }));
+            webhookMock.mockClear();
+            await adapter.admitChatGeneration(actor, history);
+            expect(webhookMock).not.toHaveBeenCalled();
+            const next = admission();
+            next.admissionId = 'next-admission'; next.generationId = 'next-generation';
+            next.messageId = 'next-assistant'; next.assistantMessage.id = 'next-assistant';
+            next.assistantMessage.data = { generation_id: 'next-generation' };
+            next.thread!.clock = 2; next.userMessage!.id = 'next-user';
+            webhookMock.mockClear();
+            const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {});
+            webhookMock.mockRejectedValueOnce(new Error('hook failed'));
+            try {
+                await expect(adapter.admitChatGeneration(actor, next)).resolves.toMatchObject({ status: 'admitted' });
+                expect(webhookMock.mock.calls.map((call) => call[0])).not.toContain('db.threads.create:action:after');
+            } finally { errorLog.mockRestore(); }
+        });
+
         it.each(['complete', 'error', 'aborted'] as const)('reconciles real persisted %s jobs through host history and canonical pull/snapshot', async (status) => {
             let jobs = new SqliteBackgroundJobProvider();
             const history = admission();
@@ -384,11 +464,22 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
     });
 
-    it.each([
+    // The admitted canonical value is authoritative even when an old writer
+    // omits every identifying field. Rejection must roll back sibling writes.
+    it.each(['sqlite', 'd1'].flatMap(runtime => [
         { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', title: 'Trashed native document', content: '{"type":"doc","content":[]}', file_hashes: JSON.stringify(['shared-hash']), meta: JSON.stringify({ plugin_key: 'preserved', 'or3.workspace-item': { version: 1, trashed_at: 1 } }) }, omitted: { id: 'workspace-item', postType: 'doc', meta: '' } },
         { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'or3:file', title: 'Saved original', content: 'Indexed saffron prefix', file_hashes: JSON.stringify(['shared-hash']), meta: JSON.stringify({ plugin_key: 'preserved', 'or3.workspace-item': { version: 1, trashed_at: null, text: { coverage: 'prefix', indexed_bytes: 21 } } }) }, omitted: { id: 'workspace-item', postType: 'doc' } },
         { tableName: 'projects', payload: { id: 'workspace-item', name: 'Project', data: [{ kind: 'file', id: 'catalog', name: 'Original', extra: 'preserved' }, { kind: 'plugin-resource', id: 'opaque', plugin_field: 'preserved' }] }, omitted: { id: 'workspace-item', name: 'Project', data: [] } },
-    ])('rejects old-writer omission transactionally for $tableName', async ({ tableName, payload, omitted }) => {
+        ...[
+            { 'or3.workspace-item': null },
+            { key: 'or3.workspace-item', value: { version: 1 } },
+            [{ key: 'or3.workspace-item', value: { version: 1 } }],
+            JSON.stringify([{ key: 'or3.workspace-item', value: { version: 1 } }]),
+        ].map(meta => ({ tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', meta }, omitted: { id: 'workspace-item' } })),
+        { tableName: 'posts', payload: { id: 'workspace-item', postType: 'or3:file' }, omitted: { id: 'workspace-item' } },
+        { tableName: 'projects', payload: { id: 'workspace-item', data: JSON.stringify([{ kind: 'file', id: 'saved' }]) }, omitted: { id: 'workspace-item', data: [] } },
+    ].map(value => ({ ...value, runtime }))))('rejects old-writer omission transactionally for $tableName on $runtime', async ({ tableName, payload, omitted, runtime }) => {
+        if (runtime === 'd1') await useD1TestDatabase();
         const first = makeOp({ tableName, pk: 'workspace-item', payload });
         const admitted = { ...makeBatch([first]), workspaceItemCapability: 'v1' as const };
         const saved = await adapter.push(stubEvent, admitted);
@@ -399,10 +490,49 @@ describe('SqliteSyncGatewayAdapter', () => {
         expect(snapshot.items).toContainEqual(expect.objectContaining({ kind: 'row', tableName, pk: 'workspace-item', payload: expect.objectContaining(payload) }));
         const old = makeOp({ tableName, pk: 'workspace-item', payload: omitted,
             stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } });
-        await expect(adapter.push(stubEvent, makeBatch([old]))).rejects.toMatchObject({ statusCode: 426 });
-        const row = getRawDb().prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').get('workspace-item') as { data_json: string };
-        expect(JSON.parse(row.data_json)).toMatchObject(payload);
-        expect(getRawDb().prepare('SELECT count(*) AS total FROM change_log').get()).toMatchObject({ total: 1 });
+        await expect(adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'threads', pk: 'sibling' }), old]))).rejects.toMatchObject({ statusCode: 426 });
+        const rows = async <T,>(query: string): Promise<T[]> => runtime === 'd1'
+            ? (await d1TestDatabase!.database.prepare(query).all<T>()).results!
+            : getRawDb().prepare(query).all() as T[];
+        const [row] = await rows<{ data_json: string }>('SELECT data_json FROM s_' + tableName + " WHERE id = 'workspace-item'");
+        expect(row).toBeDefined();
+        expect(JSON.parse(row!.data_json)).toMatchObject(payload);
+        expect(await rows('SELECT count(*) AS total FROM change_log')).toEqual([{ total: 1 }]);
+        expect(await rows('SELECT value FROM server_version_counter')).toEqual([{ value: 1 }]);
+        expect(await rows('SELECT id FROM s_threads')).toEqual([]);
+    });
+
+    // A preflight-only guard loses this race: the canonical item acquires
+    // Files/Trash semantics after admission reads but before the atomic batch.
+    it.each(['posts', 'projects'])('guards canonical %s capability changes inside the D1 batch', async tableName => {
+        await useD1TestDatabase();
+        const first = makeOp({ tableName, pk: 'capability-race', payload: { id: 'capability-race' } });
+        await adapter.push(stubEvent, makeBatch([first]));
+        const canonical = tableName === 'posts'
+            ? { id: first.pk, post_type: 'or3:file', title: 'Saved file' }
+            : { id: first.pk, data: [{ kind: 'file', id: 'saved-file' }] };
+        const database = d1TestDatabase!.database;
+        const batch = database.batch.bind(database);
+        let raced = false;
+        database.batch = async statements => {
+            if (!raced) {
+                raced = true;
+                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName, pk: first.pk, payload: canonical,
+                    stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } })]), workspaceItemCapability: 'v1' });
+            }
+            return batch(statements);
+        };
+        await expect(adapter.push(stubEvent, makeBatch([
+            makeOp({ tableName: 'threads', pk: 'must-rollback' }),
+            makeOp({ tableName, pk: first.pk, payload: { id: first.pk, title: 'legacy overwrite' },
+                stamp: { ...first.stamp, opId: randomUUID(), clock: 3 } }),
+        ]))).rejects.toMatchObject({ statusCode: 426 });
+        expect(raced).toBe(true);
+        expect((await database.prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').bind(first.pk).all<{ data_json: string }>()).results?.map(row => JSON.parse(row.data_json)))
+            .toEqual([canonical]);
+        expect((await database.prepare('SELECT value FROM server_version_counter').all()).results).toEqual([{ value: 2 }]);
+        expect((await database.prepare('SELECT count(*) AS total FROM change_log').all()).results).toEqual([{ total: 2 }]);
+        expect((await database.prepare('SELECT id FROM s_threads').all()).results).toEqual([]);
     });
 
     it('executes the shared bootstrap and revision contract', async () => {
@@ -1071,6 +1201,39 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('snapshot', () => {
+        // Failure inventory: Trash payloads disappear in normal sync snapshots;
+        // paging can mix archive/sync modes or observe later writes. Exercise the
+        // real SQLite and D1 transaction paths; no snapshot implementation mocks.
+        it.each(['sqlite', 'd1'] as const)('retains Trash metadata in a frozen, mode-bound %s backup', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const scope = { workspaceId: WORKSPACE_ID };
+            const hashes = ['a', 'b'].map(character => `sha256:${character.repeat(64)}`);
+            const ops = hashes.map(hash => makeOp({ tableName: 'file_meta', pk: hash, payload: {
+                hash, name: 'original.txt', mime_type: 'text/plain', kind: 'file', size_bytes: 8,
+                storage_id: `object-${hash}`, storage_provider_id: 'fs', ref_count: 0,
+                created_at: 1, updated_at: 1, clock: 1, deleted: false,
+            } }));
+            const deletion = makeOp({ tableName: 'file_meta', pk: hashes[1]!, operation: 'delete',
+                stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } });
+            await adapter.push(stubEvent, { scope, ops: [...ops, deletion], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
+            const request = { scope, tables: ['file_meta'], pageSize: 1, fileKindCapability: 'v1' as const, workspaceItemCapability: 'v1' as const };
+            const normal = await adapter.snapshot(stubEvent, { ...request, pageSize: 10 });
+            expect(normal.items).toContainEqual(expect.objectContaining({ kind: 'tombstone', pk: hashes[1] }));
+            const first = await adapter.backupSnapshot(stubEvent, request);
+            expect(first.nextPageToken).toBeTruthy();
+            await expect(adapter.snapshot(stubEvent, { ...request, pageToken: first.nextPageToken! })).rejects.toThrow(/mode/i);
+            const syncFirst = await adapter.snapshot(stubEvent, request);
+            await expect(adapter.backupSnapshot(stubEvent, { ...request, pageToken: syncFirst.nextPageToken! })).rejects.toThrow(/mode/i);
+            await adapter.push(stubEvent, { scope, ops: [makeOp({ ...ops[1]!, payload: { ...ops[1]!.payload as object, name: 'later.txt' },
+                stamp: { clock: 3, hlc: '2025-01-03T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
+            const next = await adapter.backupSnapshot(stubEvent, { ...request, pageToken: first.nextPageToken! });
+            expect(next.highWatermark).toBe(first.highWatermark);
+            expect(next.nextPageToken).toBeNull();
+            expect([...first.items, ...next.items]).toEqual([
+                expect.objectContaining({ kind: 'row', pk: hashes[0] }),
+                expect.objectContaining({ kind: 'row', pk: hashes[1], payload: expect.objectContaining({ deleted: true, name: 'original.txt', storage_id: `object-${hashes[1]}` }) }),
+            ]);
+        });
         async function collectRemainingPages(first: SnapshotResponse): Promise<{
             pages: SnapshotResponse[];
             items: SnapshotItem[];
@@ -1292,155 +1455,54 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('canonical storage queries', () => {
-        // Failure modes: deleted rows vanish from usage after log pruning,
-        // placeholder tombstones invent a zero size, and restoration appears in
-        // both views. These are observations, never deletion authorization.
-        it('accounts retained metadata after pruning and moves restored hashes back to live', async () => {
-            const hash = `sha256:${'e'.repeat(64)}`;
-            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
-                payload: { hash, size_bytes: 41, storage_id: `${WORKSPACE_ID}:${hash}` } })]));
+        // Failure modes: retained queries accidentally read reference edges or the
+        // prunable log, leak live/foreign rows, invent placeholder sizes, or lose
+        // the metadata needed for read-only accounting after a winning delete.
+        it.each(['native', 'd1'] as const)('keyset-pages retained materialized metadata independently of sync history with %s', async (runtime) => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const hashes = ['a', 'b', 'c', 'd'].map((letter) => `sha256:${letter.repeat(64)}`);
+            const metadata = (hash: string) => makeOp({
+                tableName: 'file_meta', pk: hash,
+                payload: { hash, size_bytes: 321, storage_id: 'object-1', name: 'retained.png', mime_type: 'image/png', kind: 'image' },
+            });
+            await adapter.push(stubEvent, makeBatch([
+                metadata(hashes[0]!), metadata(hashes[2]!),
+                makeOp({ tableName: 'messages', pk: 'reference', payload: { id: 'reference', file_hashes: JSON.stringify([hashes[2]]) } }),
+            ]));
+            const deletion = (hash: string) => makeOp({
+                tableName: 'file_meta', pk: hash, operation: 'delete',
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
+            });
+            await adapter.push(stubEvent, makeBatch([deletion(hashes[0]!), deletion(hashes[1]!)]));
+            await adapter.push(stubEvent, { scope: { workspaceId: 'foreign' }, ops: [metadata(hashes[3]!), deletion(hashes[3]!)] });
+            await getSqliteDb().deleteFrom('change_log').execute();
+            await getSqliteDb().deleteFrom('tombstones').execute();
+
+            const query = { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata' as const, limit: 1 };
+            const first = await adapter.queryCanonicalStorage(makeSessionEvent('owner'), query);
+            expect(first).toMatchObject({
+                items: [{ kind: 'retained_metadata', hash: 'a'.repeat(64), sizeBytes: 321, storageId: 'object-1',
+                    name: 'retained.png', mimeType: 'image/png', fileKind: 'image', updatedAt: expect.any(Number) }],
+                hasMore: true, nextCursor: expect.any(String),
+            });
+            expect(adapter.capabilities.retainedStorageMetadata).toBe('v1');
+            const second = await adapter.queryCanonicalStorage(stubEvent, { ...query, cursor: first.nextCursor });
+            expect(second).toEqual({ items: [{ kind: 'retained_metadata', hash: 'b'.repeat(64), updatedAt: expect.any(Number) }], hasMore: false });
+            expect(await adapter.queryCanonicalStorage(stubEvent, { ...query, hash: hashes[0]!.toUpperCase() })).toEqual({ items: first.items, hasMore: false });
+            await expect(adapter.queryCanonicalStorage(stubEvent, { ...query, kind: 'live_metadata', cursor: first.nextCursor })).rejects.toThrow('Invalid canonical storage cursor');
+            await expect(adapter.queryCanonicalStorage(makeSessionEvent('owner'), { ...query, scope: { workspaceId: 'foreign' } })).rejects.toThrow('Forbidden');
+        });
+
+        // Unknown retained sizes are allowed only when absent, never when a
+        // stored value is malformed and would silently corrupt byte accounting.
+        it.each([null, -1, '321', Number.MAX_SAFE_INTEGER + 1])('rejects malformed retained size %s', async (size) => {
+            const hash = `sha256:${'a'.repeat(64)}`;
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: size } })]));
             await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
-                stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
-            getRawDb().prepare('DELETE FROM change_log').run();
-            getRawDb().prepare('DELETE FROM tombstones').run();
-            expect(adapter.capabilities).toMatchObject({ retainedStorageMetadata: 'v1' });
-            const query = () => adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1 });
-            expect(await query()).toMatchObject({ items: [{ kind: 'retained_metadata', hash: 'e'.repeat(64), sizeBytes: 41 }], hasMore: false });
-            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
-                payload: { hash, size_bytes: 41 },
-                stamp: { clock: 3, hlc: '2026-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
-            expect(await query()).toEqual({ items: [], hasMore: false });
-            expect(await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'live_metadata' }))
-                .toMatchObject({ items: [{ kind: 'metadata', hash: 'e'.repeat(64), sizeBytes: 41 }] });
-        });
-
-        it('reports unknown size for delete-before-put tombstones and scopes retained keyset pages', async () => {
-            for (const digit of ['1', '2', '3']) {
-                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: digit.repeat(64), operation: 'delete' })]));
-            }
-            const first = await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1 });
-            expect(first.items).toEqual([{ kind: 'retained_metadata', hash: '1'.repeat(64), updatedAt: expect.any(Number) }]);
-            expect(first.hasMore).toBe(true);
-            const second = await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1, cursor: first.nextCursor });
-            expect(second.items).toEqual([{ kind: 'retained_metadata', hash: '2'.repeat(64), updatedAt: expect.any(Number) }]);
-            expect(second.hasMore).toBe(true);
-            const third = await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', limit: 1, cursor: second.nextCursor });
-            expect(third).toEqual({ items: [{ kind: 'retained_metadata', hash: '3'.repeat(64), updatedAt: expect.any(Number) }], hasMore: false });
-            expect(await adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: 'foreign' }, kind: 'retained_metadata' }))
-                .toEqual({ items: [], hasMore: false });
-            await expect(adapter.queryCanonicalStorage(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, kind: 'live_metadata', cursor: first.nextCursor }))
-                .rejects.toMatchObject({ statusCode: 400 });
-        });
-
-        it.each([0, 41, undefined, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, '41'])(
-            'preserves known retained sizes and leaves invalid sizes unknown (%j)',
-            async (size) => {
-                const hash = `sha256:${'a'.repeat(64)}`;
-                await adapter.push(stubEvent, makeBatch([makeOp({
-                    tableName: 'file_meta', pk: hash,
-                    payload: { hash, size_bytes: size, storage_id: 'retained-object' },
-                })]));
-                await adapter.push(stubEvent, makeBatch([makeOp({
-                    tableName: 'file_meta', pk: hash, operation: 'delete',
-                    stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
-                })]));
-                const valid = typeof size === 'number' && Number.isSafeInteger(size) && size >= 0;
-                expect(await adapter.queryCanonicalStorage(stubEvent, {
-                    scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
-                    hash: `SHA256:${'A'.repeat(64)}`,
-                })).toEqual({
-                    items: [{
-                        kind: 'retained_metadata', hash: 'a'.repeat(64),
-                        ...(valid ? { sizeBytes: size } : {}),
-                        storageId: 'retained-object', updatedAt: expect.any(Number),
-                    }],
-                    hasMore: false,
-                });
-            }
-        );
-
-        it('isolates retained rows by workspace and rejects mismatched session scopes', async () => {
-            const hash = 'b'.repeat(64);
-            for (const [workspaceId, size] of [[WORKSPACE_ID, 11], ['foreign', 99]] as const) {
-                await adapter.push(stubEvent, {
-                    scope: { workspaceId },
-                    ops: [makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: size } })],
-                });
-                await adapter.push(stubEvent, {
-                    scope: { workspaceId },
-                    ops: [makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
-                        stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })],
-                });
-            }
-            const event = makeSessionEvent('storage-owner');
-            expect(await adapter.queryCanonicalStorage(event, {
-                scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata', hash,
-            })).toEqual({
-                items: [{ kind: 'retained_metadata', hash, sizeBytes: 11, updatedAt: expect.any(Number) }],
-                hasMore: false,
-            });
-            await expect(adapter.queryCanonicalStorage(event, {
-                scope: { workspaceId: 'foreign' }, kind: 'retained_metadata', hash,
-            })).rejects.toMatchObject({ statusCode: 403 });
-        });
-
-        it('keeps retained reads mutation-free and rejects mismatched or malformed cursors', async () => {
-            for (const digit of ['1', '2']) {
-                await adapter.push(stubEvent, makeBatch([makeOp({
-                    tableName: 'file_meta', pk: digit.repeat(64), operation: 'delete',
-                })]));
-            }
-            const raw = getRawDb();
-            const before = raw.prepare('SELECT total_changes() AS count').get();
-            const request = { scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata' as const, limit: 1 };
-            const page = await adapter.queryCanonicalStorage(stubEvent, request);
-            expect(page.hasMore).toBe(true);
-            expect(page.nextCursor).toBeTypeOf('string');
-            for (const cursor of ['not-json', 'x'.repeat(2049), Buffer.from(JSON.stringify({
-                version: 1, kind: 'retained_metadata', key: ['1', '2'],
-            })).toString('base64url')]) {
-                await expect(adapter.queryCanonicalStorage(stubEvent, { ...request, cursor }))
-                    .rejects.toMatchObject({ statusCode: 400 });
-            }
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
             await expect(adapter.queryCanonicalStorage(stubEvent, {
-                ...request, hash: '1'.repeat(64), cursor: page.nextCursor,
-            })).rejects.toMatchObject({ statusCode: 400 });
-            expect(raw.prepare('SELECT total_changes() AS count').get()).toEqual(before);
-        });
-
-        it('keeps logical quota admission separate from retained disk observations', async () => {
-            const retainedHash = 'c'.repeat(64);
-            await adapter.push(stubEvent, makeBatch([makeOp({
-                tableName: 'file_meta', pk: retainedHash,
-                payload: { hash: retainedHash, size_bytes: 900 },
-            })]));
-            await adapter.push(stubEvent, makeBatch([makeOp({
-                tableName: 'file_meta', pk: retainedHash, operation: 'delete',
-                stamp: { clock: 2, hlc: '2026-01-01T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
-            }), makeOp({ tableName: 'file_meta', pk: 'd'.repeat(64), operation: 'delete' })]));
-            await adapter.push(stubEvent, makeBatch([makeOp({
-                tableName: 'file_meta', pk: 'e'.repeat(64),
-                payload: { hash: 'e'.repeat(64), size_bytes: 30 },
-            })]));
-            const request = {
-                workspaceId: WORKSPACE_ID, hash: 'f'.repeat(64), mimeType: 'image/png',
-                expiresAt: Math.floor(Date.now() / 1000) + 60, workspaceQuotaBytes: 40,
-            };
-            await expect(adapter.reserveUploadIntent(stubEvent, {
-                ...request, intentId: 'fits-logical-quota', sizeBytes: 10,
-            })).resolves.toBeUndefined();
-            await expect(adapter.reserveUploadIntent(stubEvent, {
-                ...request, intentId: 'exceeds-logical-quota', hash: 'a'.repeat(64), sizeBytes: 1,
-            })).rejects.toMatchObject({ statusCode: 413 });
-            expect(await adapter.queryCanonicalStorage(stubEvent, {
                 scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
-            })).toEqual({
-                items: [
-                    { kind: 'retained_metadata', hash: retainedHash, sizeBytes: 900, updatedAt: expect.any(Number) },
-                    { kind: 'retained_metadata', hash: 'd'.repeat(64), updatedAt: expect.any(Number) },
-                ],
-                hasMore: false,
-            });
+            })).rejects.toThrow('Invalid canonical file size');
         });
 
         it('reads live metadata from materialized state after logs are pruned and ignores a losing delete', async () => {
@@ -1579,41 +1641,219 @@ describe('SqliteSyncGatewayAdapter', () => {
             });
         });
 
-        it('atomically rejects concurrent reservations that collectively exceed quota', async () => {
-            const now = Math.floor(Date.now() / 1000);
-            const reserve = (intentId: string, hash: string) => adapter.reserveUploadIntent(stubEvent, {
-                intentId, workspaceId: WORKSPACE_ID, hash, mimeType: 'image/png', sizeBytes: 60,
-                expiresAt: now + 60, workspaceQuotaBytes: 100,
+        describe.each(['native', 'd1'] as const)('upload-intent lifecycle with %s', (runtime) => {
+            beforeEach(async () => {
+                if (runtime === 'd1') await useD1TestDatabase();
             });
-            const results = await Promise.allSettled([
-                reserve('intent-a', `sha256:${'a'.repeat(64)}`),
-                reserve('intent-b', `sha256:${'b'.repeat(64)}`),
-            ]);
-            expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
-            expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
-            const row = getRawDb().prepare(`SELECT COALESCE(SUM(reserved_bytes), 0) AS total
-                FROM upload_intents WHERE status = 'active'`).get() as { total: number };
-            expect(row.total).toBe(60);
-        });
 
-        it('consumes an intent once and rejects replay or metadata mismatch', async () => {
-            const now = Math.floor(Date.now() / 1000);
-            const request = {
-                intentId: 'intent-commit', workspaceId: WORKSPACE_ID,
-                hash: `sha256:${'c'.repeat(64)}`, mimeType: 'image/png', sizeBytes: 10,
-                expiresAt: now + 60,
-            };
-            await adapter.reserveUploadIntent(stubEvent, request);
-            await expect(adapter.consumeUploadIntent(stubEvent, {
-                ...request, sizeBytes: 11, storageId: 'object-1',
-            })).rejects.toMatchObject({ statusCode: 409 });
-            await expect(adapter.consumeUploadIntent(stubEvent, {
-                ...request, storageId: 'object-1',
-            })).resolves.toBeUndefined();
-            await expect(adapter.consumeUploadIntent(stubEvent, {
-                ...request, storageId: 'object-1',
-            })).rejects.toMatchObject({ statusCode: 409 });
+            // Failure modes: D1's asynchronous reads admit concurrent requests over
+            // quota, consumed uploads release their charge before metadata arrives,
+            // or a zero-byte duplicate loses its charge when the first is cancelled.
+            // Retained bytes still incur storage charges after logical deletion.
+            // Reservation expiry must not make a consumed original free either.
+            it('keeps metadata-only sizes out of another writer\'s upload quota', async () => {
+                const hash = `sha256:${'d'.repeat(64)}`;
+                const result = await adapter.push(makeSessionEvent('writer-a'), makeBatch([makeOp({
+                    tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: 1_000_000, storage_id: 'unverified' },
+                })]));
+                expect(result.results[0]).toMatchObject({ success: true });
+                await expect(adapter.reserveUploadIntent(makeSessionEvent('writer-b'), {
+                    intentId: 'honest-upload', workspaceId: WORKSPACE_ID, hash: `sha256:${'e'.repeat(64)}`,
+                    mimeType: 'text/plain', sizeBytes: 1, expiresAt: Math.floor(Date.now() / 1000) + 60, workspaceQuotaBytes: 10,
+                })).resolves.toBeUndefined();
+            });
+
+            it('reconciles old metadata-derived charges from persisted commit receipts on upgrade', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'verified-old', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'text/plain', sizeBytes: 5, expiresAt: now + 60 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'verified-blob' });
+                const db = getSqliteDb();
+                await sql`UPDATE retained_storage SET size_bytes = 999`.execute(db);
+                await reconcileVerifiedStorage(db as unknown as Kysely<unknown>);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'after-upgrade',
+                    hash: `sha256:${'b'.repeat(64)}`, sizeBytes: 5, workspaceQuotaBytes: 10 })).resolves.toBeUndefined();
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'over-verified-quota',
+                    hash: `sha256:${'c'.repeat(64)}`, sizeBytes: 1, workspaceQuotaBytes: 10 })).rejects.toMatchObject({ statusCode: 413 });
+            });
+
+            it('keeps retained originals charged after Trash and receipt expiry', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'retained', workspaceId: WORKSPACE_ID,
+                    hash: `sha256:${'e'.repeat(64)}`, mimeType: 'image/png', sizeBytes: 60,
+                    expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'retained-object' });
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    payload: { hash: request.hash, size_bytes: 60, storage_id: 'retained-object' } })]));
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    operation: 'delete', stamp: { deviceId: DEVICE_A, opId: randomUUID(), hlc: '2025-01-01T00:00:00.000Z-0001', clock: 2 } })]));
+                await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', request.intentId).execute();
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request,
+                    intentId: 'over-quota', hash: `sha256:${'f'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
+                // Restoring/deduplicating the same immutable content adds no bytes.
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request,
+                    intentId: 'restore' })).resolves.toBeUndefined();
+            });
+
+            it('reserves size increases above retained metadata and keeps duplicate holds charged', async () => {
+                const hash = `sha256:${'a'.repeat(64)}`;
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
+                    payload: { hash, size_bytes: 10, storage_id: 'legacy-original' } })]));
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'larger', workspaceId: WORKSPACE_ID, hash,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 50 };
+                await expect(adapter.reserveUploadIntent(stubEvent, request)).rejects.toMatchObject({ statusCode: 413 });
+                await adapter.reserveUploadIntent(stubEvent, { ...request, workspaceQuotaBytes: 100 });
+                await adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'duplicate', workspaceQuotaBytes: 100 });
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'other',
+                    hash: `sha256:${'b'.repeat(64)}`, sizeBytes: 41, workspaceQuotaBytes: 100 })).rejects.toMatchObject({ statusCode: 413 });
+            });
+
+            it('atomically rejects concurrent reservations that collectively exceed quota', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const reserve = (intentId: string, hash: string) => adapter.reserveUploadIntent(stubEvent, {
+                    intentId, workspaceId: WORKSPACE_ID, hash, mimeType: 'image/png', sizeBytes: 60,
+                    expiresAt: now + 60, workspaceQuotaBytes: 100,
+                });
+                const results = await Promise.allSettled([
+                    reserve('intent-a', `sha256:${'a'.repeat(64)}`),
+                    reserve('intent-b', `sha256:${'b'.repeat(64)}`),
+                ]);
+                expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+                expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+                const pending = await adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now,
+                });
+                expect(pending.items).toHaveLength(1);
+                expect(pending.items[0]).toMatchObject({ kind: 'reservation', sizeBytes: 60 });
+            });
+
+            it('holds consumed quota until canonical admission without double-counting live metadata', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'first', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' });
+                const pending = () => adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now,
+                });
+                expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'first', hash: 'a'.repeat(64), sizeBytes: 60, expiresAt: now + 60 }]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
+                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    payload: { hash: request.hash, size_bytes: 60 } })]));
+                expect((await pending()).items).toEqual([]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'third', hash: `sha256:${'c'.repeat(64)}`, sizeBytes: 40 })).resolves.toBeUndefined();
+            });
+
+            // A consumed receipt can retry only within the original authorization
+            // TTL. Its physically retained bytes remain charged after that TTL.
+            it('expires consumed receipt replay while retaining its physical storage charge', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const currentTime = vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+                try {
+                    const request = { intentId: 'interrupted', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                        mimeType: 'image/png', sizeBytes: 100, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                    await adapter.reserveUploadIntent(stubEvent, request);
+                    await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' });
+                    await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).resolves.toBeUndefined();
+                    currentTime.mockReturnValue((now + 61) * 1000);
+                    await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).rejects.toMatchObject({ statusCode: 409 });
+                    await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second',
+                        hash: `sha256:${'b'.repeat(64)}`, expiresAt: now + 120 })).rejects.toMatchObject({ statusCode: 413 });
+                    const pending = () => adapter.queryCanonicalStorage(stubEvent, {
+                        scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now: now + 61,
+                    });
+                    expect((await pending()).items).toEqual([]);
+                    const receipt = await getSqliteDb().selectFrom('upload_intents').select('expires_at').where('id', '=', request.intentId).executeTakeFirstOrThrow();
+                    expect(receipt.expires_at).toBe(now + 60);
+                } finally {
+                    currentTime.mockRestore();
+                }
+            });
+
+            it('retains a same-hash reservation after its first intent is cancelled and releases it on expiry', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'first', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'duplicate' });
+                await adapter.cancelUploadIntent(stubEvent, request);
+                const pending = () => adapter.queryCanonicalStorage(stubEvent, {
+                    scope: { workspaceId: WORKSPACE_ID }, kind: 'active_reservations', now,
+                });
+                expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'duplicate', hash: 'a'.repeat(64), sizeBytes: 60, expiresAt: now + 60 }]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
+                await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', 'duplicate').execute();
+                expect((await pending()).items).toEqual([]);
+                await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).resolves.toBeUndefined();
+            });
+
+            // Exact persisted receipts let storage commit retry after interruption.
+            // A changed tuple must never turn the consumed intent into a fresh grant.
+            it('accepts exact consumed receipt retries and rejects changed authorization fields', async () => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = {
+                    intentId: 'intent-commit', workspaceId: WORKSPACE_ID,
+                    hash: `sha256:${'c'.repeat(64)}`, mimeType: 'image/png', sizeBytes: 10,
+                    expiresAt: now + 60,
+                };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                await expect(adapter.consumeUploadIntent(stubEvent, {
+                    ...request, sizeBytes: 11, storageId: 'object-1',
+                })).rejects.toMatchObject({ statusCode: 409 });
+                await expect(adapter.consumeUploadIntent(stubEvent, {
+                    ...request, storageId: 'object-1',
+                })).resolves.toBeUndefined();
+                const before = await getSqliteDb().selectFrom('upload_intents').selectAll().where('id', '=', request.intentId).executeTakeFirstOrThrow();
+                await expect(adapter.consumeUploadIntent(stubEvent, {
+                    ...request, hash: request.hash.toUpperCase(), storageId: 'object-1',
+                })).resolves.toBeUndefined();
+                for (const changed of [
+                    { intentId: 'missing' }, { workspaceId: 'foreign' }, { hash: `sha256:${'d'.repeat(64)}` },
+                    { mimeType: 'image/jpeg' }, { sizeBytes: 11 }, { storageId: 'object-2' },
+                ]) {
+                    await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1', ...changed })).rejects.toMatchObject({ statusCode: 409 });
+                }
+                const after = await getSqliteDb().selectFrom('upload_intents').selectAll().where('id', '=', request.intentId).executeTakeFirstOrThrow();
+                expect(after).toEqual(before);
+            });
+
+            it.each(['expired', 'cancelled'] as const)('rejects a %s unconsumed authorization', async (status) => {
+                const now = Math.floor(Date.now() / 1000);
+                const request = { intentId: 'invalid', workspaceId: WORKSPACE_ID, hash: `sha256:${'a'.repeat(64)}`,
+                    mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60 };
+                await adapter.reserveUploadIntent(stubEvent, request);
+                if (status === 'cancelled') await adapter.cancelUploadIntent(stubEvent, request);
+                else await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', request.intentId).execute();
+                await expect(adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'object-1' })).rejects.toMatchObject({ statusCode: 409 });
+            });
         });
+    });
+
+    it('shares a bounded version watcher and releases it after the last subscriber', async () => {
+        vi.useFakeTimers();
+        const first: number[] = [], second: number[] = [];
+        const fail = vi.fn();
+        let stopFirst: (() => void) | undefined, stopSecond: (() => void) | undefined;
+        try {
+            stopFirst = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, version => first.push(version), fail);
+            stopSecond = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, version => second.push(version), fail);
+            await vi.advanceTimersByTimeAsync(0);
+            expect(first).toEqual([0]);
+            expect(second).toEqual([0]);
+            setWorkspaceVersion(2);
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(first).toEqual([0, 2]);
+            expect(second).toEqual([0, 2]);
+            stopFirst(); stopSecond();
+            setWorkspaceVersion(3);
+            await vi.advanceTimersByTimeAsync(4000);
+            expect(first).toEqual([0, 2]);
+            expect(second).toEqual([0, 2]);
+            expect(fail).not.toHaveBeenCalled();
+        } finally { stopFirst?.(); stopSecond?.(); vi.useRealTimers(); }
     });
 
     describe('workspace scope authorization', () => {
@@ -1753,14 +1993,24 @@ describe('SqliteSyncGatewayAdapter', () => {
             })).rejects.toMatchObject({ statusCode: 400 });
         });
 
-        it('binds a device cursor to its first authenticated owner', async () => {
-            setWorkspaceVersion(5);
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
-                scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 3,
-            });
-            await expect(adapter.updateCursor(makeSessionEvent('user-b'), {
+        it.each(['native', 'd1'] as const)('keeps same-device acknowledgements independent per user on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            await getSqliteDb().insertInto('server_version_counter').values({ workspace_id: WORKSPACE_ID, value: 5 }).execute();
+            await getSqliteDb().insertInto('device_cursors').values({ id: 'legacy', workspace_id: WORKSPACE_ID,
+                device_id: DEVICE_A, owner_user_id: null, last_seen_version: 0, updated_at: 1 }).execute();
+            await adapter.updateCursor(makeSessionEvent('user-b'), { scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 3 });
+            await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 4,
-            })).rejects.toMatchObject({ statusCode: 403 });
+            })).resolves.toBeUndefined();
+            const rows = await getSqliteDb().selectFrom('device_cursors').selectAll().where('workspace_id', '=', WORKSPACE_ID).execute();
+            expect(rows).toEqual(expect.arrayContaining([
+                expect.objectContaining({ owner_user_id: 'user-a', last_seen_version: 4 }),
+                expect.objectContaining({ owner_user_id: 'user-b', last_seen_version: 3 }),
+            ]));
+            expect(rows.find(row => row.id === 'legacy')?.owner_user_id).toBeNull();
+            await expect(adapter.updateCursor(makeSessionEvent('user-b'), {
+                scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 2,
+            })).rejects.toMatchObject({ statusCode: 409 });
         });
 
         it('rejects a cross-workspace cursor claim', async () => {
@@ -1935,6 +2185,196 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('notification ownership', () => {
+        // A cursor advances over other users' filtered changes. The owner's
+        // delete must remain visible after that gap, including ownerless wire
+        // payloads emitted by the host's delete capture.
+        it.each(['sqlite', 'd1'].flatMap(runtime => ['object', 'absent'].map(payloadMode => ({ runtime, payloadMode }))))('delivers an own notification delete with $payloadMode payload to the peer after filtered changes on $runtime', async ({ runtime, payloadMode }) => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'deleted-note' })]));
+            const peer = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 20 });
+            expect(peer.changes.map(change => change.pk)).toEqual(['deleted-note']);
+            await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'filtered-note' })]));
+            const deletion = makeOp({ tableName: 'notifications', pk: 'deleted-note', operation: 'delete',
+                payload: { id: 'deleted-note', deleted: true },
+                stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } });
+            if (payloadMode === 'absent') delete deletion.payload;
+            const result = await adapter.push(alice, makeBatch([deletion]));
+            expect(result.results[0]).toMatchObject({ success: true, applied: true, serverVersion: 3 });
+            const changes = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: peer.nextCursor, limit: 20 });
+            expect(changes.changes).toEqual([expect.objectContaining({ tableName: 'notifications', pk: 'deleted-note', op: 'delete',
+                payload: expect.objectContaining({ user_id: 'user-alice' }) })]);
+            expect(changes.nextCursor).toBe(3);
+            const foreign = await adapter.pull(bob, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 20 });
+            expect(foreign.changes).toEqual([]);
+            expect(foreign.nextCursor).toBe(3);
+            const replay = await adapter.push(alice, makeBatch([deletion]));
+            expect(replay.results[0]).toMatchObject({ success: true, replayed: true, serverVersion: 3 });
+            expect(replay.serverVersion).toBe(3);
+            // A lost acknowledgement can cross an upgrade. Earlier delete
+            // receipts lack the server-owned user_id; intent is still equal.
+            const query = 'UPDATE change_log SET payload_json = ? WHERE op_id = ?';
+            if (runtime === 'd1') await d1TestDatabase!.database.prepare(query).bind(JSON.stringify(deletion.payload) ?? null, deletion.stamp.opId).run();
+            else getRawDb().prepare(query).run(JSON.stringify(deletion.payload) ?? null, deletion.stamp.opId);
+            const upgradedReplay = await adapter.push(alice, makeBatch([deletion]));
+            expect(upgradedReplay.results[0]).toMatchObject({ success: true, replayed: true, serverVersion: 3 });
+            expect(upgradedReplay.serverVersion).toBe(3);
+            const foreignReplay = await adapter.push(bob, makeBatch([deletion]));
+            expect(foreignReplay.results[0]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
+        });
+        // A denied concurrent write must neither consume a version nor leave
+        // gaps between successful operations in the same atomic push.
+        it('keeps D1 notification ownership atomic across concurrent first puts', async () => {
+            await useD1TestDatabase();
+            const database = d1TestDatabase!.database;
+            const batch = database.batch.bind(database);
+            let raced = false;
+            database.batch = async statements => {
+                if (!raced) {
+                    raced = true;
+                    await adapter.push(makeSessionEvent('user-alice'), makeBatch([makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'private' } })]));
+                }
+                return batch(statements);
+            };
+            const result = await adapter.push(makeSessionEvent('user-bob'), makeBatch([
+                makeOp({ tableName: 'threads', pk: 'before' }),
+                makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'stolen' },
+                    stamp: { clock: 10, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } }),
+                makeOp({ tableName: 'threads', pk: 'after' }),
+            ]));
+            expect(result.results[1]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
+            expect(result.results[1]).not.toHaveProperty('winner');
+            expect(result.results[1]).not.toHaveProperty('payload');
+            expect(result.serverVersion).toBe(3);
+            expect((await database.prepare('SELECT server_version FROM change_log ORDER BY server_version').all()).results)
+                .toEqual([{ server_version: 1 }, { server_version: 2 }, { server_version: 3 }]);
+            const deleted = await adapter.push(makeSessionEvent('user-bob'), makeBatch([
+                makeOp({ tableName: 'threads', pk: 'after', operation: 'delete',
+                    stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } }),
+            ]));
+            expect(deleted.serverVersion).toBe(4);
+            expect((await database.prepare('SELECT server_version FROM tombstones WHERE pk = ?').bind('after').all()).results)
+                .toEqual([{ server_version: 4 }]);
+            const alice = await adapter.snapshot(makeSessionEvent('user-alice'), { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
+            expect(alice.items).toEqual([expect.objectContaining({ payload: expect.objectContaining({ title: 'private' }) })]);
+        });
+
+        // Eviction after the header read must be reported as expiry, never an
+        // empty final page that a consumer could accept as a complete snapshot.
+        it.each(['snapshot', 'backupSnapshot'] as const)('rejects %s evicted during a D1 page read', async method => {
+            await useD1TestDatabase();
+            const actor = makeSessionEvent('user-alice');
+            const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
+            await adapter.push(actor, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))));
+            const first = await adapter[method](actor, request);
+            expect(first.nextPageToken).toBeTruthy();
+            const database = d1TestDatabase!.database;
+            await database.prepare('UPDATE sync_snapshots SET created_at = 0 WHERE id = ?').bind(first.snapshotId).run();
+            const prepare = database.prepare.bind(database);
+            let raced = false;
+            database.prepare = sql => {
+                const statement = prepare(sql);
+                if (sql.includes('FROM sync_snapshot_items')) {
+                    const bind = statement.bind.bind(statement);
+                    statement.bind = (...args) => {
+                        const bound = bind(...args);
+                        const all = bound.all.bind(bound);
+                        bound.all = async <T>() => {
+                            if (!raced) {
+                                raced = true;
+                                for (let i = 0; i < 4; i++) await adapter[method](actor, request);
+                            }
+                            return all<T>();
+                        };
+                        return bound;
+                    };
+                }
+                return statement;
+            };
+            await expect(adapter[method](actor, { ...request, pageToken: first.nextPageToken! }))
+                .rejects.toMatchObject({ statusCode: 410 });
+            expect(raced).toBe(true);
+        });
+
+        // Failure inventory: high-clock puts steal rows, low-clock puts leak
+        // winners, and a stolen snapshot token reads another user's frozen rows.
+        it.each(['sqlite', 'd1'] as const)('rejects foreign notification puts without leaking winners on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                payload: { id: 'owned', title: 'private' },
+                stamp: { clock: 5, hlc: '2025-01-05T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            for (const clock of [1, 10]) {
+                const result = await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                    payload: { id: 'owned', title: 'stolen' },
+                    stamp: { clock, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } })]));
+                expect(result.results[0]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
+                expect(result.results[0]).not.toHaveProperty('winner');
+                expect(result.results[0]).not.toHaveProperty('payload');
+                expect(result.serverVersion).toBe(1);
+            }
+            const page = await adapter.snapshot(alice, { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
+            expect(page.items).toEqual([expect.objectContaining({ payload: expect.objectContaining({ title: 'private', user_id: 'user-alice' }) })]);
+            const ownUpdate = await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                payload: { id: 'owned', title: 'updated' },
+                stamp: { clock: 20, hlc: '2025-01-20T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            expect(ownUpdate.results[0]).toMatchObject({ success: true, applied: true });
+        });
+
+        it.each(['sqlite', 'd1'] as const)('binds sync and backup continuation to the capturing user on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk, payload: { id: pk, title: 'private' } }))));
+            for (const method of ['snapshot', 'backupSnapshot'] as const) {
+                const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
+                const first = await adapter[method](alice, request);
+                expect(first.nextPageToken).toBeTruthy();
+                await expect(adapter[method](bob, { ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 403 });
+                const next = await adapter[method](alice, { ...request, pageToken: first.nextPageToken! });
+                expect(next.items).toEqual([expect.objectContaining({ pk: 'b' })]);
+            }
+        });
+
+        // Repeated first pages must have bounded retained copies, independent
+        // users must still bootstrap, and expiry must remove copied rows too.
+        it.each(['sqlite', 'd1'] as const)('bounds retained copies per user and prunes expired copies on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const alice = makeSessionEvent('user-alice');
+            const bob = makeSessionEvent('user-bob');
+            await adapter.push(alice, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))));
+            const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
+            const first = await adapter.snapshot(alice, request);
+            const bobFirst = await adapter.snapshot(bob, request);
+            let last = first;
+            for (let i = 0; i < 7; i++) last = await adapter[i % 2 ? 'backupSnapshot' : 'snapshot'](alice, request);
+            const sql = 'SELECT count(*) AS count FROM sync_snapshots';
+            const count = runtime === 'd1'
+                ? (await d1TestDatabase!.database.prepare(sql).all<{ count: number }>()).results![0]!.count
+                : (getRawDb().prepare(sql).get() as { count: number }).count;
+            expect(count).toBeLessThanOrEqual(5);
+            await expect(adapter.snapshot(alice, { ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 410 });
+            expect(last.nextPageToken).toBeTruthy();
+            expect((await adapter.snapshot(alice, { ...request, pageToken: last.nextPageToken! })).items).toHaveLength(1);
+            const retainedBob = runtime === 'd1'
+                ? (await d1TestDatabase!.database.prepare('SELECT id FROM sync_snapshots WHERE id = ?').bind(bobFirst.snapshotId).all()).results
+                : getRawDb().prepare('SELECT id FROM sync_snapshots WHERE id = ?').all(bobFirst.snapshotId);
+            expect(retainedBob).toHaveLength(1);
+            if (runtime === 'd1') await d1TestDatabase!.database.prepare('UPDATE sync_snapshots SET expires_at = 0').run();
+            else getRawDb().prepare('UPDATE sync_snapshots SET expires_at = 0').run();
+            const { pruneExpiredSyncSnapshots } = await import('../server/sync/sqlite-sync-gateway-adapter');
+            await pruneExpiredSyncSnapshots();
+            for (const table of ['sync_snapshots', 'sync_snapshot_items']) {
+                const query = `SELECT count(*) AS count FROM ${table}`;
+                const remaining = runtime === 'd1'
+                    ? (await d1TestDatabase!.database.prepare(query).all<{ count: number }>()).results![0]!.count
+                    : (getRawDb().prepare(query).get() as { count: number }).count;
+                expect(remaining).toBe(0);
+            }
+        });
+
         it('binds user_id, rejects spoofed owners, and scopes pull/snapshot', async () => {
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');
