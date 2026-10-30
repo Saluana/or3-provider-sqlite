@@ -400,3 +400,4 @@ cancels preparation and restores admission rather than treating failure as idle.
 An additive covering index migration keeps counts off stored response bodies.
 
 Admin workspace summaries, workspace details, and deployment-admin lists expose `createdAt` in Unix milliseconds for the host UI. SQLite continues to store the underlying creation timestamps in Unix seconds; no data migration is needed.
+Background history admission and finalization failures expose structured codes for validation, authorization, conflicts, and supersession. Transient SQLite failures retain their original errors for retry.
