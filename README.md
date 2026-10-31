@@ -405,5 +405,14 @@ history delivery prevent replacement. Database failures propagate so the host
 cancels preparation and restores admission rather than treating failure as idle.
 An additive covering index migration keeps counts off stored response bodies.
 
+A host that tracks in-flight workers and reconciliation can opt into
+`getShutdownBlockerCount({ allowPersistedDelegation: true })`. Native SQLite then
+allows saved delegation waits and terminal delegation delivery to remain pending
+across restart when there is no live or indeterminate worker lease. Active model
+jobs still block. This read-only count changes no retention, authorization,
+recovery or replay rules: inaccessible or damaged evidence stays preserved.
+D1 and callers that omit the option retain the conservative count. This support
+is a source change after 0.0.25 and requires a matching host update.
+
 Admin workspace summaries, workspace details, and deployment-admin lists expose `createdAt` in Unix milliseconds for the host UI. SQLite continues to store the underlying creation timestamps in Unix seconds; no data migration is needed.
 Background history admission and finalization failures expose structured codes for validation, authorization, conflicts, and supersession. Transient SQLite failures retain their original errors for retry.

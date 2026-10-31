@@ -523,7 +523,7 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         expect(fetchModel).toHaveBeenCalledOnce();
     });
 
-    it.each(['resume', 'stop'] as const)('keeps parked parents as shutdown blockers during preparation (%s)', async outcome => {
+    it.each(['resume', 'stop'] as const)('drains persisted parents without admitting new work during preparation (%s)', async outcome => {
         const delegate = { type: 'function' as const, function: { name: 'delegate_chat', description: 'Delegate',
             parameters: { type: 'object' as const, properties: {} } } };
         const body = { model: 'fixture/model', messages: [{ role: 'user', content: 'Parent task' }], tools: [delegate],
@@ -546,7 +546,7 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         await reopen();
         expect(await provider.getShutdownBlockerCount()).toBeGreaterThan(0);
         const controller = getShutdownRuntime().controller;
-        const preparation = controller.prepare('fixture-preparation', 5_000);
+        const preparation = controller.prepare('fixture-preparation', 500);
         try {
             expect(controller.phase()).toBe('preparing');
             expect(await reconcileDueDelegationWaits(provider, 1)).toBe(1);
@@ -564,14 +564,15 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
                 finally { clock.mockRestore(); }
                 expect(await provider.getShutdownBlockerCount()).toBe(0);
                 expect(fetchModel).toHaveBeenCalledOnce();
-                expect(await preparation).toEqual({ drained: true });
             }
+            expect(await preparation).toEqual({ drained: true });
         } finally {
             controller.cancel('fixture-preparation');
             await preparation;
         }
         expect(controller.phase()).toBe('running');
         if (outcome === 'stop') return;
+        await reopen();
         const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 5_001);
         try {
             expect(await reconcileDueDelegationWaits(provider, 1)).toBe(1);
@@ -579,7 +580,8 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         } finally { clock.mockRestore(); }
     });
 
-    it('parks, reopens, finishes the child, and resumes the ordered parent tool queue', async () => {
+    it.each(['available', 'deleted before finalization', 'deleted after lost acknowledgement', 'restored during finalization'] as const)(
+        'parks, reopens, and resumes the ordered parent tool queue with child history %s', async historyChange => {
         const delegate = { type: 'function' as const, function: { name: 'delegate_chat', description: 'Delegate',
             parameters: { type: 'object' as const, properties: {} } } };
         const later = { type: 'function' as const, function: { name: 'later_tool', description: 'Later',
@@ -654,7 +656,53 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         expect(saving.tool_calls?.find(call => call.id === 'delegate-call')?.delegation).toEqual({ version: 3,
             callId: 'delegate-call', children: [{ index: 0, threadId: child.threadId, modelName: 'fixture/model', outcome: 'saving' }] });
         expect(JSON.stringify(saving)).not.toContain('child answer');
-        expect(await reconcileBackgroundJobHistory(provider, (await provider.getJob(child.jobId, actor.userId))!)).toBe('committed');
+        if (historyChange === 'deleted after lost acknowledgement') {
+            const interrupted = Object.create(provider) as SqliteBackgroundJobProvider;
+            interrupted.setHistoryPhase = async (id, phase, options) => {
+                if (phase === 'committed') throw new Error('Lost job-store acknowledgement');
+                return provider.setHistoryPhase(id, phase, options);
+            };
+            await expect(reconcileBackgroundJobHistory(interrupted, (await provider.getJob(child.jobId, actor.userId))!))
+                .rejects.toThrow('Lost job-store acknowledgement');
+        }
+        const deleted = historyChange !== 'available';
+        const deleteThread = async (clock: number) => {
+            const result = await sync.push(actor, { scope: { workspaceId: actor.workspaceId }, ops: [{
+                id: `delete-child-thread-${clock}`, tableName: 'threads', operation: 'delete', pk: child.threadId,
+                payload: { deleted_at: 1 }, stamp: { deviceId: 'other-device', opId: `delete-child-thread-${clock}`,
+                    hlc: '2026-10-31T00:00:00.000Z-0000', clock }, createdAt: 1, attempts: 0, status: 'pending',
+            }] });
+            expect(result.results[0]).toMatchObject({ success: true });
+        };
+        if (deleted) { await deleteThread(2); await reopen(); }
+        if (historyChange === 'restored during finalization') {
+            const finalize = sync.finalizeChatGeneration.bind(sync);
+            const race = vi.spyOn(sync, 'finalizeChatGeneration').mockImplementationOnce(async (writer, request) => {
+                const restored = await sync.push(actor, { scope: { workspaceId: actor.workspaceId }, ops: [
+                    { id: 'new-project', tableName: 'projects', operation: 'put', pk: 'new-project',
+                        payload: { id: 'new-project', name: 'Project', data: [] },
+                        stamp: { deviceId: 'other-device', opId: 'new-project', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
+                        createdAt: 1, attempts: 0, status: 'pending' },
+                    { id: 'restore-child', tableName: 'threads', operation: 'put', pk: child.threadId,
+                        payload: { id: child.threadId, project_id: 'new-project' },
+                        stamp: { deviceId: 'other-device', opId: 'restore-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                        createdAt: 1, attempts: 0, status: 'pending' },
+                ] });
+                expect(restored.results).toEqual([expect.objectContaining({ success: true }), expect.objectContaining({ success: true })]);
+                return finalize(writer, request);
+            });
+            await expect(reconcileBackgroundJobHistory(provider, (await provider.getJob(child.jobId, actor.userId))!))
+                .rejects.toMatchObject({ historyFailure: 'retry' });
+            race.mockRestore();
+            expect(await reconcileBackgroundJobHistory(provider, (await provider.getJob(child.jobId, actor.userId))!)).toBe('unchanged');
+            expect(getRawDb().prepare("SELECT 1 FROM background_generation_receipts WHERE generation_id = ? AND stage = 'finalization'")
+                .get((await provider.getJob(child.jobId, actor.userId))!.generationId)).toBeUndefined();
+            await deleteThread(4);
+        }
+        expect(await reconcileBackgroundJobHistory(provider, (await provider.getJob(child.jobId, actor.userId))!))
+            .toBe(deleted && historyChange !== 'deleted after lost acknowledgement' ? 'superseded' : 'committed');
+        if (deleted) expect((await sync.readChatHistory(actor, { kind: 'thread', thread_id: child.threadId })).thread)
+            .toMatchObject({ deleted: true });
         const future = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 61 * 60 * 1000);
         try { await provider.cleanupExpired(); } finally { future.mockRestore(); }
         expect(await provider.getJob(parentId, actor.userId)).toBeTruthy();
@@ -662,7 +710,7 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         expect(await reconcileDelegationChild(provider, parentId, actor.userId, 'coordinator', 0)).toBe('committed');
         expect(projectJobView((await provider.getJob(parentId, actor.userId))!).tool_calls?.find(call => call.id === 'delegate-call')?.delegation)
             .toEqual({ version: 2, callId: 'delegate-call', children: [
-                { index: 0, threadId: child.threadId, modelName: 'fixture/model', outcome: 'complete' },
+                { index: 0, threadId: child.threadId, modelName: 'fixture/model', outcome: deleted ? 'unavailable' : 'complete' },
             ] });
         const due = Date.now() + 5_001;
         expect(await provider.claimNextDelegationWait('resume-coordinator', due, due + 60_000)).toMatchObject({ id: parentId });
@@ -682,9 +730,9 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         const parentRecord = beforePrune.messages?.find(message => message.id === history.messageId);
         expect(parentRecord?.data).toMatchObject({ content: 'parent answer', tool_calls: expect.arrayContaining([
             expect.objectContaining({ id: 'delegate-call', delegation: { version: 1, callId: 'delegate-call',
-                children: [{ index: 0, threadId: child.threadId, modelName: 'fixture/model', outcome: 'complete' }] } }),
+                children: [{ index: 0, threadId: child.threadId, modelName: 'fixture/model', outcome: deleted ? 'unavailable' : 'complete' }] } }),
         ]) });
-        expect(beforePrune.messages?.find(message => message.id === child.assistantMessageId)?.data)
+        if (!deleted) expect(beforePrune.messages?.find(message => message.id === child.assistantMessageId)?.data)
             .toMatchObject({ content: 'child answer' });
 
         // The retained canonical records, not expired job rows, must supply the

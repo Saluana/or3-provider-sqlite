@@ -1684,7 +1684,26 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         return row?.total ?? 0;
     }
 
-    async getShutdownBlockerCount(): Promise<number> {
+    async getShutdownBlockerCount(options?: { allowPersistedDelegation?: boolean }): Promise<number> {
+        if (options?.allowPersistedDelegation && !isD1Driver()) {
+            // A saved wait or terminal delivery needs recovery, not this process.
+            // Keep the rows/receipts and existing retention/claim rules unchanged.
+            // The host also waits for tracked execution and history writes.
+            const row = await one<{ total: number }>(
+                `SELECT COUNT(*) AS total FROM background_jobs
+                 WHERE (status = 'streaming' OR history_phase IN ('admission_pending', 'finalization_pending')
+                     OR delegation_wait_active = 1 OR json_type(execution_json, '$.delegationWait') IS NOT NULL)
+                 AND NOT (
+                     COALESCE(kind, 'chat') = 'chat'
+                     AND ((lease_owner IS NULL AND lease_expires_at IS NULL)
+                         OR (lease_owner IS NOT NULL AND typeof(lease_expires_at) = 'integer' AND lease_expires_at <= ?))
+                     AND (delegation_wait_active = 1
+                         OR (status != 'streaming' AND json_extract(execution_json, '$.delegationRecoveryPolicy') IS 'v1'))
+                 )`, Date.now()
+            );
+            if (!row) throw new Error('SQLite shutdown accounting unavailable');
+            return row.total;
+        }
         // Disjoint counts include terminal waits that still require child cleanup.
         const row = await one<{ total: number }>(
             `SELECT

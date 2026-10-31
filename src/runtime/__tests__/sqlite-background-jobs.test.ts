@@ -175,6 +175,7 @@ describe('SQLite durable request usage', () => {
         await reopen();
         expect(await provider.getActiveJobCount()).toBe(1);
         expect(await provider.getShutdownBlockerCount()).toBe(6);
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(6);
         await provider.abortJob(parked, params.userId);
         await provider.abortJob(workflow, params.userId);
         expect(await provider.getShutdownBlockerCount()).toBe(5);
@@ -186,6 +187,7 @@ describe('SQLite durable request usage', () => {
         expect((await provider.getJob(terminal[0]!, params.userId))?.content).toBe('saved');
         await destroySqliteDb();
         await expect(provider.getShutdownBlockerCount()).rejects.toThrow();
+        await expect(provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).rejects.toThrow();
     });
 
     beforeEach(async () => {
@@ -1397,6 +1399,7 @@ describe('SQLite durable request usage', () => {
             await reopen();
             expect(await provider.getJob(admitted.jobId, params.userId)).not.toBeNull();
             expect((await provider.getJob(parent.id, params.userId))!.execution).toHaveProperty('delegationWait');
+            expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(0);
             _resetAuthHookEngineForTesting();
             if (denial === 'membership downgrade') getRawDb().prepare("UPDATE workspace_members SET role = 'owner' WHERE workspace_id = ? AND user_id = ?")
                 .run(execution.workspaceId, params.userId);
@@ -1443,6 +1446,7 @@ describe('SQLite durable request usage', () => {
         expect((await provider.getJob(input.parentJobId, params.userId))!.execution).toHaveProperty('delegationWait');
         expect(await provider.getJob(admitted.jobId, params.userId)).toMatchObject({ status: 'aborted', execution: { delegationDispatch: { state: 'started' } } });
         expect(await provider.getShutdownBlockerCount()).toBeGreaterThan(0);
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(0);
         expect(getRawDb().prepare("SELECT 1 FROM background_generation_receipts WHERE generation_id IN (?, ?) AND stage = 'finalization'")
             .get(params.generationId, ids.generationId)).toBeUndefined();
         const unrelated = await provider.createJob({ ...params, userId: 'another-user', execution: { ...execution, workspaceId: 'another-workspace' } });
@@ -2140,6 +2144,7 @@ describe('SQLite durable request usage', () => {
     it('parks a delegated parent without a model slot and recovers it after reopen', async () => {
         const now = Date.now();
         const id = await provider.createJob({ ...params, execution });
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(1);
         await provider.claimJob(id, 'model-worker', now, now + 60_000);
         const waiting = { ...execution, delegationWait: {
             version: 1 as const, revision: 0, callId: 'call', argumentFingerprint: `sha256:v1:${'a'.repeat(64)}`,
@@ -2158,13 +2163,24 @@ describe('SQLite durable request usage', () => {
         expect(await provider.parkDelegationWait(id, 'model-worker', waiting, [])).toBe(true);
         expect(await provider.getActiveJobCount()).toBe(0);
         expect(await provider.getShutdownBlockerCount()).toBe(1);
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(0);
         expect(await provider.claimNextJob('model-next', now, now + 60_000)).toBeNull();
         await reopen();
         const claimed = await provider.claimNextDelegationWait('coordinator', now, now + 60_000);
         expect(claimed).toMatchObject({ id, attempts: 1, leaseOwner: 'coordinator', execution: { delegationWait: { callId: 'call' } } });
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(1);
         expect(await provider.claimNextDelegationWait('other', now, now + 60_000)).toBeNull();
         const reclaimed = await provider.claimNextDelegationWait('new-coordinator', now + 60_001, now + 120_000);
         expect(reclaimed).toMatchObject({ id, attempts: 1, leaseOwner: 'new-coordinator' });
+        // Inconsistent leases cannot prove that execution has stopped.
+        for (const [owner, expiry, blockers] of [
+            ['worker', null, 1], [null, now + 60_000, 1], ['worker', 'invalid', 1],
+            ['worker', now - 1, 0], [null, null, 0],
+        ] as const) {
+            getRawDb().prepare('UPDATE background_jobs SET lease_owner = ?, lease_expires_at = ? WHERE id = ?')
+                .run(owner, expiry, id);
+            expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(blockers);
+        }
     });
 
     it('rejects malformed waits before parking and does not time out a parked parent', async () => {
@@ -2206,6 +2222,7 @@ describe('SQLite durable request usage', () => {
         await reopen();
         expect(await provider.getJob(id, params.userId)).toMatchObject({ status: 'aborted' });
         expect(await provider.getShutdownBlockerCount()).toBe(1);
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(0);
     });
 
     it('retains linked child evidence when a terminal parent loses its wait', async () => {
@@ -2931,6 +2948,7 @@ describe('SQLite background jobs with D1', () => {
         await expect(provider.claimNextDelegationWait('coordinator', now, now + 60_000)).resolves.toBeNull();
         expect(String(warning.mock.calls[0]![0])).toContain(id);
         expect((await provider.getJob(id, 'owner'))?.execution).toMatchObject({ delegationQuarantinedAt: now });
+        expect(await provider.getShutdownBlockerCount({ allowPersistedDelegation: true })).toBe(1);
         expect(await provider.claimNextDelegationWait('next', now, now + 60_000)).toBeNull();
     });
 
