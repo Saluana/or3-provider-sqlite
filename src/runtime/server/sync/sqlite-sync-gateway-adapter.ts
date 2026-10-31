@@ -1,3 +1,4 @@
+import { backgroundFinalizationFingerprint, stableJson } from './background-history-fingerprint';
 import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspace-item-capability';
 /**
  * SQLite implementation of SyncGatewayAdapter.
@@ -56,9 +57,11 @@ import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
 import { readRequestUsage } from '~~/shared/chat/compaction';
+import { matchesToolResultStorage, parseToolResultArtifact, prepareToolResultStorage, toolResultArtifactPrefix, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
 import { validateCanonicalChatQuery, encodeCanonicalChatSeek, parseCanonicalChatSeek, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
 import type { CanonicalHistoryRecord } from '~~/shared/chat/background-history';
 import { computePullRetention } from './history-gc-policy';
+import { resolveCanonicalProjectOwnership } from './canonical-project-ownership';
 
 const DEFAULT_PULL_LIMIT = 100;
 const MAX_PULL_LIMIT = 1000;
@@ -185,15 +188,6 @@ export async function pruneExpiredSyncSnapshots(): Promise<void> {
     }
 }
 
-function stableJson(value: unknown): string {
-    if (value === undefined) return 'undefined';
-    if (value === null || typeof value !== 'object') return JSON.stringify(value);
-    if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-    const record = value as Record<string, unknown>;
-    return `{${Object.keys(record).sort().map((key) =>
-        `${JSON.stringify(key)}:${stableJson(record[key])}`
-    ).join(',')}}`;
-}
 
 function backgroundHistoryOpId(
     admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
@@ -860,6 +854,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   snapshotBootstrap: 'snapshot-v1',
                   historyRetention: 'snapshot-v1',
                   backgroundGenerationHistory: 'v1',
+                  delegationTerminalHistory: 'v1',
                   canonicalChatHistory: 'v1',
                   projectOwnership: 'v1',
                   workspaceItems: 'v1',
@@ -897,32 +892,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 const thread = row ? parse(row) : undefined;
                 if (!thread) return { status: 'ok' as const, project_ownership: 'resolved' as const,
                     revision: String(threadRevision?.value ?? 0), thread };
-                if (thread.project_id) {
-                    const owner = raw.prepare('SELECT id FROM s_projects WHERE workspace_id = ? AND id = ? AND COALESCE(deleted, 0) = 0')
-                        .get(actor.workspaceId, thread.project_id);
-                    // Deletion releases ownership even if a concurrent LWW
-                    // thread write retained its pointer. Never fall back to
-                    // legacy folders when an explicit pointer was supplied.
-                    return { status: 'ok' as const, project_ownership: 'resolved' as const,
-                        revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: owner ? thread.project_id : null } };
-                }
-                // Legacy folder membership is authoritative when the chat has no
-                // pointer. Resolve it in this same authorized SQLite snapshot.
-                const projects = raw.prepare('SELECT id, data_json FROM s_projects WHERE workspace_id = ? AND COALESCE(deleted, 0) = 0')
-                    .all(actor.workspaceId) as { id: string; data_json: string }[];
-                const owners = projects.filter(project => {
-                    const payload = JSON.parse(project.data_json);
-                    const entries: unknown = typeof payload.data === 'string' ? JSON.parse(payload.data) : payload.data ?? [];
-                    if (!Array.isArray(entries)) throw new Error('Canonical project membership is unresolved.');
-                    return entries.some(entry => {
-                        if (typeof entry === 'string') return entry.trim() === query.thread_id;
-                        if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.id !== 'string') return false;
-                        const kind = typeof entry.kind === 'string' ? entry.kind.trim().toLowerCase() : entry.kind;
-                        return (kind === undefined || kind === 'chat') && entry.id.trim() === query.thread_id;
-                    });
-                });
-                return { status: 'ok' as const, project_ownership: owners.length > 1 ? 'conflict' as const : 'resolved' as const,
-                    revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: owners[0]?.id ?? null } };
+                const ownership = resolveCanonicalProjectOwnership(raw, actor.workspaceId, query.thread_id, thread.project_id);
+                return { status: 'ok' as const, project_ownership: ownership.status,
+                    revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: ownership.projectId } };
             }
             if (query.kind === 'messages') {
                 if (!query.message_ids.length) return { status: 'ok' as const, revision, messages: [] };
@@ -1179,9 +1151,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             throw Object.assign(new Error('Invalid background history workspace'), { code: 'VALIDATION_ERROR' });
         }
         const raw = getRawDb();
-        const fingerprint = createHash('sha256')
-            .update(stableJson(input))
-            .digest('hex');
+        // Preconditions may change on replay; the admission and result may not.
+        const fingerprint = backgroundFinalizationFingerprint(input);
         return raw.transaction(() => {
             this.assertCanonicalActor(actor);
             const receipt = raw
@@ -1208,6 +1179,22 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                           reason: receipt.outcome as 'deleted' | 'newer_generation' | 'edited' | 'missing',
                       };
             }
+            if (input.snapshot.expectedWorkspaceRevision !== undefined) {
+                const expected = input.snapshot.expectedWorkspaceRevision;
+                if (typeof expected !== 'string' || !/^(0|[1-9][0-9]*)$/.test(expected) || expected.length > 16)
+                    throw Object.assign(new Error('Invalid terminal delegation revision'), { code: 'VALIDATION_ERROR' });
+                const current = raw.prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
+                    .get(admission.workspaceId) as { value: number } | undefined;
+                if (String(current?.value ?? 0) !== expected)
+                    throw Object.assign(new Error('Canonical history changed during delegation finalization'), { code: 'ERR_DELEGATION_HISTORY_REVISION', retryable: true });
+            }
+            const thread = raw.prepare('SELECT deleted FROM s_threads WHERE workspace_id = ? AND id = ?')
+                .get(admission.workspaceId, admission.threadId) as { deleted: number } | undefined;
+            const threadUnavailable = !thread || !!thread.deleted;
+            if (input.snapshot.onlyIfThreadUnavailable !== undefined && input.snapshot.onlyIfThreadUnavailable !== true)
+                throw Object.assign(new Error('Invalid thread precondition'), { code: 'VALIDATION_ERROR' });
+            if (input.snapshot.onlyIfThreadUnavailable && !threadUnavailable)
+                throw Object.assign(new Error('Canonical thread is available again'), { code: 'ERR_DELEGATION_HISTORY_REVISION', retryable: true });
             const row = raw
                 .prepare(
                     `SELECT data_json, clock, deleted FROM s_messages
@@ -1221,7 +1208,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ? (current.data as Record<string, unknown>)
                 : {};
             let superseded: 'deleted' | 'newer_generation' | 'edited' | 'missing' | null = null;
-            if (!row || !current) superseded = 'missing';
+            if (threadUnavailable) superseded = 'deleted';
+            else if (!row || !current) superseded = 'missing';
             else if (row.deleted === 1 || current.deleted === true) superseded = 'deleted';
             else if (data.generation_id !== admission.generationId) superseded = 'newer_generation';
             else if (row.clock !== admission.assistantMessage.clock) superseded = 'edited';
@@ -1302,6 +1290,127 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                  VALUES (?, ?, ?, 'finalization', ?, 'committed', ?, ?)`
             ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, serverVersion, now);
             return { status: 'committed' as const, replayed: false, serverVersion };
+        }).immediate();
+    }
+
+    private assertRetainedToolParent(actor: CanonicalHistoryActor, admission: ChatGenerationAdmissionEnvelope): void {
+        if (actor.workspaceId !== admission.workspaceId) throw Object.assign(new Error('Invalid tool result workspace'), { code: 'VALIDATION_ERROR' });
+        this.assertCanonicalActor(actor);
+        const raw = getRawDb();
+        const receipt = raw.prepare(`SELECT fingerprint, outcome FROM background_generation_receipts
+            WHERE workspace_id = ? AND generation_id = ? AND stage = 'admission'`)
+            .get(admission.workspaceId, admission.generationId) as { fingerprint: string; outcome: string } | undefined;
+        const fingerprint = createHash('sha256').update(stableJson(admission)).digest('hex');
+        const thread = raw.prepare('SELECT deleted FROM s_threads WHERE workspace_id = ? AND id = ?')
+            .get(admission.workspaceId, admission.threadId) as { deleted: number } | undefined;
+        const assistant = raw.prepare('SELECT data_json, clock, deleted FROM s_messages WHERE workspace_id = ? AND id = ?')
+            .get(admission.workspaceId, admission.messageId) as { data_json: string; clock: number; deleted: number } | undefined;
+        const message = assistant ? JSON.parse(assistant.data_json) as { thread_id?: unknown; pending?: unknown; deleted?: unknown; data?: { generation_id?: unknown } } : undefined;
+        if (!receipt || receipt.outcome !== 'admitted' || receipt.fingerprint !== fingerprint || !thread || thread.deleted ||
+            !assistant || assistant.deleted || assistant.clock !== admission.assistantMessage.clock ||
+            !message || message.thread_id !== admission.threadId || message.deleted === true || message.pending !== true || message.data?.generation_id !== admission.generationId)
+            throw Object.assign(new Error('Tool result parent history is unavailable'), { code: 'SUPERSEDED' });
+    }
+
+    /** Persist immutable tool-result chunks and their sync changes in one workspace transaction. */
+    async retainChatToolResult(
+        actor: CanonicalHistoryActor,
+        input: { admission: ChatGenerationAdmissionEnvelope; callId: string; reference: string; rows: ToolResultArtifactRow[] },
+    ): Promise<void> {
+        const admission = parseRequiredHistoryAdmission(input.admission);
+        if (isD1Driver()) throw Object.assign(new Error('SQLite D1 does not support tool result retention'), { code: 'UNSUPPORTED' });
+        if (actor.workspaceId !== admission.workspaceId || typeof input.callId !== 'string' || !input.callId ||
+            new TextEncoder().encode(input.callId).length > 512 || !Array.isArray(input.rows) ||
+            !input.rows.length || input.rows.length > 32 || typeof input.reference !== 'string' || input.reference.length > 2048 ||
+            input.rows.some(row => !row || typeof row.value !== 'string' || new TextEncoder().encode(row.value).length > 64 * 1024 ||
+                row.clock !== 1 || row.deleted !== false || !Number.isSafeInteger(row.created_at) || row.created_at < 0 ||
+                !Number.isSafeInteger(row.updated_at) || row.updated_at < 0))
+            throw Object.assign(new Error('Invalid tool result retention'), { code: 'VALIDATION_ERROR' });
+        const content = input.rows.map(row => row.value).join('');
+        if (new TextEncoder().encode(content).length > 256 * 1024)
+            throw Object.assign(new Error('Invalid tool result size'), { code: 'VALIDATION_ERROR' });
+        const expected = await prepareToolResultStorage(content, { threadId: admission.threadId,
+            parentAssistantId: admission.messageId, callId: input.callId });
+        if (expected.result !== input.reference || expected.rows.length !== input.rows.length || expected.rows.some((row, index) =>
+            row.id !== input.rows[index]?.id || row.name !== input.rows[index]?.name || row.value !== input.rows[index]?.value))
+            throw Object.assign(new Error('Invalid tool result identity'), { code: 'VALIDATION_ERROR' });
+        const raw = getRawDb();
+        raw.transaction(() => {
+            this.assertRetainedToolParent(actor, admission);
+            const newRows: ToolResultArtifactRow[] = [];
+            for (const row of input.rows) {
+                const tombstone = raw.prepare("SELECT 1 FROM tombstones WHERE workspace_id = ? AND table_name = 'kv' AND pk = ?")
+                    .get(admission.workspaceId, row.id);
+                const existing = raw.prepare('SELECT data_json, deleted, clock FROM s_kv WHERE workspace_id = ? AND id = ?')
+                    .get(admission.workspaceId, row.id) as { data_json: string; deleted: number; clock: number } | undefined;
+                if (tombstone || existing?.deleted) throw Object.assign(new Error('Tool result was deleted'), { code: 'SUPERSEDED' });
+                if (existing) {
+                    const stored = JSON.parse(existing.data_json) as { id?: unknown; name?: unknown; value?: unknown; deleted?: unknown };
+                    if (existing.clock !== row.clock || stored.deleted === true || stored.id !== row.id || stored.name !== row.name || stored.value !== row.value)
+                        throw Object.assign(new Error('Conflicting tool result retention'), { code: 'CONFLICT' });
+                } else newRows.push(row);
+            }
+            if (!newRows.length) return;
+            const counter = raw.prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
+                .get(admission.workspaceId) as { value: number } | undefined;
+            const baseVersion = counter?.value ?? 0;
+            raw.prepare(`INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
+                ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, baseVersion + newRows.length);
+            const now = nowEpoch();
+            newRows.forEach((row, index) => {
+                const opId = `background-tool:${createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex')}`;
+                const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                const sanitized = sanitizePayloadForSync('kv', row, 'put');
+                if (!sanitized) throw Object.assign(new Error('Invalid tool result payload'), { code: 'VALIDATION_ERROR' });
+                const payloadJson = JSON.stringify({ ...sanitized, hlc, op_id: opId });
+                if (new TextEncoder().encode(payloadJson).length > MAX_SYNC_PAYLOAD_BYTES)
+                    throw Object.assign(new Error('Invalid tool result payload size'), { code: 'VALIDATION_ERROR' });
+                raw.prepare(`INSERT INTO s_kv (id, workspace_id, data_json, clock, hlc, device_id, op_id, deleted, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`).run(row.id, admission.workspaceId, payloadJson, row.clock, hlc,
+                        backgroundHistoryDeviceId(admission.generationId), opId, now, now);
+                raw.prepare(`INSERT INTO change_log (id, workspace_id, server_version, table_name, pk, op, payload_json,
+                    clock, hlc, device_id, op_id, created_at) VALUES (?, ?, ?, 'kv', ?, 'put', ?, ?, ?, ?, ?, ?)`)
+                    .run(uid(), admission.workspaceId, baseVersion + index + 1, row.id, payloadJson, row.clock, hlc,
+                        backgroundHistoryDeviceId(admission.generationId), opId, now);
+            });
+        }).immediate();
+    }
+
+    /** Resolve one bounded artifact in a single authorized canonical snapshot. */
+    async readChatToolResult(
+        actor: CanonicalHistoryActor,
+        input: { admission: ChatGenerationAdmissionEnvelope; callId: string; reference: string },
+    ): Promise<string> {
+        const admission = parseRequiredHistoryAdmission(input.admission);
+        if (isD1Driver()) throw Object.assign(new Error('SQLite D1 does not support tool result retention'), { code: 'UNSUPPORTED' });
+        if (typeof input.callId !== 'string' || !input.callId || new TextEncoder().encode(input.callId).length > 512 ||
+            typeof input.reference !== 'string' || input.reference.length > 2048)
+            throw Object.assign(new Error('Invalid tool result reference'), { code: 'VALIDATION_ERROR' });
+        const manifest = parseToolResultArtifact(input.reference);
+        if (!manifest || manifest.threadId !== admission.threadId)
+            throw Object.assign(new Error('Invalid tool result reference'), { code: 'VALIDATION_ERROR' });
+        const raw = getRawDb();
+        return raw.transaction(() => {
+            this.assertRetainedToolParent(actor, admission);
+            const parts: string[] = [];
+            for (let index = 0; index < manifest.parts; index++) {
+                const id = `tool-result:${manifest.id}:${index}`;
+                const row = raw.prepare('SELECT data_json, deleted, clock FROM s_kv WHERE workspace_id = ? AND id = ?')
+                    .get(admission.workspaceId, id) as { data_json: string; deleted: number; clock: number } | undefined;
+                let value: { id?: unknown; name?: unknown; value?: unknown; deleted?: unknown } | undefined;
+                try { value = row && JSON.parse(row.data_json); }
+                catch { throw Object.assign(new Error('Tool result is unavailable or corrupt'), { code: 'TOOL_RESULT_UNAVAILABLE' }); }
+                if (!row || row.deleted || row.clock !== 1 || !value || value.deleted === true || value.id !== id ||
+                    value.name !== `${toolResultArtifactPrefix(admission.threadId)}${manifest.id}:${index}` ||
+                    typeof value.value !== 'string' || new TextEncoder().encode(value.value).length > 64 * 1024)
+                    throw Object.assign(new Error('Tool result is unavailable or corrupt'), { code: 'TOOL_RESULT_UNAVAILABLE' });
+                parts.push(value.value);
+            }
+            const result = parts.join('');
+            if (!matchesToolResultStorage(input.reference, result, { threadId: admission.threadId,
+                parentAssistantId: admission.messageId, callId: input.callId }))
+                throw Object.assign(new Error('Tool result is unavailable or corrupt'), { code: 'TOOL_RESULT_UNAVAILABLE' });
+            return result;
         }).immediate();
     }
 

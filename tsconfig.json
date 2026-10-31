@@ -14,6 +14,7 @@
         "types": ["node"],
         "paths": {
             "h3": ["./node_modules/h3"],
+            "#sqlite-runtime/*": ["./src/runtime/*"],
             "~~/shared/testing/contracts/sync": ["./src/shims/sync-test-contract.ts"],
             "~~/*": ["../or3-chat/*"],
             "~~": ["../or3-chat"],

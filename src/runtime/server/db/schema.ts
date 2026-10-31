@@ -258,6 +258,8 @@ export interface BackgroundJobsTable {
     lease_owner: string | null;
     lease_expires_at: number | null;
     attempts: number;
+    delegation_wait_active: number;
+    delegation_wait_deadline: number | null;
 }
 
 export interface BackgroundGenerationReceiptsTable {
@@ -303,6 +305,12 @@ export interface Or3SqliteDb {
     connect_environments: ConnectEnvironmentsTable;
     rate_limits: RateLimitsTable;
     background_jobs: BackgroundJobsTable;
+    background_job_execution_quarantine: {
+        job_id: string;
+        execution_json: string;
+        lease_owner: string | null;
+        lease_expires_at: number | null;
+    };
     background_generation_receipts: BackgroundGenerationReceiptsTable;
     // Synced entity tables
     s_threads: SyncedEntityTable;

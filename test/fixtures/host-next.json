@@ -1,0 +1,318 @@
+{
+  "schema_version": 1,
+  "source_status": "reviewed committed host snapshot",
+  "upstream_base_commit": "c13d45a1b05c01f50872c1c27ee1a708581117af",
+  "files": [
+    {
+      "path": "app/utils/chat/thread-title.ts",
+      "git_blob": "91394c4a82f4c7f4b891972c0ae473ec8aabd033",
+      "sha256": "3e080bc97b0df5ac0b0074d6b3f4a125a6d735abe95c2a9bb2d36652fc4f0c8f"
+    },
+    {
+      "path": "server/auth/can.ts",
+      "git_blob": "2d5043d38db524717b499d1053aad4391eed7276",
+      "sha256": "27f7b7e74145d4b2963d4d6fc7d6971ac5b7b59406cf7c233319d05a27de51e3"
+    },
+    {
+      "path": "server/auth/hooks.ts",
+      "git_blob": "8d3b35aa032d95158bb997237d658c3bbd97aab6",
+      "sha256": "f399807fe25bdc963bb9b195f26e00e37b13e8aabe773a5b167b1fe9f5b22465"
+    },
+    {
+      "path": "server/auth/store/registry.ts",
+      "git_blob": "fae1934551fad4f591df78391a207be29d3a83b9",
+      "sha256": "93d0dc32b1b08bf88946b679a6861026f1c272bcb74aa91fe287e443b0618f49"
+    },
+    {
+      "path": "server/hooks/hook-engine.ts",
+      "git_blob": "937beadfdce27a002c50401686ffe2c9cd756b56",
+      "sha256": "bd2132fe02293d81f2386e3e13d8c95a11cae4cada43c336b318a6d8df56deb0"
+    },
+    {
+      "path": "server/hooks/runtime-kernel.ts",
+      "git_blob": "5b6b5b02eb0fc4f555ba0c7a0a8a0319cc4607c7",
+      "sha256": "9503c545d9e4abac8aab611dad07cf3a3d610fee9635de53e4ecb7ff4a515024"
+    },
+    {
+      "path": "server/sync/gateway/history-errors.ts",
+      "git_blob": "2040d42e550f26ff088ff5fbe7ea79dddc82cc5c",
+      "sha256": "a6f22c72ddf0e8fb5658c256a1437196c5bd3ec205c7c197259f89c587daf034"
+    },
+    {
+      "path": "server/sync/gateway/registry.ts",
+      "git_blob": "3cad36817d17b90dde891c6f36902f7d3f5e48a1",
+      "sha256": "ae2cbb6d540e43226920689eca229bd55881135439c544d21aa827844515859f"
+    },
+    {
+      "path": "server/utils/background-jobs/admission-cancels.ts",
+      "git_blob": "b787dcc13912dc50894898805896f2a3b10d5983",
+      "sha256": "9eaf66d294110a9e9da264de41165b19771e85e39003aafbd14ff6cb686a5f02"
+    },
+    {
+      "path": "server/utils/background-jobs/admission-history.ts",
+      "git_blob": "01860a4defa858916aed6bd0c609ecbdaab6b35f",
+      "sha256": "b29fbf11429c4b0db6bdabf2b0ef9664e8b2efcf0a1d8e198a32f8020b1b9665"
+    },
+    {
+      "path": "server/utils/background-jobs/capabilities.ts",
+      "git_blob": "a0af1ff5695ec2eb44431abcb9d0519f24b95a2e",
+      "sha256": "68565aa93ac83d79898b75af49bb9edd34d82a698a7b431aa6824037a7ec1009"
+    },
+    {
+      "path": "server/utils/background-jobs/delegation-access.ts",
+      "git_blob": "57085966a58ff637012443c7e02dfeec86f929dc",
+      "sha256": "8295e72e4616e8eba0ac8cad5e1ad81bebb62a55b24ea2ab6c4393b7debf04bd"
+    },
+    {
+      "path": "server/utils/background-jobs/delegation-child.ts",
+      "git_blob": "30129243b4489b88ffcb865acd84063bebf129fb",
+      "sha256": "5228b6f2b729c6d52601adf70f9280c1b197caabe8053d0ad9c00dc3cbc0d2d7"
+    },
+    {
+      "path": "server/utils/background-jobs/delegation-coordinator.ts",
+      "git_blob": "21e5abefa53729362126a55a1f3debf9d87418aa",
+      "sha256": "dbfe50ca42e700d22b0a4f7e2ca3ae6e4a812148c8a34bd442e506b3691899f8"
+    },
+    {
+      "path": "server/utils/background-jobs/delegation-resume.ts",
+      "git_blob": "4fe03e8323189f67b2e9d1da3bd56687b6fabe92",
+      "sha256": "1ac10d0a7aaba720315714cfa5b2b0980abb07d62fcf1a4f90793580c97dab9d"
+    },
+    {
+      "path": "server/utils/background-jobs/history.ts",
+      "git_blob": "b554cafee19f0384291ff3f3f926158fc0c3aa2c",
+      "sha256": "3e83ff4b616175b74baac39d304906e0b2dd3d31dcd1c2c61f6069ffaeea1f34"
+    },
+    {
+      "path": "server/utils/background-jobs/types.ts",
+      "git_blob": "72e5ac1a2127e60525764b7fddaad9b27decdaff",
+      "sha256": "5cacbeb6d79fb1a2fb6c4e57681675a11939a63ae38c29d759362fc1e58804f3"
+    },
+    {
+      "path": "server/utils/chat/canonical-history-context.ts",
+      "git_blob": "0ad02a223aa7624d0afededeab9bca16a5b6e2d6",
+      "sha256": "d9e8ec64ca7b062b87b9f9cecb387eabc6cd2579b8fe3b62318e21f1194b101f"
+    },
+    {
+      "path": "server/utils/chat/project-policy.ts",
+      "git_blob": "92217a7c1994376e1e5c2d2d2da14b3d3d58f8f8",
+      "sha256": "794838db2ecb02111cd1e17373b48d7d1f8e9b85fa9e438fdab3e9f5aff77188"
+    },
+    {
+      "path": "server/utils/chat/tool-ownership.ts",
+      "git_blob": "95e47904b480453f7321a42c931f30f031bd6b21",
+      "sha256": "714a5c4604444bcfde1c9d04888942e14399223c8299e63d829f4b053b1ffce2"
+    },
+    {
+      "path": "server/utils/chat/tool-registry.ts",
+      "git_blob": "cdeb301370a4763eded826ff7a4a5547ab62d2cf",
+      "sha256": "7187fed2d287ec3b547d5e9ce16a9ea373a74d5b2187c3d7ab179664950733a8"
+    },
+    {
+      "path": "server/utils/plugins/contribution-surface-selection.ts",
+      "git_blob": "6ed5d9bbabbcd59fbce2ca22bab49779345ed228",
+      "sha256": "162dfb8e86a5b31aea643e7a55048fa361ecdf51fc4fe7ac07238a11ab7fafc9"
+    },
+    {
+      "path": "server/utils/registry/create-runtime-config-registry.ts",
+      "git_blob": "4841f3f103bc983d3e9b1ae61161bc503c727268",
+      "sha256": "6bdf95566e5e38eff54310d625813b0fb0a808fc33dde1b917cd384e62ccefac"
+    },
+    {
+      "path": "server/utils/shutdown/controller.ts",
+      "git_blob": "9f05075ed256880ad128c462e445116fbc536ac9",
+      "sha256": "3110ea53eaaa7158286d6f3e5a2ad1478dc1c4ce890be4f0fe0583b9e2882352"
+    },
+    {
+      "path": "server/utils/shutdown/runtime.ts",
+      "git_blob": "8fc113eb4f21d654a09af8e6ccbc607605b04bf9",
+      "sha256": "5306368a90214a0e3387d1bf03a609ae1e8a2f58d82a02ed012381825bed2132"
+    },
+    {
+      "path": "shared/chat/background-history.ts",
+      "git_blob": "9b018d0941fb317e88f19fdc3de1ff257d5c9bf3",
+      "sha256": "fca065caf6d7988a8d5856afa30e6b47d513b8e7ca9ecdb5e5b6d928eea0e376"
+    },
+    {
+      "path": "shared/chat/canonical-tool-transcript.ts",
+      "git_blob": "079aac6039480cb7350cd1780853af1308d39727",
+      "sha256": "b8383bc5004ea68fe6886efb46a71a1442f432fc4daf10a82a60cbf97b09c615"
+    },
+    {
+      "path": "shared/chat/compaction.ts",
+      "git_blob": "29fb38aa84c98b5b1684bd02d6ebff4d8e957dd7",
+      "sha256": "ede6e2b03c9e4cc9de1948988e921d3ba8b3d80b8b7b70c6651d02bea5365f6c"
+    },
+    {
+      "path": "shared/chat/context-budget.ts",
+      "git_blob": "0f8dc43aae38c907c0eca8117493b26365226f70",
+      "sha256": "3114610e800eab6a02275108eedd00a256058b0387a100f664dff599820f7c0a"
+    },
+    {
+      "path": "shared/chat/delegation-checkpoint.ts",
+      "git_blob": "bafd504425b0a339da7725cd31178f74f6d54e5e",
+      "sha256": "3267510bbaba597c83838f67bebfae01fbe422b9a6762b013b423a50f595e9a1"
+    },
+    {
+      "path": "shared/chat/delegation-identities.ts",
+      "git_blob": "f7ea59ef0fc0452f07dff0163e695b0fa15d8c63",
+      "sha256": "4bdc34f6cd22d9fa8a3a5c21f29853e720b8148fbc3e5b322b7752c8599b4ab7"
+    },
+    {
+      "path": "shared/chat/delegation.ts",
+      "git_blob": "dc1911fe331786ae4ff7d8cd6c91961ae018a46b",
+      "sha256": "c25ff83824320d55a8c8828a8c89e4589027604fbc173cb0a97452f7cbdd43f8"
+    },
+    {
+      "path": "shared/chat/history-reader.ts",
+      "git_blob": "08e63c6893e487709e24543381abb5333d6c8d8f",
+      "sha256": "1a3a46a72914c1742db7288e3066e91f61b2c23508f21e9d4ce6bc86eabd1c55"
+    },
+    {
+      "path": "shared/chat/normalized-stream-reducer.ts",
+      "git_blob": "80e0dcdc9ddd5a7b2f86b196050d590f3c24a09d",
+      "sha256": "e0b936c2b02f4924b7a7603d0a71c1b36a05ef7cf8d1c22b40ab24a18916a252"
+    },
+    {
+      "path": "shared/chat/request-usage.ts",
+      "git_blob": "5a10076d563ef3f9a8d4aae475e8d29bdc0425a2",
+      "sha256": "4ba22f4b5158c005ab87526ca0282dd47450cc961cc133e497032a3b5932c2ab"
+    },
+    {
+      "path": "shared/chat/stream-errors.ts",
+      "git_blob": "e9d1f317a92fa7fd175d6d7fc0077f6647be8314",
+      "sha256": "2cea20d93c8728e89d8cc3d97613536a35273c8d8509e209f126873a37a04a7b"
+    },
+    {
+      "path": "shared/chat/tool-execution.ts",
+      "git_blob": "1f1c841e329dfecf6fb352da27461a2cdc29df65",
+      "sha256": "9994ec03c4da76c2d1df4700db220ead3c414290812f2c3649f3376441e02985"
+    },
+    {
+      "path": "shared/chat/tool-ledger.ts",
+      "git_blob": "d5aebf0a54178c3481b7c5f7c75a48a446d17d45",
+      "sha256": "6f0b0377b5e7bff2f084456a6f842894bd3349bc733028519d4ef3b685bf1895"
+    },
+    {
+      "path": "shared/chat/tool-limits.ts",
+      "git_blob": "df9e8914723e18b76914a90d3cb51e265753ef59",
+      "sha256": "acf56611b90d30afc48ea88d050623946d88db2144148601a6f738ada63d3eaa"
+    },
+    {
+      "path": "shared/chat/tool-policy.ts",
+      "git_blob": "000c16a60aaeb377d67d6b62a5809e8aa1e1d9d8",
+      "sha256": "839368a9c48f3ae4e68fb564438a1d9f6eb4bcfe9d7b805a6debd50e4554ff75"
+    },
+    {
+      "path": "shared/chat/tool-result-artifact.ts",
+      "git_blob": "9237533346ccc57659e6dd0d27ff48d9e4b2d72c",
+      "sha256": "a16663de5da3e456639da0c2e1bc52b28a95e79fccbb56abb583b03171812188"
+    },
+    {
+      "path": "shared/chat/tool-schema.ts",
+      "git_blob": "8b2c0dbfe7a0278d156ad8589c7e05a175b1f968",
+      "sha256": "fb0d24db7fcf7bcaf573e2584972eedd55d82571027f6c6564a9c28ea6f27668"
+    },
+    {
+      "path": "shared/errors/index.ts",
+      "git_blob": "919a3d4203163ca954de3cc79610fcf9fa9696c6",
+      "sha256": "a87bb92cea32f23dc8408d464f190fa5b04adfa603c83e9530e007270e32248c"
+    },
+    {
+      "path": "shared/hooks/hook-diagnostics-compat.ts",
+      "git_blob": "542d2ddd28f5b417a3f45705065563a7715e74f8",
+      "sha256": "94c3d386b0f0d82bb5082287d947c4058ebfdd36eda102812d59a675b9a26fa0"
+    },
+    {
+      "path": "shared/hooks/hook-diagnostics.ts",
+      "git_blob": "63c8dad5f44f254f4d42e01c630c65098b31d8d6",
+      "sha256": "26feb36336ba33b15784829260717be0765d9916f5910c1ead7d072b8039aa0b"
+    },
+    {
+      "path": "shared/hooks/hook-engine-core.ts",
+      "git_blob": "564c72a7d7856c8d5d00e2d7100becee8675754c",
+      "sha256": "713de7985ac5fa06c89a712934662ad46787e1793af49f312070abd5a485ff76"
+    },
+    {
+      "path": "shared/hooks/hook-engine-v2.ts",
+      "git_blob": "6c148eb6542106029961580ae8c6bc3b65755f76",
+      "sha256": "3232cf8b3544fbd383108cced7a30ae2c0f2fca3db514e78ca4005cd51908111"
+    },
+    {
+      "path": "shared/hooks/hook-record-store.ts",
+      "git_blob": "92d7ce7b332867dabe83141b1649263662a6f2db",
+      "sha256": "3b54af3a5921473acdca079bdb3956480eba6369fede843966782c61042dbf62"
+    },
+    {
+      "path": "shared/logging/sensitive-metadata.ts",
+      "git_blob": "3369236bb33e06d47ffa3cf173914e2412031343",
+      "sha256": "7ef292d2615657e14331ac12ff797b214e0f8ba653fe0f9d9d2b879a7254d4ef"
+    },
+    {
+      "path": "shared/openrouter/delegation-model-catalog.ts",
+      "git_blob": "c2101bddaab372458bdcbf3cde2cfcea95341308",
+      "sha256": "bc7c94c81ec40e5450500bf881698150ef704483b82a1689a333e95460180249"
+    },
+    {
+      "path": "shared/openrouter/errors.ts",
+      "git_blob": "010cf09f21048ada74d77c02e057e59e45c1d7ab",
+      "sha256": "6cca4b8ef34c2d825ed7cac92f0821548fdac4c223245819ea079831ed533575"
+    },
+    {
+      "path": "shared/openrouter/model-variants.ts",
+      "git_blob": "411cf3d174015056db491e0b1f5e1f21651b75ec",
+      "sha256": "d3a629d5ae002fb39ea4417df4bba821972f777dce151cac4ad879d3ebf739f5"
+    },
+    {
+      "path": "shared/openrouter/parseOpenRouterSSE.ts",
+      "git_blob": "b6784c8546549851636a4a1faa6c1e5d7766a3a3",
+      "sha256": "83a2c35a2893961927d1d3675415cd6e29111288aa2b34d628379923754448dd"
+    },
+    {
+      "path": "shared/openrouter/reasoning.ts",
+      "git_blob": "eb90ecbabbd270c2dcd1520a043f2c90b0dfbbcb",
+      "sha256": "5714315580e226f964d0e1e8f1b3e11d794b8313887fda24f579b7d2966d44e8"
+    },
+    {
+      "path": "shared/plugins/activation-table.ts",
+      "git_blob": "6e537f5f9fb446c025da6936186c4278aec604e7",
+      "sha256": "bfd7f13f97ba6410619b97da52944faa922ed1649e3dff8d927b89e86b3aecc0"
+    },
+    {
+      "path": "shared/plugins/contribution-registry.ts",
+      "git_blob": "8c49d8f0f1212070df48c36e4a30f8f48d006bf8",
+      "sha256": "cf951a52fdfd75339b48813c9d4463520356d1c5980b3bfc6a84620aa6ed8461"
+    },
+    {
+      "path": "shared/plugins/contribution-surfaces.ts",
+      "git_blob": "70bd8fe373e8e8397ac362ba56866a7ca2616b30",
+      "sha256": "f0a7dbcd72b6a859dc249fc0b34031a201688ea0743e79b30135298a6b4b3bb9"
+    },
+    {
+      "path": "shared/plugins/registration-handle.ts",
+      "git_blob": "54cfad4780f63dad5dafc7b52a3762f2e69941cc",
+      "sha256": "6c5ff7d8f5cd9046de0e81cb520b657c3bfca593dc079f952d67c24e2ea9e6bf"
+    },
+    {
+      "path": "shared/runtime-crypto.ts",
+      "git_blob": "b96952f7761aa919581500192c3d9d55af109a82",
+      "sha256": "7957edf18dfb5ad2f5aede8cf52f08220a06e4e64a880fa20130555e4436d6e3"
+    },
+    {
+      "path": "shared/sync/field-mappings.ts",
+      "git_blob": "a229c8191ce1c99cde6af92822a5d908265f4b9f",
+      "sha256": "79a24842b0c7583163fd4d8e0f2c9ec047ec650ccd04cb1182e0132b224d8cd8"
+    },
+    {
+      "path": "shared/sync/revision.ts",
+      "git_blob": "3a147ec72501625a68e93d31620d5f226ed5fe5f",
+      "sha256": "daa5c508f005676a92f57c47ee24dfadd1b9f60758ff208ba4f4a3caf6537ca9"
+    },
+    {
+      "path": "shared/sync/sanitize.ts",
+      "git_blob": "18296ddfd4473a3196074dfc47e89797e375a684",
+      "sha256": "205f83575f0bc14053d134fcebb0475858125e07459debcc47fb849c8b3dde23"
+    }
+  ],
+  "source_commit": "54d19baadd7c61949bf679e761d3d69ac84978a9"
+}

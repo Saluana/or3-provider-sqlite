@@ -57,6 +57,7 @@ const REQUIRED_SCHEMA_TABLES = [
     'connect_environments',
     'rate_limits',
     'background_jobs',
+    'background_job_execution_quarantine',
     'background_admission_cancels',
     'background_generation_receipts'
 ] as const;
@@ -66,6 +67,7 @@ import * as m025 from './migrations/025_background_shutdown_accounting';
 import * as m026 from './migrations/026_retained_storage_usage';
 import * as m027 from './migrations/027_verified_storage_usage';
 import * as m028 from './migrations/028_user_scoped_device_cursors';
+import * as m029 from './migrations/029_delegation_wait';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -95,7 +97,8 @@ const migrations: Record<string, Migration> = {
     '025_background_shutdown_accounting': m025,
     '026_retained_storage_usage': m026,
     '027_verified_storage_usage': m027,
-    '028_user_scoped_device_cursors': m028
+    '028_user_scoped_device_cursors': m028,
+    '029_delegation_wait': m029
 };
 
 class StaticMigrationProvider implements MigrationProvider {

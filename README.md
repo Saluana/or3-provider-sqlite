@@ -283,12 +283,18 @@ bun run type-check  # TypeScript validation
 bun run build       # build for distribution
 ```
 
-The normal test suite runs in a provider-only checkout using hash-verified,
-byte-for-byte host runtime fixtures. `bun run test:host-integration` reruns the
+The normal test suite uses a hash-verified snapshot of a reviewed, committed
+host revision; see [its provenance](test/fixtures/host-next.README.md).
+`bun run test:host-integration` reruns the
 same background-job, canonical-history and registration cases against a prepared
 sibling `../or3-chat` at the exact reviewed source tree. It fails on missing or
 mismatched source rather than falling back to fixtures. See the
-[fixture provenance and prerequisites](test/fixtures/host/README.md).
+[fixture provenance and prerequisites](test/fixtures/host-next.README.md).
+
+`OR3_PROJECT_HOST_ROOT=/path/to/or3-chat bun run type-check:host-contract`
+checks provider server code against that prepared host's actual contracts and
+generated Nuxt server declarations. This is stronger than the standalone release
+shim check; it does not establish that either checkout is a released artifact.
 
 ## Compatibility
 

@@ -9,10 +9,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sql } from 'kysely';
-import { initializeSqliteDb, getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '../server/db/kysely';
+import { initializeSqliteDb, getSqliteDb, getRawDb, destroySqliteDb, _resetForTest } from '#sqlite-runtime/server/db/kysely';
 import { createD1TestDatabase } from '../../../test/support/d1-test-database';
-import { runMigrations } from '../server/db/migrate';
-import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
+import { runMigrations } from '#sqlite-runtime/server/db/migrate';
+import { down as rollbackDelegationMigration } from '#sqlite-runtime/server/db/migrations/029_delegation_wait';
+import { SqliteSyncGatewayAdapter } from '#sqlite-runtime/server/sync/sqlite-sync-gateway-adapter';
 import type {
     PendingOp,
     PullRequest,
@@ -23,8 +24,9 @@ import type {
 import type { H3Event } from 'h3';
 import { verifySyncContract } from '~~/shared/testing/contracts/sync';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
-import { SqliteBackgroundJobProvider } from '../server/background-jobs/sqlite-provider';
-import { reconcileBackgroundJobHistory } from '~~/server/utils/background-jobs/history';
+import { SqliteBackgroundJobProvider } from '#sqlite-runtime/server/background-jobs/sqlite-provider';
+import { reconcileBackgroundJobHistory, retainBackgroundToolResult } from '~~/server/utils/background-jobs/history';
+import { prepareToolResultStorage, readToolResultStorage } from '~~/shared/chat/tool-result-artifact';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import type { CanonicalGenerationSnapshot, ChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
 import type { RequestUsage } from '~~/shared/chat/compaction';
@@ -114,7 +116,7 @@ describe('SqliteSyncGatewayAdapter', () => {
     // Security failures: normalized legacy membership omitted, extension/invalid
     // entries counted as chats, ambiguous owners guessed, or explicit pointers
     // overridden by stale associations.
-    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT)).each([
+    it.each([
         { label: 'plain strings', data: ['legacy'] },
         { label: 'padded strings', data: [' legacy '] },
         { label: 'padded object IDs', data: [{ id: ' legacy ' }] },
@@ -144,7 +146,7 @@ describe('SqliteSyncGatewayAdapter', () => {
     // A deleted/missing owner releases the chat even if LWW preserved its old
     // pointer. A same-ID project in another workspace cannot retain ownership,
     // and legacy membership must not override an explicit released pointer.
-    it.runIf(Boolean(process.env.OR3_PROJECT_HOST_ROOT)).each(['missing', 'deleted', 'foreign'] as const)(
+    it.each(['missing', 'deleted', 'foreign'] as const)(
         'releases canonical chats with an explicit %s project owner', async (state) => {
             const raw = getRawDb();
             raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
@@ -348,6 +350,54 @@ describe('SqliteSyncGatewayAdapter', () => {
         afterEach(async () => {
             await destroySqliteDb();
             await rm(directory, { recursive: true, force: true });
+        });
+
+        it('retains tool output atomically in canonical KV, replays after reopen and refuses deleted rows or revoked access', async () => {
+            const history = admission();
+            const jobs = new SqliteBackgroundJobProvider();
+            const id = await jobs.createJob({ userId: actor.userId, threadId: history.threadId, messageId: history.messageId,
+                generationId: history.generationId, model: 'test-model', kind: 'chat', syncProviderId: 'sqlite', historyPhase: 'admission_pending',
+                execution: { version: 1, workspaceId: WORKSPACE_ID, history, body: { messages: [] }, referer: 'https://example.test', apiKeyCiphertext: 'test-only' } });
+            expect(await reconcileBackgroundJobHistory(jobs, (await jobs.getJob(id, actor.userId))!)).toBe('ready');
+            const job = (await jobs.getJob(id, actor.userId))!;
+            const content = 'research with escape \" and unicode 🌱 '.repeat(4000);
+            const prepared = await prepareToolResultStorage(content, { threadId: history.threadId, parentAssistantId: history.messageId, callId: 'call-1' });
+            expect(prepared.rows.length).toBeGreaterThan(1);
+            const before = (getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value;
+            await expect(adapter.retainChatToolResult(actor, { admission: history, callId: 'different-call', reference: prepared.result, rows: prepared.rows })).rejects.toThrow();
+            getRawDb().exec(`CREATE TRIGGER fail_second_artifact BEFORE INSERT ON s_kv
+                WHEN (SELECT COUNT(*) FROM s_kv WHERE workspace_id = NEW.workspace_id) = 1
+                BEGIN SELECT RAISE(ABORT, 'injected artifact write failure'); END`);
+            await expect(retainBackgroundToolResult(job, content, 'call-1')).rejects.toThrow('injected artifact write failure');
+            expect((getRawDb().prepare('SELECT COUNT(*) AS count FROM s_kv WHERE workspace_id = ?').get(WORKSPACE_ID) as { count: number }).count).toBe(0);
+            expect((getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value).toBe(before);
+            getRawDb().exec('DROP TRIGGER fail_second_artifact');
+            const reference = await retainBackgroundToolResult(job, content, 'call-1');
+            expect(reference.startsWith('or3-tool-result:v1/')).toBe(true);
+            const version = (getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value;
+            await reopen();
+            expect(await retainBackgroundToolResult(job, content, 'call-1')).toBe(reference);
+            expect(await adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).toBe(content);
+            await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'other-call', reference })).rejects.toThrow();
+            expect((getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value).toBe(version);
+            const page = await adapter.snapshot(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+            const kv = new Map(page.items.filter((entry): entry is Extract<SnapshotItem, { kind: 'row' }> => entry.kind === 'row' && entry.tableName === 'kv')
+                .map(entry => [entry.pk, entry.payload as { value: string; deleted?: boolean }]));
+            expect(await readToolResultStorage(reference, async key => kv.get(key))).toBe(content);
+            getRawDb().prepare('UPDATE s_threads SET deleted = 1 WHERE workspace_id = ? AND id = ?').run(WORKSPACE_ID, history.threadId);
+            await expect(retainBackgroundToolResult(job, content, 'call-1')).rejects.toThrow();
+            getRawDb().prepare('UPDATE s_threads SET deleted = 0 WHERE workspace_id = ? AND id = ?').run(WORKSPACE_ID, history.threadId);
+            const firstId = [...kv.keys()][0]!;
+            const original = (getRawDb().prepare('SELECT data_json FROM s_kv WHERE workspace_id = ? AND id = ?').get(WORKSPACE_ID, firstId) as { data_json: string }).data_json;
+            getRawDb().prepare("UPDATE s_kv SET data_json = json_set(data_json, '$.value', 'corrupted') WHERE workspace_id = ? AND id = ?").run(WORKSPACE_ID, firstId);
+            await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).rejects.toThrow();
+            getRawDb().prepare('UPDATE s_kv SET data_json = ? WHERE workspace_id = ? AND id = ?').run(original, WORKSPACE_ID, firstId);
+            getRawDb().prepare('UPDATE s_kv SET deleted = 1 WHERE workspace_id = ? AND id = ?').run(WORKSPACE_ID, firstId);
+            await expect(retainBackgroundToolResult(job, content, 'call-1')).rejects.toThrow();
+            await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).rejects.toThrow();
+            getRawDb().prepare('DELETE FROM workspace_members WHERE id = ?').run('usage-membership');
+            await expect(retainBackgroundToolResult(job, content, 'call-1')).rejects.toThrow();
+            await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).rejects.toThrow();
         });
 
         it('emits created hooks once for admitted rows and does not create an existing thread', async () => {
@@ -1670,6 +1720,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'verified-blob' });
                 const db = getSqliteDb();
                 await sql`UPDATE retained_storage SET size_bytes = 999`.execute(db);
+                await rollbackDelegationMigration(db as unknown as Parameters<typeof rollbackDelegationMigration>[0]);
                 await sql`DELETE FROM kysely_migration WHERE name >= '027'`.execute(db);
                 await runMigrations(db);
                 await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'after-upgrade',
@@ -2364,7 +2415,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(retainedBob).toHaveLength(1);
             if (runtime === 'd1') await d1TestDatabase!.database.prepare('UPDATE sync_snapshots SET expires_at = 0').run();
             else getRawDb().prepare('UPDATE sync_snapshots SET expires_at = 0').run();
-            const { pruneExpiredSyncSnapshots } = await import('../server/sync/sqlite-sync-gateway-adapter');
+            const { pruneExpiredSyncSnapshots } = await import('#sqlite-runtime/server/sync/sqlite-sync-gateway-adapter');
             await pruneExpiredSyncSnapshots();
             for (const table of ['sync_snapshots', 'sync_snapshot_items']) {
                 const query = `SELECT count(*) AS count FROM ${table}`;

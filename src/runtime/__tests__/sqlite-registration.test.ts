@@ -14,6 +14,17 @@ const registrations = vi.hoisted(() => ({
     jobs: new Set<string>(),
     limits: new Map<string, RateLimitProvider>(),
 }));
+const registrationOverrides = vi.hoisted(() => ({
+    registerAuthWorkspaceStore: (entry: { id: string; create: () => SqliteAuthWorkspaceStore }) => registrations.workspaces.set(entry.id, entry),
+    registerSyncGatewayAdapter: (entry: { id: string }) => registrations.sync.add(entry.id),
+    registerConnectStore: (entry: { id: string }) => registrations.connect.add(entry.id),
+    registerBackgroundJobProvider: (id: string) => registrations.jobs.add(id),
+    registerRateLimitProvider: (id: string, provider: RateLimitProvider) => registrations.limits.set(id, provider),
+    registerProviderAdminAdapter: () => {},
+    registerAdminStoreProvider: () => {},
+    registerWebhookStore: () => {},
+    registerPluginConnectionStore: () => {},
+}));
 
 // Canonical-history tests use the actual pinned registry through this exact
 // alias. Startup wiring still records the factory without replacing any store.
@@ -21,25 +32,18 @@ vi.mock('~~/server/sync/gateway/registry', () => ({
     registerSyncGatewayAdapter: (entry: { id: string }) => registrations.sync.add(entry.id),
 }));
 
+// A real host root resolves this registry separately from the standalone shim.
+// Capture the registered factory in either configuration.
+vi.mock('~~/server/auth/store/registry', async (importOriginal) => ({
+    ...await importOriginal<object>(),
+    ...registrationOverrides,
+}));
+
 // The standalone suite supplies Chat registries through one existing shim.
 // Capture the actual factories registered by the plugin, not substitute stores.
 vi.mock('../../shims/or3-chat-test-runtime', async (importOriginal) => ({
     ...await importOriginal<typeof ChatRuntime>(),
-    registerAuthWorkspaceStore: (entry: {
-        id: string;
-        create: () => SqliteAuthWorkspaceStore;
-    }) => registrations.workspaces.set(entry.id, entry),
-    registerSyncGatewayAdapter: (entry: { id: string }) =>
-        registrations.sync.add(entry.id),
-    registerConnectStore: (entry: { id: string }) =>
-        registrations.connect.add(entry.id),
-    registerBackgroundJobProvider: (id: string) => registrations.jobs.add(id),
-    registerRateLimitProvider: (id: string, provider: RateLimitProvider) =>
-        registrations.limits.set(id, provider),
-    registerProviderAdminAdapter: () => {},
-    registerAdminStoreProvider: () => {},
-    registerWebhookStore: () => {},
-    registerPluginConnectionStore: () => {},
+    ...registrationOverrides,
 }));
 
 function config() {

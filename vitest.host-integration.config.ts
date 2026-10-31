@@ -1,16 +1,12 @@
-import { defineConfig, mergeConfig } from 'vitest/config';
 import path from 'node:path';
-import config from './vitest.config';
-import { hostContractAliases, verifyHostFixture } from './test/support/host-fixture';
+import { createProviderTestConfig } from './vitest.config';
+import { verifyDelegationHostFixture } from './test/support/delegation-host-fixture';
 
-const hostRoot = path.resolve(import.meta.dirname, '../or3-chat');
-verifyHostFixture(hostRoot);
+const hostRoot = path.resolve(process.env.OR3_PROJECT_HOST_ROOT || path.resolve(import.meta.dirname, '../or3-chat'));
+verifyDelegationHostFixture(path.resolve('test/fixtures/host-next'), hostRoot);
 
-// The same owners and assertions execute the reviewed host source. Put these
-// exact aliases before the ordinary fixture and broad declaration-shim aliases.
-const hostConfig = mergeConfig(config, defineConfig({
-    resolve: { alias: hostContractAliases(hostRoot) },
-}));
+// Select live sources before constructing aliases; the fixture cannot shadow them.
+const hostConfig = createProviderTestConfig(hostRoot);
 hostConfig.test = {
     ...hostConfig.test,
     include: [

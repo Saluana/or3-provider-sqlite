@@ -1,6 +1,6 @@
 {
     "name": "or3-provider-sqlite",
-    "version": "0.0.24",
+    "version": "0.0.25",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/Saluana/or3-provider-sqlite.git"
@@ -34,12 +34,14 @@
     ],
     "scripts": {
         "prepack": "bun run build",
-    "build": "nuxt-module-build build",
-    "lint": "eslint src --max-warnings 0",
-    "type-check": "tsc --noEmit",
-    "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
-    "test": "vitest run",
-    "test:host-integration": "vitest run --config vitest.host-integration.config.ts"
+        "build": "nuxt-module-build build",
+        "lint": "eslint src --max-warnings 0",
+        "type-check": "tsc --noEmit",
+        "type-check:standalone": "tsc -p tsconfig.release.json --noEmit",
+        "type-check:host-contract": "bun run scripts/typecheck-host-contract.ts",
+        "test": "vitest run",
+        "test:host-integration": "vitest run --config vitest.host-integration.config.ts",
+        "test:delegation-artifact": "bun run scripts/test-delegation-artifact.ts"
     },
     "publishConfig": {
         "access": "public"
@@ -56,12 +58,16 @@
         "nuxt": "^3.0.0 || ^4.0.0"
     },
     "devDependencies": {
+        "@cfworker/json-schema": "4.1.1",
         "@eslint/js": "^9.34.0",
+        "@noble/hashes": "^2.4.0",
         "@nuxt/module-builder": "^1.0.2",
+        "@openrouter/sdk": "^1.2.145",
         "@types/better-sqlite3": "^7.6.13",
         "@types/node": "^24.10.1",
         "@typescript-eslint/eslint-plugin": "^8.41.0",
         "@typescript-eslint/parser": "^8.41.0",
+        "ajv": "^8.20.0",
         "eslint": "^9.34.0",
         "h3": "^1.15.11",
         "pathe": "^2.0.3",

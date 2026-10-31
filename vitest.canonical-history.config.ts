@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import config from './vitest.config';
+import { createProviderTestConfig } from './vitest.config';
 
 // Additive qualification lane. The older reviewed/pinned fixture is unchanged.
 const host = path.resolve(import.meta.dirname,
@@ -15,7 +15,8 @@ for (const file of files) {
     if (!committed.equals(readFileSync(path.join(host, `${file}.ts`)))) throw new Error(`Uncommitted canonical contract: ${file}`);
 }
 const hostRequire = createRequire(path.join(host, 'package.json'));
-const lane = mergeConfig(config, defineConfig({ resolve: { alias: [
+// The host's canonical contracts and Nuxt test stubs must precede the base aliases.
+const lane = mergeConfig(createProviderTestConfig(host), defineConfig({ resolve: { alias: [
     { find: '~~/shared/testing/contracts/sync', replacement: path.join(import.meta.dirname, 'src/shims/sync-test-contract.ts') },
     ...files.map((file) => ({ find: `~~/${file}`, replacement: path.join(host, `${file}.ts`) })),
     { find: 'fake-indexeddb/auto', replacement: hostRequire.resolve('fake-indexeddb/auto') },

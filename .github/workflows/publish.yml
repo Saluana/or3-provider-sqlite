@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: Saluana/or3-chat
-          ref: 3aa7b3c0d251d4071c6520814cc5d823e05bfccf
+          ref: 54d19baadd7c61949bf679e761d3d69ac84978a9
           path: qualification-host
       - name: Install canonical host qualification dependencies
         working-directory: qualification-host
@@ -61,6 +61,8 @@ jobs:
         run: |
           ln -s "$PWD/qualification-host" ../or3-chat
           bun run type-check
+          OR3_PROJECT_HOST_ROOT="$PWD/qualification-host" bun run test:host-integration
+          OR3_PROJECT_HOST_ROOT="$PWD/qualification-host" bunx vitest run --config vitest.delegation-integration.config.ts
           OR3_CANONICAL_HOST_ROOT="$PWD/qualification-host" bunx vitest run --config vitest.canonical-history.config.ts
       - name: Validate package archive
         run: npm pack --dry-run --json > "$RUNNER_TEMP/package-pack.json"
