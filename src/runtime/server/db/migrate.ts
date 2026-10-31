@@ -59,7 +59,10 @@ const REQUIRED_SCHEMA_TABLES = [
     'background_jobs',
     'background_job_execution_quarantine',
     'background_admission_cancels',
-    'background_generation_receipts'
+    'background_generation_receipts',
+    'storage_object_generations',
+    'storage_object_heads',
+    'storage_generation_uploads'
 ] as const;
 
 import * as m024 from './migrations/024_signup_invites';
@@ -68,6 +71,8 @@ import * as m026 from './migrations/026_retained_storage_usage';
 import * as m027 from './migrations/027_verified_storage_usage';
 import * as m028 from './migrations/028_user_scoped_device_cursors';
 import * as m029 from './migrations/029_delegation_wait';
+import * as m030 from './migrations/030_storage_generations';
+import * as m031 from './migrations/031_storage_generation_uploads';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -98,7 +103,9 @@ const migrations: Record<string, Migration> = {
     '026_retained_storage_usage': m026,
     '027_verified_storage_usage': m027,
     '028_user_scoped_device_cursors': m028,
-    '029_delegation_wait': m029
+    '029_delegation_wait': m029,
+    '030_storage_generations': m030,
+    '031_storage_generation_uploads': m031
 };
 
 class StaticMigrationProvider implements MigrationProvider {

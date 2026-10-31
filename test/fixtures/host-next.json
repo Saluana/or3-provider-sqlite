@@ -80,13 +80,13 @@
     },
     {
       "path": "server/utils/background-jobs/history.ts",
-      "git_blob": "b554cafee19f0384291ff3f3f926158fc0c3aa2c",
-      "sha256": "3e83ff4b616175b74baac39d304906e0b2dd3d31dcd1c2c61f6069ffaeea1f34"
+      "git_blob": "d3bf91dd330065d4192bcb6d3a8b9bb931fcb47f",
+      "sha256": "79337f3bc0cc410273c6ab4e1fcb7b5f1248a05d1b92d58868f62b770cd37cba"
     },
     {
       "path": "server/utils/background-jobs/types.ts",
-      "git_blob": "72e5ac1a2127e60525764b7fddaad9b27decdaff",
-      "sha256": "5cacbeb6d79fb1a2fb6c4e57681675a11939a63ae38c29d759362fc1e58804f3"
+      "git_blob": "af72e031add2327762ddb76561df3da46d42b58e",
+      "sha256": "b72703535008968bc4cf857dfd87b3f7ea89549454e37b8a320e9caa94f4d038"
     },
     {
       "path": "server/utils/chat/canonical-history-context.ts",
@@ -125,8 +125,8 @@
     },
     {
       "path": "server/utils/shutdown/runtime.ts",
-      "git_blob": "8fc113eb4f21d654a09af8e6ccbc607605b04bf9",
-      "sha256": "5306368a90214a0e3387d1bf03a609ae1e8a2f58d82a02ed012381825bed2132"
+      "git_blob": "cc05db4214002ebb1e41ea2f4f4367c8f78ba6d0",
+      "sha256": "16440d0479bd5ba0b4066a93a32a31b6cd03ce0fcd12144062ead5b54f961e7f"
     },
     {
       "path": "shared/chat/background-history.ts",
@@ -314,5 +314,5 @@
       "sha256": "205f83575f0bc14053d134fcebb0475858125e07459debcc47fb849c8b3dde23"
     }
   ],
-  "source_commit": "54d19baadd7c61949bf679e761d3d69ac84978a9"
+  "source_commit": "60203070fe3d8102b98baf576a0b423d5621e36a"
 }

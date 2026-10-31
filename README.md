@@ -412,7 +412,16 @@ across restart when there is no live or indeterminate worker lease. Active model
 jobs still block. This read-only count changes no retention, authorization,
 recovery or replay rules: inaccessible or damaged evidence stays preserved.
 D1 and callers that omit the option retain the conservative count. This support
-is a source change after 0.0.25 and requires a matching host update.
+ships in 0.0.26 and requires a matching host update.
 
 Admin workspace summaries, workspace details, and deployment-admin lists expose `createdAt` in Unix milliseconds for the host UI. SQLite continues to store the underlying creation timestamps in Unix seconds; no data migration is needed.
+
+## Dormant immutable-generation foundation (unreleased)
+
+Migration 030 adds inert generation records, current-hash heads, and canonical write barriers after the released migrations. No runtime route creates these records, no adapter advertises `externalStorageGenerations`, and physical cleanup remains disabled. See [protocol invariants and activation blockers](docs/storage-generations.md).
+
+Migrations 030–031 resume safely after interrupted startup and reject incompatible preexisting schema objects. Released migration 029 remains unchanged.
+
+Migration 031 adds the dormant upload ledger and restore tickets. The optional coordinator remains unregistered. See [upload, restore, and recovery invariants](docs/storage-generation-uploads.md).
+
 Background history admission and finalization failures expose structured codes for validation, authorization, conflicts, and supersession. Transient SQLite failures retain their original errors for retry.

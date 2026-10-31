@@ -26,6 +26,7 @@ type SqliteTransaction<T> = ((...args: unknown[]) => T) & {
 };
 
 export interface SqliteRawDatabase {
+    readonly inTransaction?: boolean;
     close(): void;
     prepare(sql: string): SqliteRawStatement;
     pragma?(source: string): unknown;
@@ -62,6 +63,7 @@ type BunStatement = {
 };
 
 type BunDatabase = {
+    readonly inTransaction?: boolean;
     prepare(sql: string): BunStatement;
     run?(sql: string, ...parameters: unknown[]): unknown;
     exec?(sql: string): unknown;
@@ -224,6 +226,10 @@ class BunStatementAdapter implements SqliteRawStatement {
 
 class BunDatabaseAdapter implements SqliteRawDatabase {
     constructor(private readonly database: BunDatabase) {}
+
+    get inTransaction(): boolean | undefined {
+        return this.database.inTransaction;
+    }
 
     close(): void {
         this.database.close();
