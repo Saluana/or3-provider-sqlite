@@ -449,8 +449,16 @@ describe('separate abandonment authority and conservative recovery', () => {
         expect(await coordinator.getGeneration(key)).toBeNull();
         expect(await coordinator.getGenerationUploadClaim(claim)).toMatchObject({ state: 'abandon_claimed', claimId: claim.claimId });
         expect(activeCharge()).toBe(0);
+        // A terminal upload intent is not proof that physical bytes are gone.
+        // Legacy quota admission must see the same retained charge until ACK.
+        const legacy = { intentId: 'legacy-after-claim', workspaceId: key.workspaceId, hash: otherHash,
+            mimeType: 'text/plain', sizeBytes: 91, expiresAt: now + 60, workspaceQuotaBytes: 100 };
+        await expect(adapter.reserveUploadIntent(event, legacy)).rejects.toMatchObject({ statusCode: 413 });
+        expect(raw.prepare('SELECT used_bytes FROM storage_usage WHERE workspace_id=?').get(key.workspaceId)).toEqual({ used_bytes: 10 });
         expect(await coordinator.completeGenerationUploadAbandonment(claim)).toMatchObject({ status: 'abandoned', intent: { state: 'abandoned' } });
         expect(await coordinator.completeGenerationUploadAbandonment(claim)).toMatchObject({ status: 'replayed' });
+        expect(raw.prepare('SELECT used_bytes FROM storage_usage WHERE workspace_id=?').get(key.workspaceId)).toEqual({ used_bytes: 0 });
+        await expect(adapter.reserveUploadIntent(event, legacy)).resolves.toBeUndefined();
         expect(await coordinator.getGeneration(key)).toBeNull();
     });
 

@@ -13,6 +13,11 @@ Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Devel
 - **Admin stores** (`sqlite`) — workspace access/lifecycle, workspace settings, user search, and deployment-admin grants (local, Bun, and Turso runtimes)
 - **RateLimitProvider** (`sqlite`) — durable rate-limit counters
 
+OR3 Chat checks SQLite deployment-admin grants against the canonical user on
+cached sessions. A granted account can manage settings only for a workspace it
+owns; instance administration still requires the super-admin login. D1 does
+not provide the deployment-admin grant store.
+
 SSR-authenticated deployments also activate SQLite when it is selected only by
 `OR3_LIMITS_ENABLED=true` and `OR3_LIMITS_STORAGE_PROVIDER=sqlite`, independently
 of the account workspace backend.
@@ -425,3 +430,10 @@ Migrations 030–031 resume safely after interrupted startup and reject incompat
 Migration 031 adds the dormant upload ledger and restore tickets. The optional coordinator remains unregistered. See [upload, restore, and recovery invariants](docs/storage-generation-uploads.md).
 
 Background history admission and finalization failures expose structured codes for validation, authorization, conflicts, and supersession. Transient SQLite failures retain their original errors for retry.
+
+The dormant generation coordinator now exposes `retainedGenerationQuotaVersion: 1`.
+It charges allocations and Trash through the existing retained ledger and only
+releases enrolled-object charges after confirmed removal acknowledgement. Restores
+reuse their retained charge; replacement waits for confirmed deletion. Legacy
+retained objects cannot be implicitly adopted. This adds no schema migration,
+registration or production cleanup activation.

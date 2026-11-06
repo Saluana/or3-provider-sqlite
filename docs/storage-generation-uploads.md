@@ -20,7 +20,7 @@ paired storage provider, never from an untrusted upload request.
 An upload-origin binding permanently owns its intent, generation and immutable
 target identities. Registration does not adopt existing legacy metadata or
 references. New generations are permitted only when the current head is absent
-or already irreversibly claimed/deleted; a verified head cannot be overwritten.
+or has confirmed deletion; a claimed but not yet removed head cannot be replaced.
 The whole workspace/hash is enrolled as soon as the binding is committed, before
 filesystem allocation. Old raw metadata/reference writers cannot fill this gap
 with a legacy binding. Historical enrollment persists after abandonment, and
@@ -39,8 +39,13 @@ The lifecycle is:
 A separate server-time expiry in the binding limits credentials. The accounting
 projection is an ordinary `upload_intents` row with an active charge and a
 non-expiring accounting deadline (`Number.MAX_SAFE_INTEGER`). This deliberately
-keeps charges visible to existing canonical quota readers and the older
-`reserveUploadIntent` implementation. No deduplication creates a zero-charge
+keeps reservations visible to existing canonical quota readers and the older
+`reserveUploadIntent` implementation. Allocation also charges the existing
+`retained_storage` ledger atomically; quota readers subtract that retained charge
+from active holds to avoid counting it twice. This charge survives abandonment
+claims and is released only by confirmed exact-removal acknowledgement. Restore
+admission reuses the retained charge. Legacy retained objects cannot be adopted.
+No deduplication creates a zero-charge
 surviving intent: only one unresolved binding per workspace/hash is admitted.
 
 Old consume, cancel, expiry, DELETE, identity-changing UPDATE, and REPLACE paths
@@ -88,6 +93,12 @@ metadata. The dormant factory/API and tests establish the primitive; authenticat
 client admission wiring and rollout remain activation blockers. No new client
 roundtrip, sync wire field, or change-log/server-version semantics are silently
 introduced here.
+
+The coordinator exposes `retainedGenerationQuotaVersion: 1` for a paired storage
+factory to require this accounting behavior. No schema change or production
+activation accompanies it. Removal acknowledgements update both retained-ledger
+projections atomically, preserve legacy charges, and refuse to release a hash
+while a successor or another active allocation exists.
 
 ## Distinct abandonment and recovery authority
 

@@ -8,7 +8,7 @@ import type {
 import {
     SqliteExternalStorageGenerationCoordinator, assertGenerationIdentifier, generationRecord,
 } from './sqlite-generation-coordinator';
-import { GENERATION_TABLE, HEAD_TABLE, GENERATION_PROOF_ROWS, generationHashSql, validGenerationHashSql, validGenerationObjectSql } from '../db/storage-generation-guards';
+import { GENERATION_TABLE, HEAD_TABLE, GENERATION_PROOF_ROWS, generationHashSql, validGenerationHashSql } from '../db/storage-generation-guards';
 import {
     GENERATION_UPLOAD_TABLE as UPLOADS, GENERATION_UPLOAD_HOLD_EXPIRY,
     GENERATION_UPLOAD_MAX_TTL_SECONDS, GENERATION_UPLOAD_MAX_PENDING,
@@ -54,6 +54,9 @@ function intent(row: UploadRow): ExternalStorageGenerationUploadIntent {
 export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExternalStorageGenerationCoordinator
     implements ExternalStorageGenerationUploadCoordinatorV1 {
     readonly uploadVersion = 1 as const;
+    /** Allocation/Trash/claimed bytes remain in the canonical retained ledger
+     * until independently verified removal is acknowledged. */
+    readonly retainedGenerationQuotaVersion = 1 as const;
 
     private uploadKey(input: ExternalStorageGenerationUploadKey): ExternalStorageGenerationUploadKey {
         assertGenerationIdentifier(input.intentId, 'upload intent');
@@ -113,23 +116,32 @@ export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExte
     }
 
     private quotaUsed(workspaceId: string): number {
-        const rows = this.raw.prepare(`SELECT deleted, data_json, ${validGenerationObjectSql('data_json')} AS valid
-            FROM s_file_meta WHERE workspace_id = ? LIMIT ?`).all(workspaceId, GENERATION_PROOF_ROWS + 1) as {
-                deleted: number; data_json: string; valid: number;
-            }[];
-        if (rows.length > GENERATION_PROOF_ROWS) throw new Error('Storage upload proof_incomplete: metadata budget');
+        const rows = this.raw.prepare('SELECT size_bytes FROM retained_storage WHERE workspace_id = ? LIMIT ?')
+            .all(workspaceId, GENERATION_PROOF_ROWS + 1) as { size_bytes: number }[];
+        if (rows.length > GENERATION_PROOF_ROWS) throw new Error('Storage upload proof_incomplete: retained budget');
         let used = 0;
         for (const row of rows) {
-            if (row.deleted !== 0) continue;
-            if (row.valid !== 1) throw new Error('Storage upload invalid canonical metadata');
-            const data = JSON.parse(row.data_json) as Record<string, unknown>;
-            const size = data.size_bytes ?? data.sizeBytes;
-            if (('size_bytes' in data && 'sizeBytes' in data) || typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
-                throw new Error('Storage upload invalid canonical file size');
-            }
-            used = this.sum(used, size);
+            used = this.sum(used, row.size_bytes);
         }
         return used;
+    }
+
+    private retainedBytes(workspaceId: string, hash: string): number {
+        const row = this.raw.prepare('SELECT size_bytes FROM retained_storage WHERE workspace_id = ? AND hash = ?')
+            .get(workspaceId, hash) as { size_bytes: number } | undefined;
+        return this.sum(0, row?.size_bytes ?? 0);
+    }
+
+    private chargedBytes(workspaceId: string, hash: string, now: number): number {
+        let charged = this.quotaUsed(workspaceId);
+        const pending = new Map<string, number>();
+        for (const row of this.activeIntents(workspaceId)) {
+            if (row.expires_at <= now) continue;
+            if (row.hash === hash) throw new Error('Storage upload already has an active reservation');
+            pending.set(row.hash, Math.max(pending.get(row.hash) ?? 0, row.reserved_bytes));
+        }
+        for (const [digest, size] of pending) charged = this.sum(charged, Math.max(0, size - this.retainedBytes(workspaceId, digest)));
+        return charged;
     }
 
     private sum(left: number, right: number): number {
@@ -171,10 +183,13 @@ export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExte
                 throw new Error('Storage generation identity or target cannot be reused');
             }
             const head = this.head(key);
-            if (head && (head.storage_provider_id !== this.storageProviderId || head.state === 'verified')) {
-                throw new Error('Current storage generation must be irreversibly claimed before replacement');
+            if (head && (head.storage_provider_id !== this.storageProviderId || head.state !== 'deleted')) {
+                throw new Error('Current storage generation must have confirmed removal before replacement');
             }
             const enrolled = Boolean(this.raw.prepare(`SELECT 1 FROM ${UPLOADS} WHERE workspace_id = ? AND hash = ? LIMIT 1`).get(key.workspaceId, key.hash));
+            if (!enrolled && this.raw.prepare('SELECT 1 FROM retained_storage WHERE workspace_id = ? AND hash = ?').get(key.workspaceId, key.hash)) {
+                throw new Error('Storage generation cannot adopt legacy retained bytes');
+            }
             const proof = this.metadataProof(key, !head && !enrolled, input.storageId) ?? this.referenceProof(key, !head && !enrolled);
             if (proof) throw new Error(`Legacy storage adoption or upload proof failed: ${proof}`);
             const pending = this.raw.prepare(`SELECT count(*) AS count FROM ${UPLOADS} WHERE workspace_id = ?
@@ -182,12 +197,7 @@ export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExte
             if (pending.count >= GENERATION_UPLOAD_MAX_PENDING) throw new Error('Storage upload pending allocation limit');
             const now = this.now();
             const expires = this.sum(now, input.expiresInSeconds);
-            let charged = this.quotaUsed(key.workspaceId);
-            for (const row of this.activeIntents(key.workspaceId)) {
-                if (row.expires_at <= now) continue;
-                if (row.hash === key.hash) throw new Error('Storage upload already has an active reservation');
-                charged = this.sum(charged, row.reserved_bytes);
-            }
+            const charged = this.chargedBytes(key.workspaceId, key.hash, now);
             const projectedBytes = this.sum(charged, input.sizeBytes);
             if (input.workspaceQuotaBytes !== undefined && projectedBytes > input.workspaceQuotaBytes) {
                 throw new Error('Workspace storage quota exceeded');
@@ -203,6 +213,11 @@ export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExte
                 (id,workspace_id,hash,mime_type,size_bytes,reserved_bytes,expires_at,status,storage_id,created_at)
                 VALUES (?,?,?,?,?,?,?,'active',?,?)`).run(key.intentId, key.workspaceId, key.hash, input.mimeType,
                     input.sizeBytes, input.sizeBytes, GENERATION_UPLOAD_HOLD_EXPIRY, input.storageId, now);
+            // Charge before issuing any upload credential, including allocations
+            // that never publish. Existing quota readers see this same ledger.
+            this.raw.prepare(`INSERT INTO retained_storage(workspace_id,hash,size_bytes) VALUES (?,?,?)
+                ON CONFLICT(workspace_id,hash) DO UPDATE SET size_bytes=MAX(size_bytes,excluded.size_bytes)`)
+                .run(key.workspaceId, key.hash, input.sizeBytes);
             return { status: 'reserved', intent: intent(this.mustUpload(key)) };
         });
     }
@@ -246,13 +261,8 @@ export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExte
             if (pending.count >= GENERATION_UPLOAD_MAX_PENDING) throw new Error('Storage restore pending allocation limit');
             const now = this.now();
             if (now < generation.last_activity_at) throw new Error('Storage restore server clock regressed');
-            let charged = this.quotaUsed(key.workspaceId);
-            for (const row of this.activeIntents(key.workspaceId)) {
-                if (row.expires_at <= now) continue;
-                if (row.hash === key.hash) throw new Error('Storage restore already has an active reservation');
-                charged = this.sum(charged, row.reserved_bytes);
-            }
-            const projected = this.sum(charged, origin.size_bytes);
+            const charged = this.chargedBytes(key.workspaceId, key.hash, now);
+            const projected = this.sum(charged, Math.max(0, origin.size_bytes - this.retainedBytes(key.workspaceId, key.hash)));
             if (input.workspaceQuotaBytes !== undefined && projected > input.workspaceQuotaBytes) throw new Error('Workspace storage quota exceeded');
             this.raw.prepare(`INSERT INTO ${UPLOADS}
                 (intent_id,workspace_id,hash,generation_id,user_id,storage_provider_id,namespace_id,storage_id,mime_type,
@@ -382,12 +392,16 @@ export class SqliteExternalStorageGenerationUploadCoordinator extends SqliteExte
         return this.mutate(() => {
             const row = this.claimedUpload(key);
             if (!row) throw new Error('Storage upload abandonment claim mismatch');
-            if (row.state === 'abandoned') return { status: 'replayed', intent: intent(row) };
+            if (row.state === 'abandoned') {
+                this.releaseManagedRetainedCharge(key);
+                return { status: 'replayed', intent: intent(row) };
+            }
             const now = this.now();
             if (row.claimed_at === null || now < row.claimed_at) throw new Error('Storage upload server clock regressed');
             if (row.published_generation_id !== null) this.raw.prepare(`UPDATE ${GENERATION_TABLE} SET state = 'deleted', deleted_at = ? WHERE generation_id = ? AND state = 'claimed'`)
                 .run(now, key.generationId);
             this.raw.prepare(`UPDATE ${UPLOADS} SET state = 'abandoned', deleted_at = ? WHERE intent_id = ?`).run(now, key.intentId);
+            this.releaseManagedRetainedCharge(key);
             return { status: 'abandoned', intent: intent(this.upload(key)!) };
         });
     }

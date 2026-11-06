@@ -10,7 +10,7 @@ import {
     generationGuardTriggers, canonicalGuardSql, generationHashSql, validGenerationHashSql,
     validGenerationObjectSql, generationReferencesSql, validGenerationReferencesSql,
 } from '../db/storage-generation-guards';
-import { generationUploadGuardTriggers } from '../db/storage-generation-upload-guards';
+import { generationUploadGuardTriggers, GENERATION_UPLOAD_TABLE } from '../db/storage-generation-upload-guards';
 
 type GenerationRow = {
     generation_id: string; workspace_id: string; hash: string; storage_provider_id: string;
@@ -256,12 +256,42 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         return this.mutate(() => {
             const row = this.find(key);
             if (!row || row.claim_id !== input.claimId || row.state === 'verified') throw new Error('Storage generation claim mismatch');
-            if (row.state === 'deleted') return { status: 'replayed', generation: generationRecord(row) };
+            if (row.state === 'deleted') {
+                this.releaseManagedRetainedCharge(key);
+                return { status: 'replayed', generation: generationRecord(row) };
+            }
             const now = this.now();
             if (row.claimed_at === null || now < row.claimed_at) throw new Error('Storage generation server clock regressed');
             this.raw.prepare(`UPDATE ${GENERATION_TABLE} SET state = 'deleted', deleted_at = ? WHERE generation_id = ?`)
                 .run(now, key.generationId);
+            this.releaseManagedRetainedCharge(key);
             return { status: 'deleted', generation: generationRecord(this.find(key)!) };
         });
+    }
+
+    /** Runs under the same guarded transaction as removal acknowledgement.
+     * Only permanently enrolled targets may release a retained hash charge;
+     * legacy objects and any successor/pending generation keep their charge.
+     */
+    protected releaseManagedRetainedCharge(key: ExternalStorageGenerationKey): void {
+        const origins = this.raw.prepare(`SELECT generation_id, state, published_generation_id FROM ${GENERATION_UPLOAD_TABLE}
+            WHERE workspace_id = ? AND hash = ? AND purpose = 'upload' LIMIT ?`)
+            .all(key.workspaceId, key.hash, GENERATION_PROOF_ROWS + 1) as { generation_id: string; state: string; published_generation_id: string | null }[];
+        if (!origins.length || origins.length > GENERATION_PROOF_ROWS) return;
+        if (this.raw.prepare(`SELECT 1 FROM ${GENERATION_TABLE} WHERE workspace_id = ? AND hash = ? AND state <> 'deleted' LIMIT 1`)
+            .get(key.workspaceId, key.hash)) return;
+        if (origins.some(row => row.state !== 'abandoned' && !(row.state === 'materialized' && row.published_generation_id === row.generation_id))) return;
+        if (this.raw.prepare(`SELECT 1 FROM upload_intents WHERE workspace_id = ? AND hash = ? AND status = 'active' LIMIT 1`)
+            .get(key.workspaceId, key.hash)) return;
+        const retained = this.raw.prepare('SELECT size_bytes FROM retained_storage WHERE workspace_id = ? AND hash = ?')
+            .get(key.workspaceId, key.hash) as { size_bytes: number } | undefined;
+        if (!retained) return;
+        if (!Number.isSafeInteger(retained.size_bytes) || retained.size_bytes < 0) throw new Error('Invalid retained storage charge');
+        // The existing ledger deliberately has no DELETE trigger. Both projections
+        // change here, atomically, only after the provider's exact removal proof.
+        const result = this.raw.prepare('UPDATE storage_usage SET used_bytes=used_bytes-? WHERE workspace_id=? AND used_bytes>=?')
+            .run(retained.size_bytes, key.workspaceId, retained.size_bytes);
+        if (result.changes !== 1) throw new Error('Retained storage accounting mismatch');
+        this.raw.prepare('DELETE FROM retained_storage WHERE workspace_id=? AND hash=?').run(key.workspaceId, key.hash);
     }
 }
