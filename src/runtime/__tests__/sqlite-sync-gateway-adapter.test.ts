@@ -360,7 +360,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 execution: { version: 1, workspaceId: WORKSPACE_ID, history, body: { messages: [] }, referer: 'https://example.test', apiKeyCiphertext: 'test-only' } });
             expect(await reconcileBackgroundJobHistory(jobs, (await jobs.getJob(id, actor.userId))!)).toBe('ready');
             const job = (await jobs.getJob(id, actor.userId))!;
-            const content = 'research with escape \" and unicode 🌱 '.repeat(4000);
+            const content = 'research with escape " and unicode 🌱 '.repeat(4000);
             const prepared = await prepareToolResultStorage(content, { threadId: history.threadId, parentAssistantId: history.messageId, callId: 'call-1' });
             expect(prepared.rows.length).toBeGreaterThan(1);
             const before = (getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value;
