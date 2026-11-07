@@ -19,6 +19,25 @@ describe('sqlite admin stores', () => {
         await destroySqliteDb();
     });
 
+    // Failure inventory: contact is not completion; failures retain last success;
+    // summaries are user/workspace scoped, bounded, monotonic, and contain no payloads.
+    it('retains independent completed sync and classified failure observations', async () => {
+        const auth = new SqliteAuthWorkspaceStore();
+        const { userId } = await auth.getOrCreateUser({ provider: 'basic-auth', providerUserId: 'observer' });
+        const { workspaceId } = await auth.createWorkspace({ userId, name: 'Observed' });
+        const store = createSqliteWorkspaceAccessStore();
+        expect(await store.getCustomerSyncObservations!({ userId })).toEqual([]);
+        await store.recordSyncObservation!({ userId, workspaceId, operation: 'pull', observedAt: 2000, outcome: 'success' });
+        await store.recordSyncObservation!({ userId, workspaceId, operation: 'push', observedAt: 3000, outcome: 'failure', code: 'provider_failed' });
+        await store.recordSyncObservation!({ userId, workspaceId, operation: 'pull', observedAt: 1000, outcome: 'success' });
+        expect(await store.getCustomerSyncObservations!({ userId })).toEqual([{
+            workspaceId, lastSuccessAt: 2000, lastSuccessOperation: 'pull', lastFailureAt: 3000, lastFailureCode: 'provider_failed',
+        }]);
+        expect(await store.getCustomerSyncObservations!({ userId: 'other' })).toEqual([]);
+        await runMigrations(getSqliteDb());
+        expect((await store.getCustomerSyncObservations!({ userId }))[0]?.lastSuccessAt).toBe(2000);
+    });
+
     it('lists and manages workspace membership', async () => {
         const authStore = new SqliteAuthWorkspaceStore();
         const accessStore = createSqliteWorkspaceAccessStore();
@@ -240,5 +259,47 @@ describe('sqlite admin stores', () => {
         await adminStore.revokeAdmin({ userId });
         await adminStore.revokeAdmin({ userId });
         expect(await adminStore.isAdmin({ userId })).toBe(false);
+    });
+
+    it('reads customers without provisioning and pages stably', async () => {
+        const authStore = new SqliteAuthWorkspaceStore();
+        type Page = { items: Array<{ userId: string }>; nextCursor: string | null };
+        const accessStore = createSqliteWorkspaceAccessStore() as ReturnType<typeof createSqliteWorkspaceAccessStore> & {
+            listCustomers(input: { query?: string; cursor?: string | null; limit: number }): Promise<Page>;
+            getCustomersByIds(input: { userIds: string[] }): Promise<Array<{ userId: string }>>;
+            getCustomerWorkspaces(input: { userId: string }): Promise<Array<Record<string, unknown>>>;
+        };
+        const ids: string[] = [];
+        for (let i = 0; i < 5; i++) {
+            const { userId } = await authStore.getOrCreateUser({ provider: 'basic-auth', providerUserId: `c-${i}`, email: `customer_${i}@example.com` });
+            ids.push(userId);
+        }
+        await getSqliteDb().updateTable('users').set({ created_at: 1_700_000_000 }).execute();
+        const { workspaceId } = await authStore.createWorkspace({ userId: ids[0]!, name: 'Retained' });
+        await accessStore.upsertMember({ workspaceId, emailOrProviderId: 'customer_1@example.com', role: 'editor' });
+        await accessStore.softDeleteWorkspace({ workspaceId, deletedAt: 123 });
+        const count = async () => ({
+            users: (await getSqliteDb().selectFrom('users').select((eb) => eb.fn.countAll<number>().as('n')).executeTakeFirstOrThrow()).n,
+            workspaces: (await getSqliteDb().selectFrom('workspaces').select((eb) => eb.fn.countAll<number>().as('n')).executeTakeFirstOrThrow()).n,
+        });
+        const before = await count();
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        do {
+            const page: Page = await accessStore.listCustomers({ limit: 2, cursor });
+            seen.push(...page.items.map((item: { userId: string }) => item.userId));
+            cursor = page.nextCursor;
+        } while (cursor);
+        expect(seen.sort()).toEqual([...ids].sort());
+        expect((await accessStore.listCustomers({ query: 'customer_3', limit: 50 })).items.map((item) => item.userId)).toEqual([ids[3]]);
+        // LIKE wildcards in the query are literal.
+        expect((await accessStore.listCustomers({ query: '%', limit: 50 })).items).toEqual([]);
+        expect((await accessStore.getCustomersByIds({ userIds: [ids[2]!, 'missing'] })).map((item) => item.userId)).toEqual([ids[2]]);
+        const owned = await accessStore.getCustomerWorkspaces({ userId: ids[0]! });
+        expect(owned).toEqual([expect.objectContaining({ id: workspaceId, role: 'owner', deleted: true, deletedAt: 123, memberCount: 2, lastContactAt: null })]);
+        expect(await accessStore.getCustomerWorkspaces({ userId: ids[1]! })).toEqual([expect.objectContaining({ id: workspaceId, role: 'editor' })]);
+        expect(await accessStore.getCustomerWorkspaces({ userId: 'missing' })).toEqual([]);
+        await expect(accessStore.listCustomers({ limit: 2, cursor: 'not-a-cursor' })).rejects.toThrow();
+        expect(await count()).toEqual(before);
     });
 });

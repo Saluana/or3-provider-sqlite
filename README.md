@@ -18,6 +18,13 @@ cached sessions. A granted account can manage settings only for a workspace it
 owns; instance administration still requires the super-admin login. D1 does
 not provide the deployment-admin grant store.
 
+The access store also implements OR3's optional, read-only customer support reads:
+`listCustomers` (keyset-paged by creation time, at most 50 rows, literal
+substring search), `getCustomersByIds` and `getCustomerWorkspaces` (owned
+workspaces including deleted ones, plus memberships). They never provision rows.
+"Last contact" is the latest `device_cursors.updated_at` for the user. Hosts that
+predate these reads ignore them.
+
 SSR-authenticated deployments also activate SQLite when it is selected only by
 `OR3_LIMITS_ENABLED=true` and `OR3_LIMITS_STORAGE_PROVIDER=sqlite`, independently
 of the account workspace backend.
@@ -423,11 +430,11 @@ Admin workspace summaries, workspace details, and deployment-admin lists expose 
 
 ## Dormant immutable-generation foundation (unreleased)
 
-Migration 030 adds inert generation records, current-hash heads, and canonical write barriers after the released migrations. No runtime route creates these records, no adapter advertises `externalStorageGenerations`, and physical cleanup remains disabled. See [protocol invariants and activation blockers](docs/storage-generations.md).
+Migration 030 adds generation records, current-hash heads, and canonical write barriers after the released migrations. Normal transfer routes do not create these records. Cleanup is disabled by default; the Linux adapter can expose the coordinator through the explicit opt-in described below. See [protocol invariants and activation blockers](docs/storage-generations.md).
 
-Migrations 030–031 resume safely after interrupted startup and reject incompatible preexisting schema objects. Released migration 029 remains unchanged.
+Migrations 030–032 resume safely after interrupted startup and reject incompatible preexisting schema objects. Released migration 029 remains unchanged.
 
-Migration 031 adds the dormant upload ledger and restore tickets. The optional coordinator remains unregistered. See [upload, restore, and recovery invariants](docs/storage-generation-uploads.md).
+Migration 031 adds the upload ledger and restore tickets. Normal generation transfer routes remain unregistered. See [upload, restore, and recovery invariants](docs/storage-generation-uploads.md).
 
 Background history admission and finalization failures expose structured codes for validation, authorization, conflicts, and supersession. Transient SQLite failures retain their original errors for retry.
 
@@ -437,3 +444,27 @@ releases enrolled-object charges after confirmed removal acknowledgement. Restor
 reuse their retained charge; replacement waits for confirmed deletion. Legacy
 retained objects cannot be implicitly adopted. This adds no schema migration,
 registration or production cleanup activation.
+
+### Admin diagnostics and managed-generation inspection
+
+The optional customer-read store includes bounded completed-sync observations
+(migration `032_sync_observations`): last successful gateway operation and latest
+classified failure per user/workspace. These observations contain no sync payload,
+are independent of cursor contact, and cannot invalidate an accepted sync write.
+The SQLite admin adapter's explicit health probe verifies a canonical database
+read; configuration/enablement alone is not a health result.
+
+The dormant generation coordinator also exposes `inspectCandidates` to trusted
+server callers. It pages at most 100 exact enrolled generations per workspace,
+uses the same bounded eligibility proof as claims, and changes no generation or
+accounting state. Estimates describe logical managed bytes, not reclaimed disk
+blocks. Mutable legacy storage is excluded. This read does not register deletion,
+HTTP upload, restore, cleanup automation or a production capability. Installed
+Linux filesystem and independent S3 backup/crash lifecycle gates remain required
+before activation.
+
+### Opt-in enrolled-generation cleanup
+
+On Linux, the SQLite/filesystem pairing exposes managed-generation cleanup only when `OR3_STORAGE_FS_CLEANUP_NAMESPACE_ID` names the existing filesystem namespace UUID and SQLite runs with `OR3_SQLITE_PRAGMA_SYNCHRONOUS=FULL` (or `EXTRA`). The namespace must already have been provisioned by the generation protocol; this setting neither provisions it nor enrolls legacy files. It does not change normal upload/download routing. Leave the namespace setting unset to keep cleanup unavailable. D1 and other unsupported drivers remain unavailable.
+
+Manual admin cleanup rechecks canonical eligibility and uses the installed filesystem remover. Optional `OR3_STORAGE_RETENTION_WORKSPACES` selects explicit workspace IDs for the same audited primitive, with seven-day retention and at most 25 examined generations per hourly turn. Changing these environment settings requires a managed restart. Defaults remain disabled. Use the repaired managed backup/restore path for enrolled data; raw file copying is not a supported restore.

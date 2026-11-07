@@ -11,6 +11,7 @@ import {
 } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { down as rollbackStorage } from '../server/db/migrations/030_storage_generations';
+import { down as rollbackObservations } from '../server/db/migrations/032_sync_observations';
 import { down as rollbackUploads } from '../server/db/migrations/031_storage_generation_uploads';
 import { down as rollbackDelegation } from '../server/db/migrations/029_delegation_wait';
 import { SqliteBackgroundJobProvider } from '../server/background-jobs/sqlite-provider';
@@ -29,6 +30,7 @@ describe('SQLite migration integrity boundaries', () => {
     it('resumes a migration interrupted after preserving malformed execution bytes', async () => {
         const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
+        await rollbackObservations(db as unknown as Kysely<unknown>);
         await rollbackUploads(db as unknown as Kysely<unknown>);
         await rollbackStorage(db as unknown as Kysely<unknown>);
         await rollbackDelegation(db as unknown as Kysely<unknown>);
@@ -69,6 +71,7 @@ describe('SQLite migration integrity boundaries', () => {
         try {
             const db = await initializeSqliteDb({ driver: 'd1', d1Database: d1.database });
             await runMigrations(db);
+            await rollbackObservations(db as unknown as Kysely<unknown>);
             await rollbackUploads(db as unknown as Kysely<unknown>);
             await rollbackStorage(db as unknown as Kysely<unknown>);
             await rollbackDelegation(db as unknown as Kysely<unknown>);
@@ -100,6 +103,7 @@ describe('SQLite migration integrity boundaries', () => {
         try {
             let db = await initializeSqliteDb({ path });
             await runMigrations(db);
+            await rollbackObservations(db as unknown as Kysely<unknown>);
             await rollbackUploads(db as unknown as Kysely<unknown>);
             await rollbackStorage(db as unknown as Kysely<unknown>);
             await rollbackDelegation(db as unknown as Kysely<unknown>);
@@ -137,6 +141,7 @@ describe('SQLite migration integrity boundaries', () => {
             expect(getRawDb().prepare('SELECT job_id, execution_json FROM background_job_execution_quarantine ORDER BY job_id').all())
                 .toEqual([{ job_id: 'bad-active', execution_json: malformed }, { job_id: 'bad-terminal', execution_json: malformedTerminal }]);
             expect(await new SqliteBackgroundJobProvider().getShutdownBlockerCount()).toBe(3);
+            await rollbackObservations(db as unknown as Kysely<unknown>);
             await rollbackUploads(db as unknown as Kysely<unknown>);
             await rollbackStorage(db as unknown as Kysely<unknown>);
             await rollbackDelegation(db as unknown as Kysely<unknown>);
@@ -154,12 +159,15 @@ describe('SQLite migration integrity boundaries', () => {
         'CREATE TRIGGER storage_generation_no_delete',
         'CREATE TABLE storage_generation_uploads',
         'DROP TRIGGER upload_intents_generation_guard_insert',
+        'CREATE TABLE sync_observations',
+        'CREATE INDEX idx_users_admin_created_id',
     ])('resumes the published delegation schema after interruption at %s', async (interruption) => {
         const directory = await mkdtemp(join(tmpdir(), 'or3-storage-upgrade-'));
         const path = join(directory, 'upgrade.sqlite');
         try {
             let db = await initializeSqliteDb({ path });
             await runMigrations(db);
+            await rollbackObservations(db as unknown as Kysely<unknown>);
             await rollbackUploads(db as unknown as Kysely<unknown>);
             await rollbackStorage(db as unknown as Kysely<unknown>);
             await sql`DELETE FROM kysely_migration WHERE name > '029_delegation_wait'`.execute(db);
@@ -188,7 +196,7 @@ describe('SQLite migration integrity boundaries', () => {
             expect(getRawDb().prepare("SELECT execution_json FROM background_jobs WHERE id = 'preserved'").get())
                 .toEqual({ execution_json: '{"version":1}' });
             expect(getRawDb().prepare("SELECT name FROM kysely_migration WHERE name > '029_delegation_wait' ORDER BY name").all())
-                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }]);
+                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }]);
         } finally {
             vi.restoreAllMocks();
             await destroySqliteDb();
@@ -199,12 +207,31 @@ describe('SQLite migration integrity boundaries', () => {
     it('refuses a preexisting incompatible storage table without recording the migration', async () => {
         const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
+        await rollbackObservations(db as unknown as Kysely<unknown>);
         await rollbackUploads(db as unknown as Kysely<unknown>);
         await rollbackStorage(db as unknown as Kysely<unknown>);
         await sql`DELETE FROM kysely_migration WHERE name > '029_delegation_wait'`.execute(db);
         await sql`CREATE TABLE storage_object_generations (unrelated TEXT)`.execute(db);
         await expect(runMigrations(db)).rejects.toThrow(/incompatible.*storage_object_generations/i);
         expect(getRawDb().prepare("SELECT name FROM kysely_migration WHERE name > '029_delegation_wait'").all()).toEqual([]);
+    });
+
+    // Interrupted DDL must resume only matching schema. A same-named table or
+    // index with another definition must survive unchanged and block startup.
+    it.each([
+        ['sync_observations', 'CREATE TABLE sync_observations (unrelated TEXT)'],
+        ['idx_users_admin_created_id', 'CREATE INDEX idx_users_admin_created_id ON users (email)'],
+    ])('refuses incompatible diagnostic schema %s without recording the migration', async (name, statement) => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await runMigrations(db);
+        await rollbackObservations(db as unknown as Kysely<unknown>);
+        const raw = getRawDb();
+        raw.prepare("DELETE FROM kysely_migration WHERE name = '032_sync_observations'").run();
+        raw.exec(statement);
+
+        await expect(runMigrations(db)).rejects.toThrow(`Incompatible migration schema: ${name}`);
+        expect(raw.prepare('SELECT sql FROM sqlite_master WHERE name = ?').get(name)).toEqual({ sql: statement });
+        expect(raw.prepare("SELECT name FROM kysely_migration WHERE name = '032_sync_observations'").all()).toEqual([]);
     });
 
     it('refuses to start from a database created by a newer migration set', async () => {

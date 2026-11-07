@@ -210,6 +210,58 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
         });
     }
 
+    private eligibility(row: GenerationRow, retentionSeconds: number): { reason: Exclude<ExternalStorageGenerationClaimResult, { generation: unknown }>['reason'] | null; lastActivity: number } {
+        const key = generationRecord(row);
+        if (this.head(key)?.generation_id !== key.generationId) return { reason: 'not_current', lastActivity: row.last_activity_at };
+        const proof = this.metadataProof(key, false, row.storage_id) ?? this.referenceProof(key, false);
+        if (proof) return { reason: proof, lastActivity: row.last_activity_at };
+        const now = this.now();
+        const intents = this.raw.prepare(`SELECT ${validGenerationHashSql('hash')} AS valid_hash,
+            ${generationHashSql('hash')} AS hash, expires_at FROM upload_intents
+            WHERE workspace_id = ? AND status = 'active' LIMIT ?`).all(key.workspaceId, GENERATION_PROOF_ROWS + 1) as {
+                valid_hash: number; hash: string; expires_at: number;
+            }[];
+        if (intents.length > GENERATION_PROOF_ROWS) return { reason: 'proof_incomplete', lastActivity: row.last_activity_at };
+        let lastActivity = row.last_activity_at;
+        for (const intent of intents) {
+            if (intent.valid_hash !== 1 || !Number.isSafeInteger(intent.expires_at) || intent.expires_at < 0) {
+                return { reason: 'unknown_references', lastActivity: row.last_activity_at };
+            }
+            if (intent.hash !== key.hash) continue;
+            if (intent.expires_at > now) return { reason: 'active_upload', lastActivity: row.last_activity_at };
+            lastActivity = Math.max(lastActivity, intent.expires_at);
+        }
+        if (now < lastActivity || now - lastActivity < retentionSeconds) return { reason: 'retention', lastActivity: row.last_activity_at };
+        return { reason: null, lastActivity };
+    }
+
+    /** Read-only bounded advisory proof. A result is never deletion authority;
+     * claimGeneration repeats every proof in its own durable transaction. */
+    async inspectCandidates(input: { workspaceId: string; retentionSeconds: number; limit?: number; cursor?: string }) {
+        assertGenerationIdentifier(input.workspaceId, 'workspace');
+        const limit = input.limit ?? 25;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new Error('Invalid storage candidate limit');
+        if (!Number.isSafeInteger(input.retentionSeconds) || input.retentionSeconds < 0) throw new Error('Invalid storage retention interval');
+        if (input.cursor !== undefined) assertGenerationIdentifier(input.cursor, 'cursor');
+        if (this.raw.inTransaction !== false) throw new Error('Storage inspection requires its own read snapshot');
+        return this.raw.transaction(() => {
+            this.assertIntegrity();
+            const rows = this.raw.prepare(`SELECT * FROM ${GENERATION_TABLE} WHERE workspace_id = ? AND storage_provider_id = ?
+                AND generation_id > ? ORDER BY generation_id LIMIT ?`).all(input.workspaceId, this.storageProviderId, input.cursor ?? '', limit + 1) as GenerationRow[];
+            const complete = rows.length <= limit;
+            const items = rows.slice(0, limit).map(row => {
+                const proof = row.state === 'verified' ? this.eligibility(row, input.retentionSeconds) : null;
+                return { generation: generationRecord(row), status: row.state !== 'verified' ? row.state : proof?.reason ? 'blocked' as const : 'eligible' as const,
+                    reason: proof?.reason ?? null };
+            });
+            const estimated = items.filter(item => item.status === 'eligible').reduce((sum, item) => sum + item.generation.sizeBytes, 0);
+            return { items, complete, nextCursor: complete ? null : items.at(-1)!.generation.generationId,
+                observedAt: this.now(), workspaceId: input.workspaceId, retentionSeconds: input.retentionSeconds,
+                estimatedLogicalBytes: Number.isSafeInteger(estimated) ? estimated : null,
+                scope: 'managed_generations_only' as const, legacyIncluded: false as const };
+        })();
+    }
+
     async claimGeneration(input: ExternalStorageGenerationKey & { claimId: string; retentionSeconds: number }): Promise<ExternalStorageGenerationClaimResult> {
         const key = this.key(input);
         assertGenerationIdentifier(input.claimId, 'claim');
@@ -219,26 +271,9 @@ export class SqliteExternalStorageGenerationCoordinator implements ExternalStora
             if (!row) return { status: 'blocked', reason: 'missing' };
             if (row.state !== 'verified') return row.claim_id === input.claimId
                 ? { status: 'replayed', generation: generationRecord(row) } : { status: 'blocked', reason: 'claim_conflict' };
-            if (this.head(key)?.generation_id !== key.generationId) return { status: 'blocked', reason: 'not_current' };
-            const proof = this.metadataProof(key, false, row.storage_id) ?? this.referenceProof(key, false);
-            if (proof) return { status: 'blocked', reason: proof };
+            const { reason, lastActivity } = this.eligibility(row, input.retentionSeconds);
+            if (reason) return { status: 'blocked', reason };
             const now = this.now();
-            const intents = this.raw.prepare(`SELECT ${validGenerationHashSql('hash')} AS valid_hash,
-                ${generationHashSql('hash')} AS hash, expires_at FROM upload_intents
-                WHERE workspace_id = ? AND status = 'active' LIMIT ?`).all(key.workspaceId, GENERATION_PROOF_ROWS + 1) as {
-                    valid_hash: number; hash: string; expires_at: number;
-                }[];
-            if (intents.length > GENERATION_PROOF_ROWS) return { status: 'blocked', reason: 'proof_incomplete' };
-            let lastActivity = row.last_activity_at;
-            for (const intent of intents) {
-                if (intent.valid_hash !== 1 || !Number.isSafeInteger(intent.expires_at) || intent.expires_at < 0) {
-                    return { status: 'blocked', reason: 'unknown_references' };
-                }
-                if (intent.hash !== key.hash) continue;
-                if (intent.expires_at > now) return { status: 'blocked', reason: 'active_upload' };
-                lastActivity = Math.max(lastActivity, intent.expires_at);
-            }
-            if (now < lastActivity || now - lastActivity < input.retentionSeconds) return { status: 'blocked', reason: 'retention' };
             if (this.raw.prepare(`SELECT 1 FROM ${GENERATION_TABLE} WHERE claim_id = ?`).get(input.claimId)) {
                 return { status: 'blocked', reason: 'claim_conflict' };
             }

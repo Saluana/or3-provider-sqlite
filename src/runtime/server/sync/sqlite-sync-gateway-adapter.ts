@@ -1,3 +1,4 @@
+import { SqliteExternalStorageGenerationUploadCoordinator } from '../storage/sqlite-generation-upload-coordinator';
 import { backgroundFinalizationFingerprint, stableJson } from './background-history-fingerprint';
 import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspace-item-capability';
 /**
@@ -842,6 +843,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         };
     }
 
+    /** Construct only on use, after the provider initializes its database. */
+    get storageGenerationCoordinator() {
+        const namespace = process.env.OR3_STORAGE_FS_CLEANUP_NAMESPACE_ID;
+        if (process.platform !== 'linux' || !namespace || isD1Driver()) return undefined;
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(namespace)) throw new Error('Invalid filesystem cleanup namespace');
+        const raw = getRawDb();
+        const durability = raw.prepare('PRAGMA synchronous').get() as { synchronous?: number };
+        if (durability.synchronous !== 2 && durability.synchronous !== 3) return undefined;
+        return new SqliteExternalStorageGenerationUploadCoordinator({ storageProviderId: 'fs', database: raw });
+    }
+
     get capabilities() {
         return isD1Driver()
             ? ({
@@ -853,6 +865,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             : ({
                   snapshotBootstrap: 'snapshot-v1',
                   historyRetention: 'snapshot-v1',
+                  ...(this.storageGenerationCoordinator ? { externalStorageGenerations: 'v1' as const } : {}),
                   backgroundGenerationHistory: 'v1',
                   delegationTerminalHistory: 'v1',
                   canonicalChatHistory: 'v1',

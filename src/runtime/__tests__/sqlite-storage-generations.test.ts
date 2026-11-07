@@ -61,14 +61,50 @@ function intent(id = 'intent', workspace = key.workspaceId, value = hash, expire
         VALUES (?,?,?,'text/plain',10,10,?,'active',?)`).run(id, workspace, value, expires, now);
 }
 
+// The public adapter must expose the real coordinator only for explicit cleanup
+// configuration on Linux. Existing direct-coordinator tests cannot detect missing
+// runtime wiring; the full installed host previously returned 503 here.
+it.runIf(process.platform === 'linux')('registered adapter coordinates opted-in filesystem cleanup with canonical storage', async () => {
+    vi.stubEnv('OR3_STORAGE_FS_CLEANUP_NAMESPACE_ID', '11111111-1111-4111-8111-111111111111');
+    const adapter = new SqliteSyncGatewayAdapter();
+    const active = adapter.storageGenerationCoordinator!;
+    await active.registerVerifiedGeneration(registration);
+    expect(await active.getGeneration(key)).toMatchObject({ state: 'verified', storageId: registration.storageId });
+    expect((await active.claimGeneration(claim)).status).toBe('claimed');
+});
+
 describe('dormant managed storage generation coordinator', () => {
     it('keeps runtime deletion capabilities absent and empty-schema legacy writers unchanged', async () => {
         source('s_messages', 'legacy', { file_hashes: [' legacy alias '] });
         metadata({ malformed: true }, 'legacy-id');
         const adapter = new SqliteSyncGatewayAdapter();
         expect(adapter.capabilities).not.toHaveProperty('externalStorageGenerations');
-        expect(adapter).not.toHaveProperty('storageGenerationCoordinator');
+        expect(adapter.storageGenerationCoordinator).toBeUndefined();
         expect(raw.prepare('SELECT count(*) AS n FROM storage_object_generations').get()).toEqual({ n: 0 });
+    });
+
+    // Dry-run failure inventory: a page must not claim or release anything;
+    // live references/active uploads and retention use the same proof as claim;
+    // bounds and cursors cannot expand scope or accept storage paths.
+    it('inspects bounded canonical candidates without changing bytes, claims or accounting', async () => {
+        await coordinator.registerVerifiedGeneration(registration);
+        const other = { ...registration, hash: otherHash, generationId: 'generation-2', storageId: 'namespace/immutable/generation-2' };
+        await coordinator.registerVerifiedGeneration(other);
+        source('s_messages', 'live', { file_hashes: [otherHash] });
+        // Advisory reads do not require changing the deployed durability mode.
+        raw.pragma('synchronous = NORMAL');
+        const before = raw.prepare('SELECT * FROM storage_object_generations ORDER BY generation_id').all();
+        const page = await coordinator.inspectCandidates({ workspaceId: key.workspaceId, retentionSeconds: 0, limit: 1 });
+        expect(page.items).toHaveLength(1);
+        expect(page.items[0]).toMatchObject({ generation: { generationId: key.generationId, storageId: registration.storageId }, status: 'eligible' });
+        expect(page.complete).toBe(false);
+        expect(page.nextCursor).toBe(key.generationId);
+        const next = await coordinator.inspectCandidates({ workspaceId: key.workspaceId, retentionSeconds: 0, limit: 1, cursor: page.nextCursor! });
+        expect(next.items[0]).toMatchObject({ status: 'blocked', reason: 'in_use' });
+        expect(next.complete).toBe(true);
+        expect((await coordinator.inspectCandidates({ workspaceId: 'foreign', retentionSeconds: 0, limit: 1 })).items).toEqual([]);
+        await expect(coordinator.inspectCandidates({ workspaceId: key.workspaceId, retentionSeconds: 0, limit: 101 })).rejects.toThrow(/limit/);
+        expect(raw.prepare('SELECT * FROM storage_object_generations ORDER BY generation_id').all()).toEqual(before);
     });
 
     it('registers, claims, replays after reopen, and never reopens an irreversible generation', async () => {

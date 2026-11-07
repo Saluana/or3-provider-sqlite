@@ -16,6 +16,8 @@ import {
     SYNC_MAINTENANCE_RETENTION_SECONDS,
 } from '../../sync/maintenance-state';
 import { createSqliteSyncGatewayAdapter } from '../../sync/sqlite-sync-gateway-adapter';
+import { sql } from 'kysely';
+import { getSqliteDb } from '../../db/kysely';
 import { getSqliteDriver } from '../../db/kysely';
 import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 
@@ -31,6 +33,11 @@ function getGateway(): SyncGatewayAdapter {
 export const sqliteSyncAdminAdapter: ProviderAdminAdapter = {
     id: SQLITE_PROVIDER_ID,
     kind: 'sync',
+
+    async check() {
+        await sql`SELECT 1 FROM users LIMIT 1`.execute(getSqliteDb());
+        return { result: 'passed' as const, kind: 'database_read', scope: 'canonical SQLite database', code: 'read_ok' };
+    },
 
     async getStatus(_event: H3Event, _ctx: ProviderStatusContext): Promise<ProviderAdminStatusResult> {
         const driver = getSqliteDriver();

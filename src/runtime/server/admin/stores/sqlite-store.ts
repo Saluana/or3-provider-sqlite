@@ -1,3 +1,4 @@
+import { sql } from 'kysely';
 import type {
     AdminUserInfo,
     AdminUserStore,
@@ -6,6 +7,7 @@ import type {
     WorkspaceSummary,
 } from '~~/server/admin/stores/types';
 import { getSqliteDb } from '../../db/kysely';
+import { SqliteExternalStorageGenerationCoordinator } from '../../storage/sqlite-generation-coordinator';
 
 /** Rows store unix seconds; `createdAt` fields handed to the admin UI are milliseconds. */
 function nowEpoch(): number {
@@ -22,9 +24,62 @@ function isEmail(value: string): boolean {
 
 type Role = 'owner' | 'editor' | 'viewer';
 
+// Structural copies of the host's optional customer-read contract, so this
+// provider still type-checks against hosts that predate it.
+interface CustomerSummary { userId: string; email?: string; displayName?: string; createdAt: number; lastContactAt: number | null }
+interface CustomerPage { items: CustomerSummary[]; nextCursor: string | null }
+interface CustomerWorkspace {
+    id: string; name: string; role: Role; ownerUserId: string; createdAt: number;
+    deleted: boolean; deletedAt?: number; memberCount: number; lastContactAt: number | null;
+}
+
+const CUSTOMER_PAGE_MAX = 50;
+
+function escapeLike(value: string): string {
+    return value.replace(/[\\%_]/g, (character) => `\\${character}`);
+}
+
+function encodeCursor(createdAt: number, id: string): string {
+    return Buffer.from(JSON.stringify([createdAt, id])).toString('base64url');
+}
+
+function decodeCursor(cursor: string): [number, string] | null {
+    try {
+        const value = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as unknown;
+        return Array.isArray(value) && value.length === 2 && Number.isSafeInteger(value[0]) && typeof value[1] === 'string'
+            ? [value[0] as number, value[1] as string] : null;
+    } catch {
+        return null;
+    }
+}
+
 class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
+    async getStorageGenerationCandidates(input: { workspaceId: string; storageProviderId: 'fs' | 's3'; retentionSeconds: number; limit: number; cursor?: string }) {
+        return new SqliteExternalStorageGenerationCoordinator({ storageProviderId: input.storageProviderId }).inspectCandidates(input);
+    }
+
     private get db() {
         return getSqliteDb();
+    }
+
+    async recordSyncObservation(input: { userId: string; workspaceId: string; operation: 'push' | 'pull' | 'snapshot' | 'cursor'; observedAt: number; outcome: 'success' | 'failure'; code?: string }): Promise<void> {
+        if (!Number.isSafeInteger(input.observedAt) || input.observedAt < 0) throw new Error('Invalid observation time');
+        const success = input.outcome === 'success';
+        const code = ['provider_failed', 'request_rejected', 'operation_rejected', 'rate_limited', 'access_denied'].includes(input.code ?? '') ? input.code! : 'provider_failed';
+        await sql`INSERT INTO sync_observations (user_id, workspace_id, last_success_at, last_success_operation, last_failure_at, last_failure_code)
+            VALUES (${input.userId}, ${input.workspaceId}, ${success ? input.observedAt : null}, ${success ? input.operation : null}, ${success ? null : input.observedAt}, ${success ? null : code})
+            ON CONFLICT (user_id, workspace_id) DO UPDATE SET
+            last_success_at = CASE WHEN excluded.last_success_at >= COALESCE(last_success_at, 0) THEN excluded.last_success_at ELSE last_success_at END,
+            last_success_operation = CASE WHEN excluded.last_success_at >= COALESCE(last_success_at, 0) THEN excluded.last_success_operation ELSE last_success_operation END,
+            last_failure_at = CASE WHEN excluded.last_failure_at >= COALESCE(last_failure_at, 0) THEN excluded.last_failure_at ELSE last_failure_at END,
+            last_failure_code = CASE WHEN excluded.last_failure_at >= COALESCE(last_failure_at, 0) THEN excluded.last_failure_code ELSE last_failure_code END`.execute(this.db);
+    }
+
+    async getCustomerSyncObservations(input: { userId: string }) {
+        const result = await sql<{ workspace_id: string; last_success_at: number | null; last_success_operation: string | null; last_failure_at: number | null; last_failure_code: string | null }>`
+            SELECT workspace_id, last_success_at, last_success_operation, last_failure_at, last_failure_code
+            FROM sync_observations WHERE user_id = ${input.userId} ORDER BY workspace_id LIMIT 500`.execute(this.db);
+        return result.rows.map(row => ({ workspaceId: row.workspace_id, lastSuccessAt: row.last_success_at, lastSuccessOperation: row.last_success_operation, lastFailureAt: row.last_failure_at, lastFailureCode: row.last_failure_code }));
     }
 
     async listMembers(input: { workspaceId: string }) {
@@ -492,6 +547,91 @@ class SqliteWorkspaceAccessStore implements WorkspaceAccessStore {
             })
             .where('id', '=', input.workspaceId)
             .execute();
+    }
+
+    /** Bounded, read-only canonical directory. Keyset-paginated by creation time; never provisions. */
+    async listCustomers(input: { query?: string; cursor?: string | null; limit: number }): Promise<CustomerPage> {
+        const limit = Math.max(1, Math.min(input.limit, CUSTOMER_PAGE_MAX));
+        const query = input.query?.trim();
+        const cursor = input.cursor ? decodeCursor(input.cursor) : null;
+        if (input.cursor && !cursor) throw new Error('Invalid customer cursor');
+        let rows = this.db.selectFrom('users').select(['id', 'email', 'display_name', 'created_at']);
+        if (query) {
+            const pattern = `%${escapeLike(query)}%`;
+            rows = rows.where(sql<boolean>`(email LIKE ${pattern} ESCAPE '\\' OR display_name LIKE ${pattern} ESCAPE '\\' OR id LIKE ${pattern} ESCAPE '\\')`);
+        }
+        if (cursor) rows = rows.where(sql<boolean>`(created_at < ${cursor[0]} OR (created_at = ${cursor[0]} AND id < ${cursor[1]}))`);
+        const page = await rows.orderBy('created_at', 'desc').orderBy('id', 'desc').limit(limit + 1).execute();
+        const items = page.slice(0, limit);
+        const last = items.at(-1);
+        return {
+            items: await this.withLastContact(items),
+            nextCursor: page.length > limit && last ? encodeCursor(last.created_at, last.id) : null,
+        };
+    }
+
+    /** Batch lookup by internal IDs. Unknown IDs are omitted, never invented. */
+    async getCustomersByIds(input: { userIds: string[] }): Promise<CustomerSummary[]> {
+        const ids = [...new Set(input.userIds)].slice(0, CUSTOMER_PAGE_MAX);
+        if (!ids.length) return [];
+        const rows = await this.db.selectFrom('users').select(['id', 'email', 'display_name', 'created_at']).where('id', 'in', ids).execute();
+        return this.withLastContact(rows);
+    }
+
+    /** Owned workspaces (including retained deleted ones) and memberships for one canonical user. */
+    async getCustomerWorkspaces(input: { userId: string }): Promise<CustomerWorkspace[]> {
+        const rows = await this.db
+            .selectFrom('workspaces')
+            .leftJoin('workspace_members as membership', (join) => join
+                .onRef('membership.workspace_id', '=', 'workspaces.id')
+                .on('membership.user_id', '=', input.userId))
+            .select([
+                'workspaces.id as id', 'workspaces.name as name', 'workspaces.owner_user_id as owner_user_id',
+                'workspaces.created_at as created_at', 'workspaces.deleted as deleted', 'workspaces.deleted_at as deleted_at',
+                'membership.role as role',
+                (eb) => eb.selectFrom('workspace_members').select((inner) => inner.fn.countAll<number>().as('n'))
+                    .whereRef('workspace_members.workspace_id', '=', 'workspaces.id').as('member_count'),
+                (eb) => eb.selectFrom('device_cursors').select((inner) => inner.fn.max('device_cursors.updated_at').as('t'))
+                    .whereRef('device_cursors.workspace_id', '=', 'workspaces.id')
+                    .where('device_cursors.owner_user_id', '=', input.userId).as('last_contact'),
+            ])
+            .where((eb) => eb.or([
+                eb('workspaces.owner_user_id', '=', input.userId),
+                eb('membership.user_id', '=', input.userId),
+            ]))
+            .orderBy('workspaces.created_at', 'asc')
+            .limit(500)
+            .execute();
+        return rows.map((row) => ({
+            id: row.id,
+            name: row.name,
+            role: (row.owner_user_id === input.userId ? 'owner' : (row.role ?? 'viewer')) as Role,
+            ownerUserId: row.owner_user_id,
+            createdAt: row.created_at * 1000,
+            deleted: row.deleted === 1,
+            deletedAt: row.deleted_at ?? undefined,
+            memberCount: Number(row.member_count ?? 0),
+            lastContactAt: row.last_contact == null ? null : Number(row.last_contact) * 1000,
+        }));
+    }
+
+    /** Last sync cursor write by this user (server contact, not proof of a completed sync). */
+    private async withLastContact(rows: Array<{ id: string; email: string | null; display_name: string | null; created_at: number }>): Promise<CustomerSummary[]> {
+        if (!rows.length) return [];
+        const contacts = await this.db
+            .selectFrom('device_cursors')
+            .select(['owner_user_id', (eb) => eb.fn.max('updated_at').as('t')])
+            .where('owner_user_id', 'in', rows.map((row) => row.id))
+            .groupBy('owner_user_id')
+            .execute();
+        const byUser = new Map(contacts.map((row) => [row.owner_user_id, Number(row.t) * 1000]));
+        return rows.map((row) => ({
+            userId: row.id,
+            email: row.email ?? undefined,
+            displayName: row.display_name ?? undefined,
+            createdAt: row.created_at * 1000,
+            lastContactAt: byUser.get(row.id) ?? null,
+        }));
     }
 
     async searchUsers(input: { query: string; limit?: number }) {
