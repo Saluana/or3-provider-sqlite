@@ -1,16 +1,19 @@
 /**
  * OpenRouter model routing variants.
  *
- * Variants are requested by appending a suffix to the model id:
- * - `:online` — real-time web search (deprecated upstream in favor of the
- *   `openrouter:web_search` server tool, but still supported)
+ * The legacy `online` selection is retained for saved settings and translated
+ * to the `openrouter:web_search` server tool at the provider boundary.
+ * Routing variants are requested by appending a suffix to the model id:
  * - `:nitro` — sort providers by throughput (fastest)
  * - `:floor` — sort providers by price (cheapest)
  *
  * See https://openrouter.ai/docs/guides/routing/model-variants/nitro,
  * https://openrouter.ai/docs/guides/routing/model-variants/floor,
- * https://openrouter.ai/docs/guides/routing/model-variants/online
+ * https://openrouter.ai/docs/guides/features/server-tools/web-search
  */
+
+import type { ModelOptionDescriptor } from '../ai/types';
+import { isOpenAiModel } from '../openai/models';
 
 export const OPENROUTER_MODEL_VARIANTS = [
     'off',
@@ -47,7 +50,8 @@ export function appendModelVariant(
     modelId: string,
     variant: OpenRouterModelVariant | undefined | null
 ): string {
-    if (!variant || variant === 'off') return modelId;
+    // Routing variants are OpenRouter's; direct-OpenAI IDs never carry one.
+    if (!variant || variant === 'off' || isOpenAiModel(modelId)) return modelId;
     const base = stripModelVariantSuffix(modelId);
     return `${base}:${variant}`;
 }
@@ -81,8 +85,8 @@ export const MODEL_VARIANT_OPTIONS: readonly ModelVariantOption[] = [
     },
     {
         value: 'online',
-        label: 'Online',
-        description: 'Live web results in answers.',
+        label: 'Web search',
+        description: 'Model can search the web; extra charges may apply.',
     },
     {
         value: 'nitro',
@@ -95,6 +99,11 @@ export const MODEL_VARIANT_OPTIONS: readonly ModelVariantOption[] = [
         description: 'Cheapest providers; may be slower.',
     },
 ];
+
+/** Adapter metadata keeps search distinct from provider routing. */
+export const OPENROUTER_OPTION_DESCRIPTORS: readonly ModelOptionDescriptor<OpenRouterModelVariant>[] =
+    MODEL_VARIANT_OPTIONS.map((option) => ({ ...option,
+        kind: option.value === 'off' ? 'default' : option.value === 'online' ? 'search' : 'routing' }));
 
 /** Description for the given variant (falls back to `off` for unknown input). */
 export function getModelVariantDescription(

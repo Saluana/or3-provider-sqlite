@@ -1,0 +1,410 @@
+import type { ErrorMetadata } from '../errors';
+/**
+ * Shared Sync Types
+ *
+ * Type definitions used by both client and server for sync operations.
+ * These types define the contract between client sync engine and SyncProviders.
+ */
+
+import type { WorkspaceItemCapability } from "../posts/workspace-item-capability";
+import type { FileKindCapability } from '../files/file-capability';
+
+// ============================================================
+// CORE TYPES
+// ============================================================
+
+/**
+ * Scope for sync operations - defines the data partition
+ */
+export interface SyncScope {
+    workspaceId: string;
+    projectId?: string;
+    /** Local feed coverage identity; never used for server authorization. */
+    principalId?: string;
+}
+
+/**
+ * Stamp attached to each change for ordering and idempotency
+ */
+export interface ChangeStamp {
+    deviceId: string;
+    opId: string; // UUID for idempotency
+    hlc: string; // Hybrid logical clock
+    clock: number; // Monotonic per-record revision
+}
+
+/**
+ * Pending operation in the outbox waiting to be pushed
+ */
+export interface PendingOp {
+    id: string;
+    tableName: string;
+    operation: 'put' | 'delete';
+    pk: string; // Primary key
+    payload?: unknown; // Full record for put
+    stamp: ChangeStamp;
+    createdAt: number;
+    attempts: number;
+    nextAttemptAt?: number;
+    /**
+     * Local-only scheduling projection: `nextAttemptAt ?? 0`.
+     * `0` means immediately eligible. Maintained at the Dexie write
+     * boundary and covered by `[status+readyAt+createdAt+id]`; never sent
+     * to providers. Absent on pre-migration rows until backfilled.
+     */
+    readyAt?: number;
+    /** Local-only durable push ownership; stripped from provider requests. */
+    claimId?: string;
+    claimExpiresAt?: number;
+    status: PendingOpStatus;
+    lastError?: string;
+    lastErrorDetails?: ErrorMetadata;
+    lastErrorCode?: SyncErrorCode;
+    failureKind?: 'retry_exhausted' | 'permanent';
+    failedAt?: number;
+    discardedAt?: number;
+    discardReason?: string;
+}
+
+/**
+ * Durable outbox lifecycle. `syncing` and `failed` are retained only so
+ * databases created by older clients can be recovered in place.
+ */
+export type PendingOpStatus =
+    | 'pending'
+    | 'in_flight'
+    | 'retry_wait'
+    | 'failed_retryable'
+    | 'failed_permanent'
+    | 'applied'
+    | 'discarded'
+    | 'syncing'
+    | 'failed';
+
+/**
+ * A change received from the server
+ */
+export interface SyncChange {
+    serverVersion: number;
+    tableName: string;
+    pk: string;
+    op: 'put' | 'delete';
+    payload?: unknown;
+    stamp: ChangeStamp;
+}
+
+// ============================================================
+// REQUEST/RESPONSE TYPES
+// ============================================================
+
+/**
+ * Request to pull changes from server
+ */
+export interface PullRequest {
+    scope: SyncScope;
+    cursor: number; // Server version cursor
+    limit: number;
+    tables?: string[];
+    /** Reader capability required before generic file metadata is returned. */
+    fileKindCapability?: FileKindCapability;
+    workspaceItemCapability?: WorkspaceItemCapability;
+}
+
+/**
+ * Response from pull request
+ */
+export interface PullResponse {
+    changes: SyncChange[];
+    nextCursor: number;
+    hasMore: boolean;
+    /**
+     * Inclusive minimum `server_version` still present in change_log.
+     * `0` means the log still contains history from the origin.
+     */
+    oldestRetainedVersion: number;
+    /**
+     * True when incremental pull from `cursor` would skip deleted versions.
+     * Clients MUST snapshot-recover instead of advancing across the gap.
+     */
+    requiresSnapshot: boolean;
+}
+
+/** Default retention fields for a complete un-GCed log (cursor 0 is valid). */
+export const FULL_HISTORY_PULL_RETENTION = {
+    oldestRetainedVersion: 0,
+    requiresSnapshot: false,
+} as const;
+
+/** Request a bounded page from one consistent materialized snapshot. */
+export interface SnapshotRequest {
+    scope: SyncScope;
+    pageSize: number;
+    /** Opaque provider token; callers return it unchanged. */
+    pageToken?: string;
+    tables?: string[];
+    /** Reader capability required before generic file metadata is returned. */
+    fileKindCapability?: FileKindCapability;
+    workspaceItemCapability?: WorkspaceItemCapability;
+}
+
+export interface SnapshotRevision {
+    clock: number;
+    hlc: string;
+    opId: string;
+}
+
+/** Providers order canonical items by `(tableName, pk, kind)`. */
+export type SnapshotItem =
+    | {
+          kind: 'row';
+          tableName: string;
+          pk: string;
+          payload: unknown;
+          revision: SnapshotRevision;
+      }
+    | {
+          kind: 'tombstone';
+          tableName: string;
+          pk: string;
+          revision: SnapshotRevision;
+          serverDeletedAt: number;
+      };
+
+/**
+ * Every page in a chain carries the same snapshot ID and high-watermark.
+ * Incremental replay starts strictly after the watermark after final apply.
+ */
+export interface SnapshotResponse {
+    workspaceId: string;
+    snapshotId: string;
+    highWatermark: number;
+    items: SnapshotItem[];
+    nextPageToken: string | null;
+}
+
+/**
+ * Batch of operations to push to server
+ */
+export interface PushBatch {
+    scope: SyncScope;
+    ops: PendingOp[];
+    /** Writer capability required before generic file metadata is accepted. */
+    fileKindCapability?: FileKindCapability;
+    workspaceItemCapability?: WorkspaceItemCapability;
+}
+
+/**
+ * Error codes for sync operations
+ */
+export type SyncErrorCode = 
+    | 'VALIDATION_ERROR'      // Schema validation failed
+    | 'UNAUTHORIZED'          // Auth/permission denied
+    | 'CONFLICT'              // Optimistic lock conflict
+    | 'NOT_FOUND'             // Resource not found
+    | 'RATE_LIMITED'          // Rate limit exceeded
+    | 'OVERSIZED'             // Payload too large
+    | 'NETWORK_ERROR'         // Network/transport failure
+    | 'SERVER_ERROR'          // Internal server error
+    | 'UNKNOWN';              // Unclassified error
+
+/** Current materialized winner when a pushed revision did not win LWW. */
+export type PushWinner =
+    | { kind: 'put'; payload: Record<string, unknown>; revision: SnapshotRevision }
+    | { kind: 'delete'; revision: SnapshotRevision; serverDeletedAt?: number };
+
+/**
+ * Result of a push operation
+ */
+export interface PushResult {
+    results: Array<{
+        opId: string;
+        success: boolean;
+        serverVersion?: number;
+        error?: string;
+        errorCode?: SyncErrorCode;
+        tableName?: string;
+        operation?: 'put' | 'delete';
+        payload?: unknown;
+        wasExisting?: boolean;
+        applied?: boolean;
+        /** The op_id was already committed; no new server version was allocated. */
+        replayed?: boolean;
+        /** Authoritative current record (or tombstone) when applied is false. */
+        winner?: PushWinner;
+    }>;
+    serverVersion: number;
+}
+
+// ============================================================
+// PROVIDER INTERFACE
+// ============================================================
+
+/**
+ * Sync provider mode
+ * - direct: Client talks directly to backend with provider token
+ * - gateway: Client uses SSR endpoints that forward to backend
+ */
+export type SyncProviderMode = 'direct' | 'gateway';
+
+/**
+ * Auth configuration for direct providers
+ */
+export interface SyncProviderAuth {
+    providerId: string;
+    template?: string; // JWT template name (e.g., 'convex' for Clerk)
+}
+
+/**
+ * Subscribe options for real-time providers
+ */
+export interface SyncSubscribeOptions {
+    cursor?: number;
+    limit?: number;
+    /** Supported only with capabilities.subscriptionPages v1. The provider
+     * delivers every validated page (including filtered/empty windows), awaits
+     * acknowledgement, and owns pagination from that page's nextCursor.
+     */
+    onPage?: (fromCursor: number, page: PullResponse) => Promise<void>;
+}
+
+/**
+ * Request lifetime owned by the calling sync lifecycle.
+ */
+export interface SyncRequestOptions {
+    /** Cancels this caller’s wait and transport where supported. */
+    signal?: AbortSignal;
+}
+
+/** Sync provider contract implemented by each backend adapter. */
+export interface SyncProvider {
+    id: string;
+    mode: SyncProviderMode;
+    auth?: SyncProviderAuth;
+    /** Explicit protocol contracts implemented by this provider. Missing is fail-closed. */
+    capabilities?: {
+        snapshotBootstrap?: 'snapshot-v1';
+        historyRetention?: 'snapshot-v1';
+        /** Cursor-complete pages with acknowledged, provider-owned pagination. */
+        subscriptionPages?: 'v1';
+    };
+
+    /**
+     * Subscribe to real-time changes
+     * Returns unsubscribe function
+     */
+    subscribe(
+        scope: SyncScope,
+        tables: string[],
+        onChanges: (changes: SyncChange[]) => void | Promise<void>,
+        options?: SyncSubscribeOptions
+    ): Promise<() => void>;
+
+    /**
+     * Pull changes since cursor (for bootstrap/recovery)
+     */
+    pull(request: PullRequest, options?: SyncRequestOptions): Promise<PullResponse>;
+
+    /** Consistent materialized snapshot used before replaying after its watermark. */
+    snapshot?(request: SnapshotRequest, options?: SyncRequestOptions): Promise<SnapshotResponse>;
+
+    /**
+     * Push batch of changes
+     */
+    push(batch: PushBatch, options?: SyncRequestOptions): Promise<PushResult>;
+
+    /**
+     * Update device cursor for retention tracking
+     */
+    updateCursor(scope: SyncScope, deviceId: string, version: number, options?: SyncRequestOptions): Promise<void>;
+
+    /**
+     * GC tombstones with a retention window
+     */
+    gcTombstones?(scope: SyncScope, retentionSeconds: number): Promise<void>;
+
+    /**
+     * GC change log entries with a retention window
+     */
+    gcChangeLog?(scope: SyncScope, retentionSeconds: number): Promise<void>;
+
+    /**
+     * Cleanup resources
+     */
+    dispose(): Promise<void>;
+}
+
+// ============================================================
+// LOCAL SYNC STATE TYPES
+// ============================================================
+
+/**
+ * Tombstone record - tracks deleted records to prevent resurrection
+ */
+export interface Tombstone {
+    id: string;
+    tableName: string;
+    pk: string;
+    deletedAt: number;
+    clock: number;
+    /** Present on deterministic tombstones; optional only for legacy rows. */
+    hlc?: string;
+    /** Present on deterministic tombstones; optional only for legacy rows. */
+    opId?: string;
+    /** Server sequence that installed this tombstone, when known. */
+    serverVersion?: number;
+    /** Trusted server receipt time; distinct from caller-supplied deletedAt. */
+    serverDeletedAt?: number;
+    syncedAt?: number;
+}
+
+/**
+ * Sync state - persisted sync metadata
+ */
+export interface SyncState {
+    id: string; // 'default' for main state
+    cursor: number;
+    lastSyncAt: number;
+    deviceId: string;
+}
+
+/**
+ * Sync run - telemetry for each sync cycle
+ */
+export interface SyncRun {
+    id: string;
+    startedAt: number;
+    completedAt?: number;
+    pushedCount: number;
+    pulledCount: number;
+    conflictCount: number;
+    errorCount: number;
+    status: 'running' | 'completed' | 'failed';
+    error?: string;
+}
+
+// ============================================================
+// SYNC ENGINE TYPES
+// ============================================================
+
+/**
+ * Sync engine configuration
+ */
+export interface SyncEngineConfig {
+    workspaceId: string;
+    provider: SyncProvider;
+    deviceId: string;
+    pushIntervalMs?: number;
+    maxBatchSize?: number;
+    retryDelays?: number[];
+}
+
+/**
+ * Sync engine status
+ */
+export interface SyncEngineStatus {
+    state: 'idle' | 'syncing' | 'error' | 'offline';
+    pendingCount: number;
+    cursor: number;
+    lastSyncAt: number;
+    error?: string;
+}

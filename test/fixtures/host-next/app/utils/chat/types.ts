@@ -1,0 +1,173 @@
+/**
+ * @module app/utils/chat/types
+ *
+ * Purpose:
+ * Shared chat type definitions used across UI and streaming utilities.
+ */
+
+import type { CompactionData, RequestUsage } from '~~/shared/chat/compaction';
+import type { AiMessage } from '~~/shared/ai/types';
+export type { TextPart, ImagePart, FilePart, ContentPart, ToolCall } from '~~/shared/ai/types';
+
+/**
+ * `ChatMessage`
+ *
+ * Purpose:
+ * Canonical chat message shape used by UI and persistence layers.
+ */
+export interface ChatMessage extends AiMessage {
+    id?: string;
+    stream_id?: string;
+    file_hashes?: string | null;
+    reasoning_text?: string | null;
+    error?: string | null;
+    pending?: boolean;
+    data?: (Record<string, unknown> & { compaction?: CompactionData; usage?: RequestUsage }) | null;
+    index?: number | null;
+    order_key?: string | null;
+    created_at?: number | null;
+}
+
+export interface SendMessageParams {
+    cardOrigin?: import('~~/shared/chat/tool-card-data').CardOrigin;
+    /** @deprecated Project-chat attachments are added automatically; this field is ignored. */
+    knowledge_project_id?: string;
+    /** Explicit read-only omission inspection, followed by a one-use confirmation. */
+    inspectLossyRequest?: boolean;
+    lossyConfirmation?: import('~~/shared/chat/context-budget').LossyRequestPreview;
+    files?: { type: string; url: string }[];
+    model?: string;
+    file_hashes?: string[];
+    extraTextParts?: string[];
+    /**
+     * @deprecated Use `modelVariant: 'online'` instead. When `modelVariant`
+     * is set it takes precedence; otherwise `online: true` maps to the
+     * `:online` model suffix for backward compatibility.
+     */
+    online?: boolean;
+    /** OpenRouter routing variant suffix (`:online` / `:nitro` / `:floor`). */
+    modelVariant?: import('~~/shared/openrouter/model-variants').OpenRouterModelVariant;
+    thinking?: boolean;
+    reasoningEffort?: string | null;
+    maxCompletionTokens?: number;
+    /** Detached editor document for request-scoped plugin preparation. */
+    editorDoc?: Record<string, unknown>;
+    // Optional hashes to include for model context without reattaching to the new UI message.
+    context_hashes?: string[];
+    /** Explicit caller-provided history; native Retry instead uses validated exclusions. */
+    historyOverride?: ChatMessage[];
+    /** Native Retry's local turn IDs, excluded from a fresh validated recursive projection. */
+    retryExcludedMessageIds?: readonly string[];
+    /** Revisions atomically superseded with the admitted replacement user row. */
+    retryReplacement?: readonly import('~/db/messages').MessageRevision[];
+    /** Runs after the new user row is durable, before response generation. */
+    onUserPersisted?: (userMessageId: string) => void | Promise<void>;
+}
+
+export function hasDurableSendAcceptance(result: SendResult): boolean {
+    return 'userMessageId' in result && typeof result.userMessageId === 'string';
+}
+
+export type SendFailureReason =
+    | 'busy'
+    | 'missing_credentials'
+    | 'filtered'
+    | 'client_limit'
+    /** The selected model cannot read an attachment in this turn (e.g. an image). */
+    | 'unsupported_input'
+    | 'unavailable'
+    | 'context_full'
+    | 'model_metadata_unavailable'
+    | 'invalid_output_limit'
+    | 'invalid_context_limit'
+    | 'empty_context'
+    | 'tool_iteration_limit'
+    | 'stream_error'
+    | 'aborted'
+    | 'detached';
+
+export type SendResult =
+    | { status: 'accepted'; requestId: string; userMessageId?: string; assistantMessageId?: string }
+    | { status: 'rejected'; requestId?: string; reason: SendFailureReason; error?: string; lossyPreview?: import('~~/shared/chat/context-budget').LossyRequestPreview }
+    | { status: 'failed'; requestId: string; reason: SendFailureReason; error: string; userMessageId?: string; assistantMessageId?: string }
+    | { status: 'aborted'; requestId: string; reason: 'aborted'; userMessageId?: string; assistantMessageId?: string }
+    | { status: 'complete'; requestId: string; userMessageId: string; assistantMessageId: string }
+    | { status: 'detached'; requestId: string; reason: 'detached'; userMessageId?: string; assistantMessageId?: string };
+
+export type ChatRequestState =
+    | { status: 'idle' }
+    | { status: 'admitted'; requestId: string }
+    | { status: 'persisted'; requestId: string; userMessageId: string }
+    | { status: 'streaming'; requestId: string; userMessageId: string; assistantMessageId: string; providerAccepted?: true }
+    | { status: 'terminal'; requestId: string; result: SendResult };
+
+export type RegisterSendResult = (
+    terminal: Promise<SendResult>,
+    durableAcceptance?: Promise<SendResult>
+) => void;
+
+export type ToolRuntime = 'hybrid' | 'client' | 'server';
+
+/** Request-scoped authority and cancellation passed to every tool handler. */
+export interface ToolExecutionContext {
+    /** Recheck captured registry/project authority inside a host mutation transaction. */
+    assertToolAuthorized?: () => Promise<void>;
+    projectId?: string | null;
+    subject: string | null;
+    workspaceId: string | null;
+    threadId: string | null;
+    messageId: string | null;
+    callId: string;
+    requestId: string;
+    abortSignal: AbortSignal;
+    /** Model settings captured from the request that admitted this tool call. */
+    parentModel?: { model: string; thinking: boolean; reasoningEffort?: string | null };
+}
+
+/** Immutable admission decision associated with a provider-visible tool call. */
+export interface ToolExecutionAdmission {
+    definition: ToolDefinition;
+    /** Async pre-handler revalidation, outside storage transactions. Never forwarded into local authorization guards. */
+    beforeExecute?: () => Promise<void>;
+    /**
+     * When true, skip chat/global enablement checks.
+     * Used by Document AI, which gates tools via its own `enabledTools` map.
+     */
+    ignoreGlobalEnabled?: boolean;
+}
+
+/**
+ * `ToolDefinition`
+ *
+ * Purpose:
+ * OpenRouter tool definition with optional UI metadata.
+ */
+export interface ToolDefinition {
+    type: 'function';
+    function: {
+        name: string;
+        description: string;
+        parameters: import('~~/shared/chat/tool-schema').JsonSchemaObject;
+    };
+    ui?: {
+        label?: string;
+        icon?: string;
+        descriptionHint?: string;
+        defaultEnabled?: boolean;
+        category?: string;
+    };
+    runtime?: ToolRuntime;
+}
+
+export type ToolChoice =
+    | 'auto'
+    | 'none'
+    | {
+          type: 'function';
+          function: {
+              name: string;
+          };
+      };
+
+// Re-export from shared location (single source of truth)
+export type { ORStreamEvent } from '~~/shared/openrouter/parseOpenRouterSSE';

@@ -1,0 +1,380 @@
+/**
+ * @module server/sync/gateway/types.ts
+ *
+ * Purpose:
+ * Defines the server-side adapter interface for sync backends. This decouples
+ * SSR sync endpoints from specific backend implementations (Convex, SQLite, etc.).
+ *
+ * Architecture:
+ * - Core sync endpoints handle auth, validation, rate limiting
+ * - Adapters handle backend-specific logic (queries, mutations, cursors)
+ * - Wire types (PullRequest, PushBatch, etc.) are shared with client
+ *
+ * Example Flow:
+ * 1. POST /api/sync/push receives PushBatch from client
+ * 2. Endpoint resolves session, checks can('workspace.write')
+ * 3. Endpoint gets active SyncGatewayAdapter from config
+ * 4. Adapter handles backend operations (insert to change_log, etc.)
+ * 5. Endpoint returns PushResult to client
+ */
+import type { H3Event } from 'h3';
+import type { CanonicalChatReader } from '~~/shared/chat/history-reader';
+import type {
+    SyncScope,
+    PullRequest,
+    PullResponse,
+    PushBatch,
+    PushResult,
+    SnapshotRequest,
+    SnapshotResponse,
+} from '~~/shared/sync/types';
+import type { FileKind } from '~~/shared/files/file-kind';
+import type {
+    AdmitChatGenerationResult,
+    CanonicalGenerationSnapshot,
+    CanonicalHistoryActor,
+    ChatGenerationAdmissionEnvelope,
+    FinalizeChatGenerationResult,
+} from '~~/shared/chat/background-history';
+
+import type { ExternalStorageGenerationCoordinatorV1 } from '../../storage/gateway/generation-lifecycle';
+
+export type CanonicalStorageQueryKind =
+    | 'live_metadata'
+    /** Read-only accounting; requires capabilities.retainedStorageMetadata v1. */
+    | 'retained_metadata'
+    | 'reference_edges'
+    | 'active_reservations';
+
+export interface CanonicalStorageQueryRequest {
+    scope: { workspaceId: string };
+    kind: CanonicalStorageQueryKind;
+    /** Opaque, provider-issued keyset cursor. */
+    cursor?: string;
+    /** Maximum records returned. Providers must clamp this to a finite bound. */
+    limit?: number;
+    /** Optional exact normalized-or-prefixed content hash filter. */
+    hash?: string;
+    /** Epoch seconds used to exclude expired reservations deterministically. */
+    now?: number;
+}
+
+export interface CanonicalStorageMetadataRecord {
+    kind: 'metadata';
+    hash: string;
+    sizeBytes: number;
+    storageId?: string;
+    /** Canonical metadata used to apply safe download response policy. */
+    mimeType?: string;
+    name?: string;
+    fileKind?: FileKind;
+    updatedAt: number;
+}
+
+export interface CanonicalStorageReferenceEdge {
+    kind: 'reference';
+    hash: string;
+    sourceTable: 'messages' | 'posts';
+    sourceId: string;
+}
+
+/** Deleted materialized metadata is retained independently of sync-log GC.
+ * A delete-before-put placeholder has no known size; never report it as zero.
+ * Presence is not proof of on-disk bytes or permission to physically delete.
+ */
+export interface CanonicalStorageRetainedMetadataRecord
+    extends Omit<CanonicalStorageMetadataRecord, 'kind' | 'sizeBytes'> {
+    kind: 'retained_metadata';
+    sizeBytes?: number;
+}
+
+export interface CanonicalStorageReservationRecord {
+    kind: 'reservation';
+    reservationId: string;
+    hash: string;
+    sizeBytes: number;
+    expiresAt: number;
+}
+
+export type CanonicalStorageRecord =
+    | CanonicalStorageMetadataRecord
+    | CanonicalStorageRetainedMetadataRecord
+    | CanonicalStorageReferenceEdge
+    | CanonicalStorageReservationRecord;
+
+export interface CanonicalStorageQueryResponse {
+    items: CanonicalStorageRecord[];
+    nextCursor?: string;
+    hasMore: boolean;
+}
+
+export interface UploadIntentReservationRequest {
+    intentId: string;
+    workspaceId: string;
+    hash: string;
+    mimeType: string;
+    sizeBytes: number;
+    expiresAt: number;
+    workspaceQuotaBytes?: number;
+}
+
+export interface UploadIntentConsumptionRequest {
+    intentId: string;
+    workspaceId: string;
+    hash: string;
+    mimeType: string;
+    sizeBytes: number;
+    storageId: string;
+}
+
+/**
+ * Purpose:
+ * Provider-side sync-history maintenance state surfaced through deep health.
+ *
+ * Shape:
+ * - `enabled` reflects the verified snapshot-v1 retention contract.
+ * - `state` is `'running'` while a maintenance pass is in flight.
+ * - `lastError` is set only when the most recent pass failed; a failed pass
+ *   must never mark the provider unavailable (health stays `ok`).
+ */
+export type SyncMaintenanceState = {
+    enabled: boolean;
+    lastRun?: string;
+    backlog?: number;
+    lastError?: string;
+    state: 'idle' | 'running' | 'failed';
+};
+
+/**
+ * Purpose:
+ * Server-side sync gateway adapter interface.
+ *
+ * Responsibilities:
+ * - Handle pull/push/cursor operations for a specific backend
+ * - Maintain change log and device cursors
+ * - Implement GC for tombstones and change log
+ * - Ensure idempotency and ordering invariants
+ *
+ * Constraints:
+ * - Must respect workspace isolation (scope.workspaceId)
+ * - Must maintain stable ordering (serverVersion monotonic)
+ * - Must handle concurrent operations safely
+ */
+export interface SyncGatewayAdapter {
+    /** Dormant trusted-server API; no provider may advertise it until all paired
+     * writer/upload/physical-generation paths have been qualified together. */
+    storageGenerationCoordinator?: ExternalStorageGenerationCoordinatorV1;
+    id: string;
+
+    /** Atomically persist an expiring reservation and enforce workspace quota. */
+    reserveUploadIntent?(event: H3Event, input: UploadIntentReservationRequest): Promise<void>;
+    /** Consume a matching active intent once. Exact consumed-receipt replay must
+     * succeed for the same workspace/hash/MIME/size/storageId within its original
+     * authorization lifetime. Expired receipts require a fresh reservation;
+     * changed receipts and expired active intents fail.
+     */
+    consumeUploadIntent?(event: H3Event, input: UploadIntentConsumptionRequest): Promise<void>;
+    /** Release an active reservation after a failed/cancelled upload. */
+    cancelUploadIntent?(event: H3Event, input: { workspaceId: string; intentId: string }): Promise<void>;
+    /** Optional server notification channel. Emits only the committed workspace
+     * version; callers still use authorized pull/snapshot for all content.
+     * Must release timers/connections after unsubscribe and report stream errors.
+     */
+    watchVersion?(event: H3Event, scope: SyncScope, onVersion: (version: number) => void,
+        onError: (error: unknown) => void): Promise<() => void>;
+    /** Explicit protocol contracts implemented by this adapter. Missing is fail-closed. */
+    capabilities?: {
+        /** reserveUploadIntent serializes retained bytes and active digest holds. */
+        atomicUploadQuota?: 'retained-v1';
+        snapshotBootstrap?: 'snapshot-v1';
+        historyRetention?: 'snapshot-v1';
+        /** Atomic canonical chat admission/finalization and durable receipts. */
+        backgroundGenerationHistory?: 'v1';
+        /** Terminal finalization checks the supplied workspace revision transactionally. */
+        delegationTerminalHistory?: 'v1';
+        /** Bounded current materialized history, independently workspace authorized. */
+        canonicalChatHistory?: 'v1';
+        /** Transactional preservation/admission for catalog, Trash and file memberships. */
+        workspaceItems?: 'v1';
+        /** `readChatHistory` resolves explicit and legacy project ownership (`project_ownership`). */
+        projectOwnership?: 'v1';
+        /** Bounded deleted-metadata queries for read-only accounting, not deletion coordination. */
+        retainedStorageMetadata?: 'v1';
+        /** Separate from native-storage deletion coordination; default absent. */
+        externalStorageGenerations?: 'v1';
+    };
+    readChatHistory?: CanonicalChatReader['readChatHistory'];
+
+    /**
+     * History failures should expose a structured code, HTTP status/statusCode,
+     * or explicit retryable flag (see HistoryProviderFailure below). Unknown
+     * errors remain pending for retry; message wording is never classified.
+     * Atomically materialize the thread/turn placeholder and record the
+     * generation admission receipt. This is called only after HTTP auth and
+     * workspace authorization have produced the immutable actor.
+     */
+    admitChatGeneration?(
+        actor: CanonicalHistoryActor,
+        input: ChatGenerationAdmissionEnvelope
+    ): Promise<AdmitChatGenerationResult>;
+
+    /**
+     * Compare the current assistant generation with the admitted envelope,
+     * write its terminal snapshot to canonical history, append change_log, and
+     * record an idempotent receipt in one provider transaction.
+     */
+    finalizeChatGeneration?(
+        actor: CanonicalHistoryActor,
+        input: {
+            admission: ChatGenerationAdmissionEnvelope;
+            snapshot: CanonicalGenerationSnapshot;
+        }
+    ): Promise<FinalizeChatGenerationResult>;
+
+    /** Retain completed tool output in canonical workspace KV before settling its receipt. */
+    retainChatToolResult?(
+        actor: CanonicalHistoryActor,
+        input: { admission: ChatGenerationAdmissionEnvelope; callId: string; reference: string; rows: import('~~/shared/chat/tool-result-artifact').ToolResultArtifactRow[] },
+    ): Promise<void>;
+
+    /** Read and verify a retained result under its live admitted parent generation.
+     * Confirmed missing or corrupt chunks reject with code TOOL_RESULT_UNAVAILABLE;
+     * authorization and transient storage errors must remain distinct.
+     */
+    readChatToolResult?(
+        actor: CanonicalHistoryActor,
+        input: { admission: ChatGenerationAdmissionEnvelope; callId: string; reference: string },
+    ): Promise<string>;
+
+    /**
+     * Pull changes from server since cursor.
+     *
+     * Behavior:
+     * - Returns changes where serverVersion > cursor
+     * - Limited to `limit` changes per request
+     * - Sets `hasMore` if more changes available
+     * - Respects workspace isolation
+     *
+     * @param event - Nitro request event (contains session)
+     * @param input - Pull request with scope, cursor, limit
+     * @returns Pull response with changes and next cursor
+     */
+    pull(event: H3Event, input: PullRequest): Promise<PullResponse>;
+
+    /** One bounded page from a consistent materialized snapshot. */
+    snapshot?(
+        event: H3Event,
+        input: SnapshotRequest
+    ): Promise<SnapshotResponse>;
+
+    /** Server archive snapshot retaining materialized Trash file metadata.
+     * Normal sync may represent those rows as tombstones. Continuations must
+     * stay bound to this mode and the original frozen high-watermark.
+     */
+    backupSnapshot?(
+        event: H3Event,
+        input: SnapshotRequest
+    ): Promise<SnapshotResponse>;
+
+    /**
+     * Read bounded pages from canonical materialized storage state. Retained
+     * operation/change logs must never be consulted by this method.
+     */
+    queryCanonicalStorage?(
+        event: H3Event,
+        input: CanonicalStorageQueryRequest
+    ): Promise<CanonicalStorageQueryResponse>;
+
+    /**
+     * Push batch of operations to server.
+     *
+     * Behavior:
+     * - Validates and applies operations atomically
+     * - Returns per-op success/failure results
+     * - Assigns serverVersion to each successful op
+     * - Ensures idempotency (same opId = same result)
+     *
+     * @param event - Nitro request event (contains session)
+     * @param input - Push batch with scope and operations
+     * @returns Push result with per-op status
+     */
+    push(event: H3Event, input: PushBatch): Promise<PushResult>;
+
+    /**
+     * Update device cursor for change log GC.
+     *
+     * Behavior:
+     * - Records last-seen serverVersion for device
+     * - Used to determine safe deletion point for change log
+     * - Idempotent (upsert operation)
+     *
+     * @param event - Nitro request event (contains session)
+     * @param input - Device cursor update with scope, deviceId, version
+     */
+    updateCursor(
+        event: H3Event,
+        input: { scope: { workspaceId: string }; deviceId: string; version: number }
+    ): Promise<void>;
+
+    /**
+     * Garbage collect tombstones older than retention period.
+     *
+     * Behavior:
+     * - Deletes tombstones where deleted_at < now - retentionSeconds
+     * - Optional: may be no-op if backend handles this automatically
+     *
+     * @param event - Nitro request event (contains session)
+     * @param input - GC request with scope and retention window
+     */
+    gcTombstones?(
+        event: H3Event,
+        input: { scope: { workspaceId: string }; retentionSeconds: number }
+    ): Promise<void>;
+
+    /**
+     * Garbage collect change log entries beyond retention window.
+     *
+     * Behavior:
+     * - Deletes change log entries where:
+     *   - serverVersion < min(deviceCursors) AND
+     *   - created_at < now - retentionSeconds
+     * - Ensures no device misses changes
+     *
+     * @param event - Nitro request event (contains session)
+     * @param input - GC request with scope and retention window
+     */
+    gcChangeLog?(
+        event: H3Event,
+        input: { scope: { workspaceId: string }; retentionSeconds: number }
+    ): Promise<void>;
+
+    /**
+     * Enumerate non-deleted workspace IDs for bounded maintenance sweeps.
+     * Used by the in-process sync-history maintenance scheduler.
+     */
+    listWorkspaceIds?(): Promise<string[]>;
+
+    /**
+     * Read the provider's sync-history maintenance state (last run, backlog,
+     * failure). Optional — only providers that run maintenance implement it.
+     */
+    getMaintenanceState?(): SyncMaintenanceState;
+
+    /** Mark a maintenance pass as in-flight (guards overlapping runs). */
+    beginMaintenanceRun?(): void;
+
+    /** Record a successful maintenance pass; the provider computes the backlog. */
+    completeMaintenanceRun?(input: { lastRun: string }): void;
+
+    /** Record a failed maintenance pass with the error message. */
+    failMaintenanceRun?(error: string): void;
+}
+
+/** Structured failure metadata accepted from background history adapters. */
+export interface HistoryProviderFailure {
+    code?: 'VALIDATION_ERROR' | 'OVERSIZED' | 'UNAUTHORIZED' | 'FORBIDDEN' | 'CONFLICT' | 'SUPERSEDED' | 'UNSUPPORTED';
+    status?: number;
+    statusCode?: number;
+    retryable?: boolean;
+    retryAfterMs?: number;
+}

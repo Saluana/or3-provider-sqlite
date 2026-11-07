@@ -1,6 +1,6 @@
 /** Provider capacity is a fact; usage is an estimate and the user's maximum is optional. */
 export interface ContextModelMetadata {
-    architecture?: { input_modalities?: readonly string[] };
+    architecture?: { input_modalities?: readonly string[]; output_modalities?: readonly string[]; tokenizer?: string };
     context_length?: unknown;
     top_provider?: { context_length?: unknown; max_completion_tokens?: unknown } | null;
 }
@@ -17,7 +17,7 @@ export interface ContextBudget {
     effective_context_tokens: number;
     requested_completion_tokens: number | null;
     available_completion_tokens: number;
-    source: 'openrouter-live' | 'openrouter-cache';
+    source: 'openrouter-live' | 'openrouter-cache' | 'openai-live' | 'openai-cache';
     limited_by: 'model' | 'user' | 'provider';
 }
 export interface ContextEstimate {
