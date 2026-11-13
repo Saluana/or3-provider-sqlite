@@ -1118,6 +1118,132 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
     });
 
+    describe('byte-bounded pages', () => {
+        it.each(['sqlite', 'd1'] as const)('makes progress past an oversized legacy row on %s', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const ops = ['large-legacy', 'small-next'].map(pk => makeOp({ tableName: 'threads', pk }));
+            await adapter.push(stubEvent, makeBatch(ops));
+            const payload = { id: 'large-legacy', title: 'x'.repeat(1_100_000) };
+            const update = async (query: string) => {
+                if (runtime === 'd1') await d1TestDatabase!.database.prepare(query).bind(JSON.stringify(payload), WORKSPACE_ID, 'large-legacy').run();
+                else getRawDb().prepare(query).run(JSON.stringify(payload), WORKSPACE_ID, 'large-legacy');
+            };
+            await update('UPDATE change_log SET payload_json = ? WHERE workspace_id = ? AND pk = ?');
+            await update('UPDATE s_threads SET data_json = ? WHERE workspace_id = ? AND id = ?');
+            const first = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+            expect(first.changes).toHaveLength(1);
+            expect(first.changes[0]).toMatchObject({ pk: 'large-legacy', payload });
+            expect(first.hasMore).toBe(true);
+            const second = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: first.nextCursor, limit: 100 });
+            expect(second.changes.map(item => item.pk)).toEqual(['small-next']);
+            const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+            expect(snapshot.items).toHaveLength(1);
+            expect(snapshot.items[0]).toMatchObject({ kind: 'row', pk: 'large-legacy', payload });
+            expect(snapshot.nextPageToken).toBeTruthy();
+            const next = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100, pageToken: snapshot.nextPageToken! });
+            expect(next.items.map(item => item.pk)).toEqual(['small-next']);
+        });
+
+        it.each(['pull', 'snapshot'] as const)('bounds D1 response payloads read for a large %s page', async method => {
+            await useD1TestDatabase();
+            const ops = Array.from({ length: 8 }, (_, i) => makeOp({ tableName: 'threads', pk: `read-${i}`,
+                payload: { id: `read-${i}`, title: 'x'.repeat(200_000) } }));
+            await adapter.push(stubEvent, makeBatch(ops));
+            const database = d1TestDatabase!.database;
+            const prepare = database.prepare.bind(database);
+            let returnedBytes = 0;
+            const observe = (statement: ReturnType<typeof prepare>): ReturnType<typeof prepare> => ({
+                bind: (...values) => observe(statement.bind(...values)),
+                all: async <T>() => {
+                    const result = await statement.all<T>();
+                    returnedBytes += Buffer.byteLength(JSON.stringify(result.results ?? []));
+                    return result;
+                },
+                run: <T>() => statement.run<T>(),
+            });
+            const spy = vi.spyOn(database, 'prepare').mockImplementation(query =>
+                /^\s*select\b/i.test(query) ? observe(prepare(query)) : prepare(query));
+            try {
+                if (method === 'pull') {
+                    const pull = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+                    expect(pull.hasMore).toBe(true);
+                } else {
+                    const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+                    expect(snapshot.nextPageToken).toBeTruthy();
+                }
+                expect(returnedBytes).toBeLessThan(1_100_000);
+            } finally { spy.mockRestore(); }
+        });
+
+        it.each(['sqlite', 'd1'] as const)('preserves every change and snapshot item across %s byte-limited pages', async runtime => {
+            if (runtime === 'd1') await useD1TestDatabase();
+            const ops = Array.from({ length: 8 }, (_, i) => makeOp({
+                tableName: 'threads', pk: `large-${i}`,
+                payload: { id: `large-${i}`, title: `${i}` + 'x'.repeat(200_000) },
+            }));
+            const pushed = await adapter.push(stubEvent, makeBatch(ops));
+            expect(pushed.results.every(result => result.success)).toBe(true);
+            const changes: string[] = [];
+            const changePayloads: unknown[] = [];
+            let cursor = 0;
+            let more = true;
+            let pullPages = 0;
+            while (more) {
+                const page = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 100 });
+                expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1024 * 1024);
+                expect(page.nextCursor).toBeGreaterThan(cursor);
+                changes.push(...page.changes.map(change => change.pk));
+                changePayloads.push(...page.changes.map(change => change.payload));
+                cursor = page.nextCursor;
+                more = page.hasMore;
+                expect(++pullPages).toBeLessThan(10);
+            }
+            expect(changes).toEqual(ops.map(op => op.pk));
+            expect(changePayloads).toEqual(ops.map(op => op.payload));
+            expect(pullPages).toBeGreaterThan(1);
+            const items: string[] = [];
+            const itemPayloads: unknown[] = [];
+            let pageToken: string | undefined;
+            let snapshotId: string | undefined;
+            let watermark: number | undefined;
+            let snapshotPages = 0;
+            do {
+                const page = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100, pageToken });
+                expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1024 * 1024);
+                snapshotId ??= page.snapshotId;
+                watermark ??= page.highWatermark;
+                expect(page.snapshotId).toBe(snapshotId);
+                expect(page.highWatermark).toBe(watermark);
+                items.push(...page.items.map(item => item.pk));
+                itemPayloads.push(...page.items.map(item => item.kind === 'row' ? item.payload : null));
+                pageToken = page.nextPageToken ?? undefined;
+                expect(++snapshotPages).toBeLessThan(10);
+            } while (pageToken);
+            expect(items).toEqual(ops.map(op => op.pk));
+            expect(itemPayloads).toEqual(ops.map(op => op.payload));
+            expect(snapshotPages).toBeGreaterThan(1);
+        });
+    });
+
+    it.each(['sqlite', 'd1'] as const)('advances over filtered notification rows at %s byte boundaries', async runtime => {
+        if (runtime === 'd1') await useD1TestDatabase();
+        const alice = makeSessionEvent('user-alice');
+        const bob = makeSessionEvent('user-bob');
+        const large = (i: number) => makeOp({ tableName: 'threads', pk: `boundary-${i}`,
+            payload: { id: `boundary-${i}`, title: 'x'.repeat(200_000) } });
+        await adapter.push(alice, makeBatch(Array.from({ length: 5 }, (_, i) => large(i))));
+        await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'private' })]));
+        await adapter.push(alice, makeBatch([large(5)]));
+        const first = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+        expect(first.changes).toHaveLength(5);
+        expect(first.nextCursor).toBe(6);
+        expect(first.hasMore).toBe(true);
+        const second = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: first.nextCursor, limit: 100 });
+        expect(second.changes.map(change => change.pk)).toEqual(['boundary-5']);
+        expect(second.nextCursor).toBe(7);
+        expect(second.hasMore).toBe(false);
+    });
+
     describe('pull', () => {
         it('returns changes after cursor', async () => {
             const op1 = makeOp({ tableName: 'threads', pk: 't-1' });
