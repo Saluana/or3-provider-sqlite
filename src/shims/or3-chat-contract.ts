@@ -61,6 +61,8 @@ export type CreateConnectAuthorizationInput<T = any, U = any, V = any, W = any, 
 export const CreateConnectAuthorizationInput: any = undefined;
 export type CreateJobParams<T = any, U = any, V = any, W = any, X = any> = any;
 export const CreateJobParams: any = undefined;
+export type DelegationActivitySchema<T = any, U = any, V = any, W = any, X = any> = any;
+export const DelegationActivitySchema: any = undefined;
 export type delegationAdmissionFingerprint<T = any, U = any, V = any, W = any, X = any> = any;
 export const delegationAdmissionFingerprint: any = undefined;
 export type DelegationChildAdmission<T = any, U = any, V = any, W = any, X = any> = any;
@@ -69,9 +71,6 @@ export type DelegationChildAdmissionResult<T = any, U = any, V = any, W = any, X
 export const DelegationChildAdmissionResult: any = undefined;
 export type delegationChildIdentities<T = any, U = any, V = any, W = any, X = any> = any;
 export const delegationChildIdentities: any = undefined;
-export const DelegationActivitySchema: any = undefined;
-export type DelegationWait = any;
-export const toolCallFingerprint: any = undefined;
 export type DelegationDispatch<T = any, U = any, V = any, W = any, X = any> = any;
 export const DelegationDispatch: any = undefined;
 export type DelegationDispatchSchema<T = any, U = any, V = any, W = any, X = any> = any;
@@ -80,6 +79,8 @@ export type DelegationResume<T = any, U = any, V = any, W = any, X = any> = any;
 export const DelegationResume: any = undefined;
 export type DelegationResumeResult<T = any, U = any, V = any, W = any, X = any> = any;
 export const DelegationResumeResult: any = undefined;
+export type DelegationWait<T = any, U = any, V = any, W = any, X = any> = any;
+export const DelegationWait: any = undefined;
 export type DelegationWaitCommit<T = any, U = any, V = any, W = any, X = any> = any;
 export const DelegationWaitCommit: any = undefined;
 export type DelegationWaitSchema<T = any, U = any, V = any, W = any, X = any> = any;
@@ -220,6 +221,8 @@ export type SyncMaintenanceState<T = any, U = any, V = any, W = any, X = any> = 
 export const SyncMaintenanceState: any = undefined;
 export type TerminalGenerationSnapshot<T = any, U = any, V = any, W = any, X = any> = any;
 export const TerminalGenerationSnapshot: any = undefined;
+export type toolCallFingerprint<T = any, U = any, V = any, W = any, X = any> = any;
+export const toolCallFingerprint: any = undefined;
 export type toolResultArtifactPrefix<T = any, U = any, V = any, W = any, X = any> = any;
 export const toolResultArtifactPrefix: any = undefined;
 export type ToolResultArtifactRow<T = any, U = any, V = any, W = any, X = any> = any;
