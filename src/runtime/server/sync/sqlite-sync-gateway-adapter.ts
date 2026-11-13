@@ -10,6 +10,7 @@ import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspac
  */
 import type { H3Event } from 'h3';
 import { createHash } from 'node:crypto';
+import { sql } from 'kysely';
 import { canRunSyncHistoryGc } from './history-gc-policy';
 import { createError } from 'h3';
 import {
@@ -80,6 +81,8 @@ const SESSION_CONTEXT_KEY_PREFIX = '__or3_session_context_';
 const MIN_SYNC_RETENTION_SECONDS = 60 * 60;
 const MAX_SYNC_RETENTION_SECONDS = 365 * 24 * 60 * 60;
 const MAX_SYNC_PAYLOAD_BYTES = 256 * 1024;
+const MAX_SYNC_PAGE_BYTES = 1024 * 1024;
+const jsonBytes = (value: unknown): number => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
 // Consumed uploads occupy quota until canonical metadata arrives or their
 // authorization expires. Exact receipt retries share that original lifetime.
@@ -129,6 +132,34 @@ type SnapshotHeaderRow = {
     expires_at: number;
 };
 
+type PayloadSizeRow = { payload_bytes: number };
+
+// Read only a bounded amount of payload data across the database boundary.
+// Size metadata can cover the full row limit without transferring the payloads.
+// The first row is always admitted so even an oversized legacy row progresses.
+function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number {
+    let count = 0;
+    let bytes = 0;
+    for (const row of sizes.slice(0, limit)) {
+        const size = Math.max(0, Number(row.payload_bytes) || 0);
+        if (count && bytes + size > MAX_SYNC_PAGE_BYTES) break;
+        count++;
+        bytes += size;
+    }
+    return count;
+}
+
+function snapshotPageSelection(headerId: string, after?: SnapshotPageToken['after']): { clause: string; parameters: string[] } {
+    const clause = `FROM sync_snapshot_items WHERE snapshot_id = ?${after ? `
+        AND (table_name > ? OR (table_name = ? AND pk > ?)
+             OR (table_name = ? AND pk = ? AND kind > ?))` : ''}
+        ORDER BY table_name ASC, pk ASC, kind ASC LIMIT ?`;
+    const parameters = after
+        ? [headerId, after.tableName, after.tableName, after.pk, after.tableName, after.pk, after.kind]
+        : [headerId];
+    return { clause, parameters };
+}
+
 type SnapshotItemRow = {
     table_name: string;
     pk: string;
@@ -139,6 +170,36 @@ type SnapshotItemRow = {
     op_id: string;
     server_deleted_at: number | null;
 };
+
+// Include the continuation token and response envelope in the byte budget.
+// A single oversized item must still make progress rather than loop forever.
+function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRow[], pageSize: number, availableRows: number): SnapshotResponse {
+    const items: SnapshotItem[] = [];
+    let itemBytes = 0;
+    let scanned = 0;
+    let token: string | null = null;
+    for (const row of rows.slice(0, pageSize)) {
+        const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
+        const item: SnapshotItem = row.kind === 'row'
+            ? { kind: 'row', tableName: row.table_name, pk: row.pk,
+                payload: JSON.parse(row.payload_json ?? 'null') as unknown, revision }
+            : { kind: 'tombstone', tableName: row.table_name, pk: row.pk,
+                revision, serverDeletedAt: row.server_deleted_at ?? 0 };
+        const next = encodeSnapshotPageToken({ version: 1, snapshotId: header.id,
+            after: { tableName: row.table_name, pk: row.pk, kind: row.kind } });
+        const bytes = jsonBytes(item) + (items.length ? 1 : 0);
+        const envelope = jsonBytes({ workspaceId: header.workspace_id, snapshotId: header.id,
+            highWatermark: header.high_watermark, items: [], nextPageToken: next });
+        if (items.length && envelope + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) break;
+        items.push(item);
+        itemBytes += bytes;
+        scanned++;
+        token = next;
+    }
+    return { workspaceId: header.workspace_id, snapshotId: header.id,
+        highWatermark: header.high_watermark, items,
+        nextPageToken: availableRows > scanned ? token : null };
+}
 
 type HookEmission = {
     hookName: string;
@@ -2272,39 +2333,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
         let query = db
             .selectFrom('change_log')
-            .selectAll()
             .where('workspace_id', '=', scope.workspaceId)
             .where('server_version', '>', cursor)
-            .orderBy('server_version', 'asc')
-            .limit(fetchLimit + 1);
+            .orderBy('server_version', 'asc');
 
         if (tables?.length) {
             query = query.where('table_name', 'in', tables);
         }
 
-        const rows = await query.execute();
-
-        const hasMore = rows.length > fetchLimit;
-        const resultRows = hasMore ? rows.slice(0, fetchLimit) : rows;
-
-        const changes: SyncChange[] = resultRows.map((row) => ({
-            serverVersion: row.server_version,
-            tableName: row.table_name,
-            pk: row.pk,
-            op: row.op as 'put' | 'delete',
-            payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
-            stamp: {
-                clock: row.clock,
-                hlc: row.hlc,
-                deviceId: row.device_id,
-                opId: row.op_id,
-            },
-        })).filter((change) =>
-            isNotificationVisibleToUser(change, resolveSessionUserId(event))
-        );
-
-        const lastRow = resultRows[resultRows.length - 1];
-        const nextCursor = lastRow ? lastRow.server_version : cursor;
+        const sizes = await query.select(sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes'))
+            .limit(fetchLimit + 1).execute();
+        const selected = boundedPayloadRowCount(sizes, fetchLimit);
+        const rows = selected ? await query.selectAll().limit(selected).execute() : [];
 
         const minLog = await db
             .selectFrom('change_log')
@@ -2323,13 +2363,29 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             oldestLogVersion: minLog?.server_version ?? null,
             highWatermark: counter?.value ?? 0,
         });
-
-        return {
-            changes,
-            nextCursor,
-            hasMore,
-            ...retention,
-        };
+        const changes: SyncChange[] = [];
+        let itemBytes = 0;
+        let scanned = 0;
+        let nextCursor = cursor;
+        for (const row of rows.slice(0, fetchLimit)) {
+            const change: SyncChange = {
+                serverVersion: row.server_version, tableName: row.table_name, pk: row.pk,
+                op: row.op as 'put' | 'delete',
+                payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
+                stamp: { clock: row.clock, hlc: row.hlc, deviceId: row.device_id, opId: row.op_id },
+            };
+            if (isNotificationVisibleToUser(change, resolveSessionUserId(event))) {
+                const bytes = jsonBytes(change) + (changes.length ? 1 : 0);
+                // Account for the actual JSON envelope and a continuation flag.
+                const envelope = jsonBytes({ changes: [], nextCursor: row.server_version, hasMore: false, ...retention });
+                if (changes.length && envelope + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) break;
+                changes.push(change);
+                itemBytes += bytes;
+            }
+            scanned++;
+            nextCursor = row.server_version;
+        }
+        return { changes, nextCursor, hasMore: sizes.length > scanned, ...retention };
     }
 
     async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
@@ -2556,86 +2612,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             header = capture.immediate();
         }
 
-        const rows = after
-            ? raw.prepare(`
-                SELECT
-                    table_name, pk, kind, payload_json, clock, hlc, op_id,
-                    server_deleted_at
-                FROM sync_snapshot_items
-                WHERE snapshot_id = ?
-                  AND (
-                      table_name > ?
-                      OR (table_name = ? AND pk > ?)
-                      OR (table_name = ? AND pk = ? AND kind > ?)
-                  )
-                ORDER BY table_name ASC, pk ASC, kind ASC
-                LIMIT ?
-            `).all(
-                header.id,
-                after.tableName,
-                after.tableName,
-                after.pk,
-                after.tableName,
-                after.pk,
-                after.kind,
-                pageSize + 1
-            ) as SnapshotItemRow[]
-            : raw.prepare(`
-                SELECT
-                    table_name, pk, kind, payload_json, clock, hlc, op_id,
-                    server_deleted_at
-                FROM sync_snapshot_items
-                WHERE snapshot_id = ?
-                ORDER BY table_name ASC, pk ASC, kind ASC
-                LIMIT ?
-            `).all(header.id, pageSize + 1) as SnapshotItemRow[];
-
-        const hasMore = rows.length > pageSize;
-        const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
-        const items: SnapshotItem[] = pageRows.map((row) => {
-            const revision = {
-                clock: row.clock,
-                hlc: row.hlc,
-                opId: row.op_id,
-            };
-            if (row.kind === 'row') {
-                return {
-                    kind: 'row',
-                    tableName: row.table_name,
-                    pk: row.pk,
-                    payload: JSON.parse(row.payload_json ?? 'null') as unknown,
-                    revision,
-                };
-            }
-            return {
-                kind: 'tombstone',
-                tableName: row.table_name,
-                pk: row.pk,
-                revision,
-                serverDeletedAt: row.server_deleted_at ?? 0,
-            };
-        });
-
-        const lastRow = pageRows.at(-1);
-        const nextPageToken = hasMore && lastRow
-            ? encodeSnapshotPageToken({
-                version: 1,
-                snapshotId: header.id,
-                after: {
-                    tableName: lastRow.table_name,
-                    pk: lastRow.pk,
-                    kind: lastRow.kind,
-                },
-            })
-            : null;
-
-        return {
-            workspaceId: header.workspace_id,
-            snapshotId: header.id,
-            highWatermark: header.high_watermark,
-            items,
-            nextPageToken,
-        };
+        const selection = snapshotPageSelection(header.id, after);
+        const sizes = raw.prepare(`SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes ${selection.clause}`)
+            .all(...selection.parameters, pageSize + 1) as PayloadSizeRow[];
+        const selected = boundedPayloadRowCount(sizes, pageSize);
+        const rows = selected ? raw.prepare(`SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at ${selection.clause}`)
+            .all(...selection.parameters, selected) as SnapshotItemRow[] : [];
+        return buildSnapshotPage(header, rows, pageSize, sizes.length);
     }
 
     async updateCursor(
@@ -3076,36 +3059,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             header = created;
         }
 
-        const rows = after
-            ? await d1All<SnapshotItemRow>(
-                `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at
-                 FROM sync_snapshot_items
-                 WHERE snapshot_id = ?
-                   AND (
-                       table_name > ?
-                       OR (table_name = ? AND pk > ?)
-                       OR (table_name = ? AND pk = ? AND kind > ?)
-                   )
-                 ORDER BY table_name ASC, pk ASC, kind ASC
-                 LIMIT ?`,
-                header.id,
-                after.tableName,
-                after.tableName,
-                after.pk,
-                after.tableName,
-                after.pk,
-                after.kind,
-                pageSize + 1
-            )
-            : await d1All<SnapshotItemRow>(
-                `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at
-                 FROM sync_snapshot_items
-                 WHERE snapshot_id = ?
-                 ORDER BY table_name ASC, pk ASC, kind ASC
-                 LIMIT ?`,
-                header.id,
-                pageSize + 1
-            );
+        const selection = snapshotPageSelection(header.id, after);
+        const sizes = await d1All<PayloadSizeRow>(
+            `SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes ${selection.clause}`,
+            ...selection.parameters, pageSize + 1
+        );
+        const selected = boundedPayloadRowCount(sizes, pageSize);
+        const rows = selected ? await d1All<SnapshotItemRow>(
+            `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at ${selection.clause}`,
+            ...selection.parameters, selected
+        ) : [];
         // Captures and maintenance can evict a snapshot between these awaited
         // reads. Never acknowledge an incomplete copy as a final page.
         const [retained] = await d1All<{ expires_at: number }>(
@@ -3114,45 +3077,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (!retained || retained.expires_at <= nowEpoch()) {
             throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
         }
-        const hasMore = rows.length > pageSize;
-        const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
-        const items: SnapshotItem[] = pageRows.map((row) => {
-            const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
-            if (row.kind === 'row') {
-                return {
-                    kind: 'row',
-                    tableName: row.table_name,
-                    pk: row.pk,
-                    payload: JSON.parse(row.payload_json ?? 'null') as unknown,
-                    revision,
-                };
-            }
-            return {
-                kind: 'tombstone',
-                tableName: row.table_name,
-                pk: row.pk,
-                revision,
-                serverDeletedAt: row.server_deleted_at ?? 0,
-            };
-        });
-        const lastRow = pageRows.at(-1);
-        return {
-            workspaceId: header.workspace_id,
-            snapshotId: header.id,
-            highWatermark: header.high_watermark,
-            items,
-            nextPageToken: hasMore && lastRow
-                ? encodeSnapshotPageToken({
-                    version: 1,
-                    snapshotId: header.id,
-                    after: {
-                        tableName: lastRow.table_name,
-                        pk: lastRow.pk,
-                        kind: lastRow.kind,
-                    },
-                })
-                : null,
-        };
+        return buildSnapshotPage(header, rows, pageSize, sizes.length);
     }
 
     private async updateCursorInD1(
