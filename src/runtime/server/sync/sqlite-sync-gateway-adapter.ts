@@ -252,9 +252,11 @@ export async function pruneExpiredSyncSnapshots(): Promise<void> {
 }
 
 
+// Keep head + 1 representable for the empty-log retention boundary.
 function safeVersionEnd(base: number, count: number): number {
     const end = base + count;
-    if (!Number.isSafeInteger(base) || base < 0 || !Number.isSafeInteger(end) || end < 0) {
+    if (!Number.isSafeInteger(base) || base < 0 || !Number.isSafeInteger(end) || end < 0
+        || (count > 0 && end >= Number.MAX_SAFE_INTEGER)) {
         throw Object.assign(new Error('Sync server version exhausted or invalid'), { code: 'VALIDATION_ERROR' });
     }
     return end;
@@ -3282,7 +3284,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             sql: `SELECT json_extract('{}', CASE WHEN typeof(value) = 'integer'
                 AND value >= 0 AND value <= ? THEN '$' ELSE 'OR3_SYNC_VERSION_EXHAUSTED' END)
                 FROM server_version_counter WHERE workspace_id = ?`,
-            parameters: [Number.MAX_SAFE_INTEGER - newOps.length, workspaceId],
+            parameters: [Number.MAX_SAFE_INTEGER - 1 - newOps.length, workspaceId],
         });
         const materializedStatementIndex = new Map<string, number>();
         const materializedWasExisting = new Map<string, boolean>();

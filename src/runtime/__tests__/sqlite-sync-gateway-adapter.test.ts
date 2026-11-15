@@ -144,7 +144,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]));
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     });
-    it.each(['not-json', {}, null])('reports unresolved legacy ownership for malformed project data %j without failing independent reads', async data => {
+    it.each(['not-json', {}, null, 'oversized', 'wrong-identity'])('reports unresolved legacy ownership for malformed project data %j without failing independent reads', async data => {
         const raw = getRawDb();
         raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
         raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
@@ -155,13 +155,18 @@ describe('SqliteSyncGatewayAdapter', () => {
             makeOp({ tableName: 'threads', pk: 'legacy', payload: { id: 'legacy' } }),
             makeOp({ tableName: 'threads', pk: 'explicit', payload: { id: 'explicit', project_id: 'chosen' } }),
         ]));
-        raw.prepare("UPDATE s_projects SET data_json = ? WHERE id = 'broken'").run(data === null ? '{broken' : JSON.stringify({ id: 'broken', data }));
+        raw.prepare("UPDATE s_projects SET data_json = ? WHERE id = 'broken'").run(data === null ? '{broken' : JSON.stringify({ id: data === 'wrong-identity' ? 'other' : 'broken',
+            data: data === 'oversized' || data === 'wrong-identity' ? [] : data,
+            ...(data === 'oversized' ? { padding: 'x'.repeat(262144) } : {}),
+        }));
         await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'legacy' }))
             .resolves.toMatchObject({ status: 'scope_incomplete' });
         await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'explicit' }))
             .resolves.toMatchObject({ status: 'ok', project_ownership: 'resolved', thread: { project_id: 'chosen' } });
         await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'missing' }))
             .resolves.toMatchObject({ status: 'ok', thread: undefined });
+        await expect(adapter.readChatHistory(actor, { kind: 'messages', message_ids: ['independent'] }))
+            .resolves.toMatchObject({ status: 'ok', messages: [] });
     });
 
     it('reads a delete-before-put placeholder beside a live canonical sibling', async () => {
@@ -178,6 +183,9 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect.objectContaining({ id: 'absent', deleted: true, clock: 1 }),
             expect.objectContaining({ id: 'live', deleted: false }),
         ]));
+        raw.prepare("UPDATE s_messages SET data_json = ? WHERE id = 'live'").run('{"id":"contradiction"}');
+        await expect(adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'messages', message_ids: ['live'] }))
+            .rejects.toThrow('Canonical history identity mismatch');
     });
 
     // A deleted/missing owner releases the chat even if LWW preserved its old
@@ -1337,26 +1345,32 @@ describe('SqliteSyncGatewayAdapter', () => {
         it.each(['native', 'd1'])('rejects unsafe version allocation atomically on %s', async driver => {
             if (driver === 'd1') await useD1TestDatabase();
             const db = getSqliteDb();
-            await sql`INSERT INTO server_version_counter (workspace_id, value) VALUES (${WORKSPACE_ID}, ${Number.MAX_SAFE_INTEGER - 1})`.execute(db);
+            await sql`INSERT INTO server_version_counter (workspace_id, value) VALUES (${WORKSPACE_ID}, ${Number.MAX_SAFE_INTEGER - 2})`.execute(db);
             const batch = makeBatch([1, 2].map(n => makeOp({ tableName: 'threads', pk: `overflow-${n}` })));
             await expect(adapter.push(stubEvent, batch)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-            expect((await db.selectFrom('server_version_counter').select('value').executeTakeFirst())?.value).toBe(Number.MAX_SAFE_INTEGER - 1);
+            expect((await db.selectFrom('server_version_counter').select('value').executeTakeFirst())?.value).toBe(Number.MAX_SAFE_INTEGER - 2);
             expect(await db.selectFrom('change_log').selectAll().execute()).toEqual([]);
             expect(await db.selectFrom('s_threads').selectAll().execute()).toEqual([]);
             const lastSafe = await adapter.push(stubEvent, makeBatch([batch.ops[0]!]));
-            expect(lastSafe.serverVersion).toBe(Number.MAX_SAFE_INTEGER);
+            expect(lastSafe.serverVersion).toBe(Number.MAX_SAFE_INTEGER - 1);
+            await expect(adapter.push(stubEvent, makeBatch([batch.ops[1]!]))).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+            await sql`UPDATE change_log SET created_at = 0`.execute(db);
+            await adapter.gcChangeLog(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, retentionSeconds: 86400 });
+            for (const cursor of [Number.MAX_SAFE_INTEGER - 2, Number.MAX_SAFE_INTEGER - 1]) {
+                const pulled = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 });
+                expect(pulled).toMatchObject({ oldestRetainedVersion: Number.MAX_SAFE_INTEGER,
+                    requiresSnapshot: cursor < Number.MAX_SAFE_INTEGER - 1 });
+            }
         });
 
-        it.each(['native', 'd1'])('signals expired and ahead cursors before decoding poisoned history on %s', async driver => {
+        it.each(['native', 'd1'].flatMap(driver => [0, 4].map(cursor => ({ driver, cursor }))))('signals recovery at cursor $cursor before decoding poisoned history on $driver', async ({ driver, cursor }) => {
             if (driver === 'd1') await useD1TestDatabase();
             await adapter.push(stubEvent, makeBatch([1, 2, 3].map(n => makeOp({ tableName: 'threads', pk: `recovery-${n}` }))));
             const db = getSqliteDb();
             await sql`DELETE FROM change_log WHERE server_version < 3`.execute(db);
             await sql`UPDATE change_log SET payload_json = '{broken'`.execute(db);
-            for (const cursor of [0, 4]) {
-                await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 }))
-                    .resolves.toEqual({ changes: [], nextCursor: cursor, hasMore: false, oldestRetainedVersion: 3, requiresSnapshot: true });
-            }
+            await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 }))
+                .resolves.toEqual({ changes: [], nextCursor: cursor, hasMore: false, oldestRetainedVersion: 3, requiresSnapshot: true });
             // oldest - 1 is covered and must attempt to read the retained row.
             await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 })).rejects.toThrow();
             await sql`UPDATE change_log SET payload_json = '{"id":"recovery-3"}'`.execute(db);
