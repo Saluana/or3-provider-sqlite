@@ -252,6 +252,14 @@ export async function pruneExpiredSyncSnapshots(): Promise<void> {
 }
 
 
+function safeVersionEnd(base: number, count: number): number {
+    const end = base + count;
+    if (!Number.isSafeInteger(base) || base < 0 || !Number.isSafeInteger(end) || end < 0) {
+        throw Object.assign(new Error('Sync server version exhausted or invalid'), { code: 'VALIDATION_ERROR' });
+    }
+    return end;
+}
+
 function backgroundHistoryOpId(
     admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
     stage: 'thread' | 'user' | 'assistant' | 'finalize'
@@ -1090,7 +1098,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
             const baseVersion = counter?.value ?? 0;
-            const finalVersion = baseVersion + records.length;
+            const finalVersion = safeVersionEnd(baseVersion, records.length);
             raw.prepare(
                 `INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
                  ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`
@@ -1292,6 +1300,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, superseded, now);
                 return { status: 'superseded' as const, reason: superseded };
             }
+            if (!Number.isSafeInteger(row!.clock) || row!.clock < 0 || row!.clock >= Number.MAX_SAFE_INTEGER) {
+                throw Object.assign(new Error('Background history clock exhausted or invalid'), { code: 'VALIDATION_ERROR' });
+            }
             const nextClock = row!.clock + 1;
             const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
             const opId = backgroundHistoryOpId(admission, 'finalize');
@@ -1328,7 +1339,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             const counter = raw
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
-            const serverVersion = (counter?.value ?? 0) + 1;
+            const serverVersion = safeVersionEnd(counter?.value ?? 0, 1);
             raw.prepare(
                 `INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
                  ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`
@@ -1424,7 +1435,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 .get(admission.workspaceId) as { value: number } | undefined;
             const baseVersion = counter?.value ?? 0;
             raw.prepare(`INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
-                ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, baseVersion + newRows.length);
+                ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, safeVersionEnd(baseVersion, newRows.length));
             const now = nowEpoch();
             newRows.forEach((row, index) => {
                 const opId = digestUuid(createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex'));
@@ -1989,6 +2000,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(workspaceId) as { value: number } | undefined;
 
+            safeVersionEnd(counterRow?.value ?? 0, uniqueNewOpIds.size);
             if (counterRow) {
                 baseVersion = counterRow.value;
                 raw.prepare(
@@ -3296,6 +3308,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 parameters: [workspaceId],
             });
         }
+        // Assert inside the atomic batch, so concurrent writers cannot exhaust
+        // the counter after a preflight check. Invalid JSON paths abort D1 batches.
+        if (newOps.length > 0) statements.push({
+            sql: `SELECT json_extract('{}', CASE WHEN typeof(value) = 'integer'
+                AND value >= 0 AND value <= ? THEN '$' ELSE 'OR3_SYNC_VERSION_EXHAUSTED' END)
+                FROM server_version_counter WHERE workspace_id = ?`,
+            parameters: [Number.MAX_SAFE_INTEGER - newOps.length, workspaceId],
+        });
         const materializedStatementIndex = new Map<string, number>();
         const materializedWasExisting = new Map<string, boolean>();
         const seenMaterializedKeys = new Set<string>();
@@ -3448,6 +3468,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             batchResults = statements.length > 0 ? await d1Batch(statements) : [];
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            if (/JSON path/i.test(message) && message.includes('OR3_SYNC_VERSION_EXHAUSTED')) {
+                throw Object.assign(new Error('Sync server version exhausted or invalid'), { code: 'VALIDATION_ERROR' });
+            }
             if (/JSON path/i.test(message) && message.includes(WORKSPACE_ITEM_UPDATE_REQUIRED)) {
                 throw workspaceItemUpdateRequired();
             }

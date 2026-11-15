@@ -353,6 +353,20 @@ describe('SqliteSyncGatewayAdapter', () => {
             await rm(directory, { recursive: true, force: true });
         });
 
+        it.each(['clock', 'version'] as const)('rejects terminal %s exhaustion without changing durable state', async exhausted => {
+            const history = admission();
+            history.assistantMessage.clock = exhausted === 'clock' ? Number.MAX_SAFE_INTEGER : 1;
+            await adapter.admitChatGeneration(actor, history);
+            if (exhausted === 'version') setWorkspaceVersion(Number.MAX_SAFE_INTEGER);
+            const raw = getRawDb();
+            const state = () => ['server_version_counter', 'change_log', 's_messages', 'background_generation_receipts']
+                .map(table => raw.prepare(`SELECT * FROM ${table}`).all());
+            const before = state();
+            await expect(adapter.finalizeChatGeneration(actor, { admission: history, snapshot: snapshot() }))
+                .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+            expect(state()).toEqual(before);
+        });
+
         it('retains tool output atomically in canonical KV, replays after reopen and refuses deleted rows or revoked access', async () => {
             const history = admission();
             const jobs = new SqliteBackgroundJobProvider();
@@ -1284,6 +1298,19 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('pull', () => {
+        it.each(['native', 'd1'])('rejects unsafe version allocation atomically on %s', async driver => {
+            if (driver === 'd1') await useD1TestDatabase();
+            const db = getSqliteDb();
+            await sql`INSERT INTO server_version_counter (workspace_id, value) VALUES (${WORKSPACE_ID}, ${Number.MAX_SAFE_INTEGER - 1})`.execute(db);
+            const batch = makeBatch([1, 2].map(n => makeOp({ tableName: 'threads', pk: `overflow-${n}` })));
+            await expect(adapter.push(stubEvent, batch)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+            expect((await db.selectFrom('server_version_counter').select('value').executeTakeFirst())?.value).toBe(Number.MAX_SAFE_INTEGER - 1);
+            expect(await db.selectFrom('change_log').selectAll().execute()).toEqual([]);
+            expect(await db.selectFrom('s_threads').selectAll().execute()).toEqual([]);
+            const lastSafe = await adapter.push(stubEvent, makeBatch([batch.ops[0]!]));
+            expect(lastSafe.serverVersion).toBe(Number.MAX_SAFE_INTEGER);
+        });
+
         it.each(['native', 'd1'])('signals expired and ahead cursors before decoding poisoned history on %s', async driver => {
             if (driver === 'd1') await useD1TestDatabase();
             await adapter.push(stubEvent, makeBatch([1, 2, 3].map(n => makeOp({ tableName: 'threads', pk: `recovery-${n}` }))));
