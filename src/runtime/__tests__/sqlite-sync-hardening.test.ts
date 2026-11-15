@@ -83,6 +83,25 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:0});
         expect(await raw.prepare('SELECT data_json FROM s_messages').get()).toEqual({data_json:bytes});
     });
+    it('keeps healthy legacy redundant revision metadata readable without rewriting evidence', async () => {
+        const original = {id:'legacy-revision',name:'legacy',value:'healthy',created_at:1,updated_at:1,clock:0,hlc:'previous:0',op_id:'legacy:previous'};
+        const bytes = JSON.stringify(original); const opId = randomUUID();
+        await raw.prepare(`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
+            VALUES (?, ?, 1, 'kv', 'legacy-revision', 'put', ?, 1, 'legacy:1', 'test', ?, 1)`).run(randomUUID(),scope.workspaceId,bytes,opId);
+        await raw.prepare(`INSERT INTO s_kv (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
+            VALUES ('legacy-revision',?,?,1,'legacy:1','test',?,0,1,1)`).run(scope.workspaceId,bytes,opId);
+        await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
+        const pull = await adapter.pull(event,{scope,cursor:0,limit:10});
+        expect(pull.unavailable ?? []).toEqual([]);
+        expect(pull.changes[0]).toMatchObject({payload:original,stamp:{clock:1,hlc:'legacy:1',opId}});
+        // Pre-006 backfills also legitimately use non-UUID snapshot revisions.
+        await raw.prepare("UPDATE s_kv SET op_id = 'legacy:kv:revision:1'").run();
+        const snapshot = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10});
+        expect(snapshot.unavailable ?? []).toEqual([]);
+        expect(snapshot.items[0]).toMatchObject({payload:original,revision:{clock:1,hlc:'legacy:1',opId:'legacy:kv:revision:1'}});
+        expect(await raw.prepare('SELECT data_json FROM s_kv').get()).toEqual({data_json:bytes});
+        expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:0});
+    });
     it.runIf(driver === 'native')('keeps historical background admission receipt identity and derives ordering only for new final writes', async () => {
         const history = {version:1,kind:'new-turn',admissionId:'legacy-admission',generationId:'legacy-generation',workspaceId:scope.workspaceId,threadId:'thread',messageId:'assistant',
             thread:{id:'thread',clock:1,status:'ready',pinned:false,deleted:false,created_at:1,updated_at:1,extensionKey:'original'},

@@ -189,7 +189,7 @@ function assertCoverageKey(table: string, pk: string, pkHex?: string, tableHex?:
         throw new Error('Untrustworthy sync coverage identity');
     }
 }
-function validReadPayload(table: string, pk: string, payload: unknown, clock: number, hlc?: string, opId?: string): boolean {
+function validReadPayload(table: string, pk: string, payload: unknown, clock: number, hlc?: string): boolean {
     if (!Object.hasOwn(TABLE_PAYLOAD_SCHEMAS, table)) return false;
     const normalized = normalizeWirePayloadForTable(table, payload);
     // Old messages derive ordering from the revision HLC. Validate that view
@@ -202,9 +202,9 @@ function validReadPayload(table: string, pk: string, payload: unknown, clock: nu
     for (const key of ['id','hash','thread_id','project_id','user_id','document_id','root_thread_id','summary_message_id']) {
         if (typeof row[key] === 'string' && !isLosslessSyncIdentifier(row[key])) return false;
     }
-    return row[table === 'file_meta' ? 'hash' : 'id'] === pk && row.clock === clock &&
-        (hlc === undefined || row.hlc === undefined || row.hlc === hlc) &&
-        (opId === undefined || row.op_id === undefined || row.op_id === opId);
+    // Historical payloads may retain older redundant revision fields. Readers
+    // install the authoritative envelope revision; only new writes bind both.
+    return row[table === 'file_meta' ? 'hash' : 'id'] === pk;
 }
 function snapshotEvidence(header: SnapshotHeaderRow, row: SnapshotItemRow): EvidenceSource {
     return { workspaceId: header.workspace_id, source: 'snapshot', locator: JSON.stringify([row.table_name, row.pk]),
@@ -238,7 +238,7 @@ async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRo
                     ? { kind: 'row' as const, tableName: row.table_name, pk: row.pk, payload: JSON.parse(row.payload_json ?? 'null'), revision }
                     : { kind: 'tombstone' as const, tableName: row.table_name, pk: row.pk, revision, serverDeletedAt: row.server_deleted_at };
                 if (SnapshotItemSchema.safeParse(candidate).success && Number.isSafeInteger(row.clock) &&
-                    (row.kind === 'row' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc,row.op_id) : ALLOWED_SYNC_TABLES.includes(row.table_name))) item = candidate as SnapshotItem;
+                    (row.kind === 'row' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc) : ALLOWED_SYNC_TABLES.includes(row.table_name))) item = candidate as SnapshotItem;
             } catch { reason = 'invalid_json'; }
         }
         const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.kind,
@@ -2496,7 +2496,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
                         stamp: { clock: row.clock, hlc: row.hlc, deviceId: row.device_id, opId: row.op_id } };
                     if (SyncChangeSchema.safeParse(candidate).success && Number.isSafeInteger(row.clock) &&
-                        (row.op === 'put' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc,row.op_id) : ALLOWED_SYNC_TABLES.includes(row.table_name))) change = candidate;
+                        (row.op === 'put' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc) : ALLOWED_SYNC_TABLES.includes(row.table_name))) change = candidate;
                 } catch { reason = 'invalid_json'; }
             }
             const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.op as 'put' | 'delete',
