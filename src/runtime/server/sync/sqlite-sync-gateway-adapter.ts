@@ -1,3 +1,4 @@
+import { maintainEvidence, repairAssertion, repairResolution, type RepairGuard } from './evidence-maintenance';
 import { SqliteExternalStorageGenerationUploadCoordinator } from '../storage/sqlite-generation-upload-coordinator';
 import { backgroundFinalizationFingerprint, stableJson } from './background-history-fingerprint';
 import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspace-item-capability';
@@ -990,12 +991,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         return isD1Driver()
             ? ({
                   snapshotBootstrap: 'snapshot-v1',
+                  unavailableRecords: 'v1',
                   historyRetention: 'snapshot-v1',
                   retainedStorageMetadata: 'v1',
                   atomicUploadQuota: 'retained-v1',
               } as const)
             : ({
                   snapshotBootstrap: 'snapshot-v1',
+                  unavailableRecords: 'v1',
                   historyRetention: 'snapshot-v1',
                   ...(this.storageGenerationCoordinator ? { externalStorageGenerations: 'v1' as const } : {}),
                   backgroundGenerationHistory: 'v1',
@@ -1877,7 +1880,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         };
     }
 
-    async push(event: H3Event, input: PushBatch): Promise<PushResult> {
+    async push(event: H3Event, input: PushBatch, repair?: RepairGuard): Promise<PushResult> {
         const { scope, ops } = input;
         const workspaceId = scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
@@ -1952,6 +1955,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 indicesByOpId,
                 userId,
                 workspaceItemCapability: input.workspaceItemCapability,
+                repair,
             });
         }
 
@@ -1964,6 +1968,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const hookEmissions: HookEmission[] = [];
 
         const runTx = raw.transaction(() => {
+            if (repair) {
+                const assertion = repairAssertion(repair);
+                raw.prepare(assertion.sql).get(...assertion.parameters ?? []);
+            }
             // Admission observes canonical state under the same write lock as LWW.
             if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
                 for (const op of uniqueOps) {
@@ -2382,6 +2390,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     });
                 }
             }
+            if (repair) {
+                if (!uniqueResults[0]?.success || uniqueResults[0]?.applied === false) throw new Error('Repair did not win');
+                const resolution = repairResolution(repair,uniqueOps[0]!.stamp.opId);
+                raw.prepare(resolution.sql).run(...resolution.parameters ?? []);
+            }
         });
 
         // Run with IMMEDIATE to prevent concurrent version allocation races
@@ -2540,6 +2553,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         } else throw new Error('Evidence source mismatch');
         if (stableJson(record) !== stableJson(input.record)) throw new Error('Evidence source record mismatch');
         return { evidenceRef: await retainSqlEvidence(source,'reader_invalid') };
+    }
+
+    async maintainUnavailableRecords(event: H3Event, workspaceId: string, action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+        await assertWorkspaceScopeAuthorized(event,workspaceId);
+        return maintainEvidence(event,workspaceId,action,input,(event,op,guard) => this.push(event,
+            {scope:{workspaceId},ops:[op],workspaceItemCapability:WORKSPACE_ITEM_CAPABILITY},guard),validReadPayload);
     }
 
     async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
@@ -3263,6 +3282,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         indicesByOpId: Map<string, number[]>;
         userId: string | undefined;
         workspaceItemCapability: PushBatch['workspaceItemCapability'];
+        repair?: RepairGuard;
     }): Promise<PushResult> {
         const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId } = input;
         const existingOps = new Map<string, {
@@ -3419,6 +3439,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const now = nowEpoch();
         const statements: D1SqlStatement[] = [];
+        if (input.repair) statements.push(repairAssertion(input.repair));
         if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
             for (const op of uniqueOps) {
                 if (!['posts', 'projects'].includes(op.tableName)) continue;
@@ -3593,7 +3614,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         let batchResults: Awaited<ReturnType<typeof d1Batch>>;
         try {
-            batchResults = statements.length > 0 ? await d1Batch(statements) : [];
+            batchResults = statements.length > 0 ? await d1Batch(input.repair && newOps.length ? [...statements,repairResolution(input.repair,newOps[0]!.stamp.opId)] : statements) : [];
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             if (/JSON path/i.test(message) && message.includes('OR3_SYNC_VERSION_EXHAUSTED')) {
@@ -3756,6 +3777,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     }
 }
 
-export function createSqliteSyncGatewayAdapter(): SyncGatewayAdapter {
+export function createSqliteSyncGatewayAdapter(): SqliteSyncGatewayAdapter {
     return new SqliteSyncGatewayAdapter();
 }

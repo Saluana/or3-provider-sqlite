@@ -19,13 +19,12 @@ import { createSqliteSyncGatewayAdapter } from '../../sync/sqlite-sync-gateway-a
 import { sql } from 'kysely';
 import { getSqliteDb } from '../../db/kysely';
 import { getSqliteDriver } from '../../db/kysely';
-import type { SyncGatewayAdapter } from '~~/server/sync/gateway/types';
 
 const SQLITE_PROVIDER_ID = 'sqlite';
 
-let gatewayInstance: SyncGatewayAdapter | undefined;
+let gatewayInstance: ReturnType<typeof createSqliteSyncGatewayAdapter> | undefined;
 
-function getGateway(): SyncGatewayAdapter {
+function getGateway(): ReturnType<typeof createSqliteSyncGatewayAdapter> {
     gatewayInstance ??= createSqliteSyncGatewayAdapter();
     return gatewayInstance;
 }
@@ -103,6 +102,11 @@ export const sqliteSyncAdminAdapter: ProviderAdminAdapter = {
             },
             warnings,
             actions: [
+                ...['inspect','export','revalidate','repair'].map(action => ({
+                    id: `sync.evidence-${action}`, label: `${action[0]!.toUpperCase()}${action.slice(1)} unavailable sync records`,
+                    description: 'Retained original sync evidence; export is chunked and repair requires an explicit replacement.',
+                    danger: action === 'repair',
+                })),
                 {
                     id: 'sync.gc-change-log',
                     label: 'Clear old sync history',
@@ -130,6 +134,10 @@ export const sqliteSyncAdminAdapter: ProviderAdminAdapter = {
                 statusCode: 400,
                 statusMessage: 'Workspace not resolved',
             });
+        }
+
+        if (actionId.startsWith('sync.evidence-')) {
+            return getGateway().maintainUnavailableRecords(event,ctx.session.workspace.id,actionId.slice('sync.evidence-'.length),_payload ?? {});
         }
 
         if (

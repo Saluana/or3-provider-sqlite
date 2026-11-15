@@ -4,6 +4,7 @@ import type { H3Event } from 'h3';
 import { initializeSqliteDb, destroySqliteDb, getRawDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { createD1TestDatabase } from '../../../test/support/d1-test-database';
+import { sqliteSyncAdminAdapter } from '../server/admin/adapters/sync-sqlite';
 import { SqliteBackgroundJobProvider } from '../server/background-jobs/sqlite-provider';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import { stableJson } from '../server/sync/background-history-fingerprint';
@@ -74,7 +75,7 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await raw.prepare(`INSERT INTO s_messages (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
             VALUES ('legacy-message',?, ?,1,'legacy:1','test',?,0,1,1)`).run(scope.workspaceId,bytes,opId);
         await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
-        const pull = await adapter.pull(event,{scope,cursor:0});
+        const pull = await adapter.pull(event,{scope,cursor:0,limit:100});
         expect(pull.unavailable ?? []).toEqual([]); expect(pull.changes[0]?.payload).toEqual(payload);
         const snapshot = await adapter.snapshot(event,{scope,tables:['messages'],pageSize:1});
         expect(snapshot.unavailable ?? []).toEqual([]); expect(snapshot.items[0]).toMatchObject({payload});
@@ -109,7 +110,7 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect(log.payload_json).toBe(row.data_json);
         expect(JSON.parse(row.data_json).order_key).toBe(JSON.parse(row.data_json).hlc);
         await raw.prepare("UPDATE s_messages SET data_json = json_remove(data_json, '$.order_key') WHERE id = 'assistant'").run();
-        const finalized = await adapter.finalizeChatGeneration(actor,{admission:history,snapshot:{status:'complete',content:'answer',completedAt:1800000000000}});
+        const finalized = await adapter.finalizeChatGeneration(actor,{admission:history,snapshot:{status:'complete',content:'answer',reasoning:'',completedAt:1800000000000}});
         expect(finalized).toMatchObject({status:'committed',replayed:false,serverVersion:7});
         const finalRow = await raw.prepare("SELECT data_json FROM s_messages WHERE id = 'assistant'").get() as {data_json:string};
         const finalLog = await raw.prepare("SELECT payload_json FROM change_log WHERE server_version = 7").get() as {payload_json:string};
@@ -171,6 +172,13 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect(pull).toMatchObject({ changes: [], nextCursor: 2, hasMore: true, unavailable: [
             { pk: 'broken', originalKind: 'put', serverVersion: 1 }, { pk: 'huge', originalKind: 'put', serverVersion: 2 },
         ] });
+        const digest = createHash('sha256');
+        for (let offset = 0; offset < Buffer.byteLength(huge); offset += 32768) {
+            const chunk = await adapter.maintainUnavailableRecords(event,scope.workspaceId,'export',{id:pull.unavailable![1]!.evidenceRef,offset});
+            expect((chunk.payloadHex as string).length).toBeLessThanOrEqual(65536);
+            digest.update(Buffer.from(chunk.payloadHex as string,'hex'));
+        }
+        expect(digest.digest('hex')).toBe(createHash('sha256').update(huge).digest('hex'));
         const refs = pull.unavailable!.map(marker => marker.evidenceRef);
         expect((await adapter.pull(event, { scope, cursor: 0, limit: 2 })).unavailable!.map(marker => marker.evidenceRef)).toEqual(refs);
         const snapshot = await adapter.snapshot(event, { scope, tables: ['kv'], pageSize: 3 });
@@ -180,6 +188,33 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect(snapshot.nextPageToken).toBeNull();
         await raw.prepare('DELETE FROM change_log').run(); await raw.prepare('DELETE FROM sync_snapshots').run();
         expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({ n: 4 });
+    });
+    it.each(['uuid','payload','table'])('contains a %s defect inside a healthy pull window', async fault => {
+        await adapter.push(event,{scope,ops:[op('before'),op('bad'),op('after')]});
+        if (fault === 'uuid') await raw.prepare("UPDATE change_log SET op_id = 'invalid-uuid' WHERE pk = 'bad'").run();
+        if (fault === 'payload') await raw.prepare("UPDATE change_log SET payload_json = json_set(payload_json,'$.name',42) WHERE pk = 'bad'").run();
+        if (fault === 'table') await raw.prepare("UPDATE change_log SET table_name = 'unknown_table' WHERE pk = 'bad'").run();
+        const page = await adapter.pull(event,{scope,cursor:0,limit:3});
+        expect(PullResponseSchema.safeParse(page).success).toBe(true);
+        expect(page.changes.map(change=>change.pk)).toEqual(['before','after']);
+        expect(page).toMatchObject({nextCursor:3,hasMore:false,unavailable:[{pk:'bad',serverVersion:2}]});
+        const retained = await raw.prepare('SELECT payload_json,metadata_json FROM sync_unavailable_records WHERE id = ?').get(page.unavailable![0]!.evidenceRef) as {payload_json:string;metadata_json:string};
+        const original = await raw.prepare("SELECT payload_json FROM change_log WHERE pk = 'bad'").get() as {payload_json:string};
+        expect(retained.payload_json).toBe(original.payload_json);
+        expect(JSON.parse(retained.metadata_json)).toMatchObject({pk:'bad',server_version:2});
+    });
+    it('retains invalid deletion metadata at a page boundary and completes the final all-invalid snapshot page', async () => {
+        const put = op('a-deleted'); await adapter.push(event,{scope,ops:[put,op('z-invalid')]});
+        await adapter.push(event,{scope,ops:[{...put,id:randomUUID(),operation:'delete',payload:undefined,stamp:{...put.stamp,clock:2,opId:randomUUID()}}]});
+        await raw.prepare("UPDATE s_kv SET clock = -1 WHERE id = 'a-deleted'").run();
+        await raw.prepare("UPDATE s_kv SET data_json = '{bad' WHERE id = 'z-invalid'").run();
+        const first = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:1});
+        expect(SnapshotResponseSchema.safeParse(first).success).toBe(true);
+        expect(first).toMatchObject({items:[],unavailable:[{pk:'a-deleted',originalKind:'tombstone'}]});
+        expect(first.nextPageToken).toEqual(expect.any(String));
+        const last = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:1,pageToken:first.nextPageToken!});
+        expect(last).toMatchObject({items:[],unavailable:[{pk:'z-invalid',originalKind:'row'}],nextPageToken:null});
+        expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:2});
     });
     it('finishes an all-invalid final snapshot page, retains unknown owners privately and guards backup JSON', async () => {
         await adapter.push(event, { scope, ops: [op('only')] });
@@ -195,6 +230,8 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
             VALUES ('file',?, ?,1,'legacy:1','test',?,1,1,1)`).run(scope.workspaceId,JSON.stringify({unexpected:'original'}),randomUUID());
         const backup = await adapter.backupSnapshot(event, { scope, tables: ['file_meta'], pageSize:10 });
         expect(backup).toMatchObject({ items: [], unavailable: [{ pk: 'file' }], nextPageToken: null });
+        const original = await adapter.maintainUnavailableRecords(event,scope.workspaceId,'export',{id:backup.unavailable![0]!.evidenceRef});
+        expect(Buffer.from(original.payloadHex as string,'hex').toString()).toBe(JSON.stringify({unexpected:'original'}));
     });
     it('fails coverage for an untrustworthy identity or version and fails closed when evidence cannot persist', async () => {
         await adapter.push(event, { scope, ops: [op('bad')] });
@@ -203,27 +240,61 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await expect(adapter.pull(event,{scope,cursor:0,limit:1})).rejects.toThrow('version');
         await raw.prepare("DELETE FROM change_log WHERE pk = 'duplicate'").run();
         await raw.prepare("UPDATE change_log SET server_version = 1.5").run();
-        await expect(adapter.pull(event, {scope,cursor:0})).rejects.toThrow();
+        await expect(adapter.pull(event, {scope,cursor:0,limit:100})).rejects.toThrow();
         await raw.prepare("UPDATE change_log SET server_version = 1, pk = ''").run();
-        await expect(adapter.pull(event, {scope,cursor:0})).rejects.toThrow('identity');
+        await expect(adapter.pull(event, {scope,cursor:0,limit:100})).rejects.toThrow('identity');
         await raw.prepare("UPDATE change_log SET pk = 'bad', payload_json = '{bad'").run();
         await raw.prepare(`CREATE TRIGGER fail_evidence BEFORE INSERT ON sync_unavailable_records BEGIN SELECT RAISE(ABORT,'evidence storage failure'); END`).run();
-        await expect(adapter.pull(event, {scope,cursor:0})).rejects.toThrow('evidence storage failure');
+        await expect(adapter.pull(event, {scope,cursor:0,limit:100})).rejects.toThrow('evidence storage failure');
     });
     it('verifies fallback source identity and notification visibility before retaining reader evidence', async () => {
         await adapter.push(event,{scope,ops:[op('fallback')]});
-        const page = await adapter.pull(event,{scope,cursor:0}); const record = page.changes[0]!;
+        const page = await adapter.pull(event,{scope,cursor:0,limit:100}); const record = page.changes[0]!;
         const marker = {tableName: 'kv', pk:'fallback',originalKind:'put' as const,serverVersion:1,reason:'reader_invalid'};
         const retained = await adapter.retainUnavailableRecord(event,{scope,source:'pull',record,marker});
         expect(retained.evidenceRef).toBeTruthy();
         await expect(adapter.retainUnavailableRecord(event,{scope,source:'pull',record,marker:{...marker,pk:'forged'}})).rejects.toThrow();
     });
-    it.each(['payload','hlc','device'])('rejects invalid background %s before durable job acceptance', async fault => {
+    it('exports evidence in bounded chunks and repairs only the current revision atomically with a fresh winning operation', async () => {
+        await adapter.push(event,{scope,ops:[op('repair')]});
+        await raw.prepare("UPDATE change_log SET payload_json = '{bad'").run();
+        await raw.prepare("UPDATE s_kv SET data_json = '{bad'").run();
+        const marker = (await adapter.pull(event,{scope,cursor:0,limit:100})).unavailable![0]!;
+        const admin = (action: string,input: Record<string,unknown>) => sqliteSyncAdminAdapter.runAction!(event,`sync.evidence-${action}`,input,{session:{workspace:{id:scope.workspaceId}}} as never) as Promise<Record<string,unknown>>;
+        const inspect = await admin('inspect',{});
+        expect(inspect).toMatchObject({items:[{id:marker.evidenceRef,status:'unresolved'}]});
+        expect(await adapter.maintainUnavailableRecords(event,scope.workspaceId,'export',{id:marker.evidenceRef})).toMatchObject({payloadHex:Buffer.from('{bad').toString('hex').toUpperCase()});
+        expect(await adapter.maintainUnavailableRecords(event,scope.workspaceId,'revalidate',{id:marker.evidenceRef})).toMatchObject({valid:false});
+        const replacement = {...op('repair').payload as object};
+        const repaired = await admin('repair',{id:marker.evidenceRef,payload:replacement});
+        expect(repaired).toMatchObject({status:'repaired',serverVersion:2});
+        const fresh = (await adapter.pull(event,{scope,cursor:1,limit:100})).changes[0]!;
+        expect(fresh.stamp.clock).toBe(2); expect(fresh.stamp.opId).toMatch(/^[0-9a-f-]{36}$/);
+        expect(await raw.prepare('SELECT status,resolved_op_id FROM sync_unavailable_records WHERE id = ?').get(marker.evidenceRef)).toEqual({status:'repaired',resolved_op_id:fresh.stamp.opId});
+        // Reprocessing old evidence cannot overwrite the healthy winner.
+        expect(await adapter.maintainUnavailableRecords(event,scope.workspaceId,'repair',{id:marker.evidenceRef,payload:replacement})).toMatchObject({status:'repaired'});
+        expect((await adapter.pull(event,{scope,cursor:2,limit:100})).changes).toEqual([]);
+        // Oversized revision/metadata evidence remains available through bounded
+        // inspection and chunk export, without putting the whole revision in UI JSON.
+        await adapter.push(event,{scope,ops:[op('oversized-metadata')]});
+        await raw.prepare("UPDATE s_kv SET hlc = ? WHERE id = 'oversized-metadata'").run('h'.repeat(300000));
+        const snapshot = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10});
+        const metadataId = snapshot.unavailable!.find(marker=>marker.pk === 'oversized-metadata')!.evidenceRef;
+        const rows = (await admin('inspect',{})).items as Array<{id:string;revision:string|null}>;
+        expect(rows.find(row=>row.id === metadataId)?.revision).toBeNull();
+        const chunk = await admin('export',{id:metadataId});
+        expect((chunk.metadataHex as string).length).toBe(65536);
+        expect(chunk.totalBytes).toBeGreaterThan(300000);
+    });
+
+    it.each(['payload','hlc','device','index','timestamp'])('rejects invalid background %s before durable job acceptance', async fault => {
         const history = {version:1,kind:'new-turn',admissionId:'admission',generationId:'generation',workspaceId:scope.workspaceId,threadId:'thread',messageId:'assistant',
             thread:{id:'thread',clock:1,status:'ready',pinned:false,deleted:false,created_at:1,updated_at:1},
             userMessage:{id:'user',thread_id:'thread',clock:1,role:'user',index:0,order_key:'a0',deleted:false,created_at:1,updated_at:1},
             assistantMessage:{id:'assistant',thread_id:'thread',clock:1,role:fault === 'payload' ? 42 : 'assistant',index:1,order_key:'a1',deleted:false,created_at:1,updated_at:1,
                 ...(fault === 'hlc' ? {hlc:'x'.repeat(513)} : {})}};
+        if (fault === 'index') delete (history.assistantMessage as Partial<typeof history.assistantMessage>).index;
+        if (fault === 'timestamp') delete (history.assistantMessage as Partial<typeof history.assistantMessage>).updated_at;
         if (fault === 'device') history.generationId = 'g'.repeat(246);
         const provider = new SqliteBackgroundJobProvider();
         await expect(provider.createJob({userId:'test',threadId:'thread',messageId:'assistant',model:'test',kind:'chat',generationId:'generation',
@@ -231,6 +302,26 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect(await raw.prepare('SELECT count(*) AS n FROM background_jobs').get()).toEqual({n:0});
     });
 
+    it('keeps evidence unresolved after invalid repair and fences a concurrent healthy winner', async () => {
+        await adapter.push(event,{scope,ops:[op('race')]});
+        await raw.prepare("UPDATE change_log SET payload_json = '{bad'").run();
+        await raw.prepare("UPDATE s_kv SET data_json = '{bad'").run();
+        const id = (await adapter.pull(event,{scope,cursor:0,limit:100})).unavailable![0]!.evidenceRef;
+        await expect(adapter.maintainUnavailableRecords(event,scope.workspaceId,'repair',{id,payload:{id:'race',name:42}})).rejects.toThrow();
+        expect(await raw.prepare('SELECT value FROM server_version_counter').get()).toEqual({value:1});
+        expect(await raw.prepare('SELECT status FROM sync_unavailable_records WHERE id = ?').get(id)).toEqual({status:'unresolved'});
+        const push = adapter.push.bind(adapter); let raced = false;
+        const spy = vi.spyOn(adapter,'push').mockImplementation(async (event,input,guard) => {
+            if (guard && !raced) { raced = true; const healthy = op('race',{value:'newer'});healthy.stamp.clock = 3;await push(event,{scope,ops:[healthy]}); }
+            return push(event,input,guard);
+        });
+        try { await expect(adapter.maintainUnavailableRecords(event,scope.workspaceId,'repair',{id,payload:op('race').payload})).rejects.toThrow(); }
+        finally { spy.mockRestore(); }
+        expect(await adapter.maintainUnavailableRecords(event,scope.workspaceId,'repair',{id,payload:op('race').payload})).toMatchObject({status:'superseded'});
+        const healthy = (await adapter.pull(event,{scope,cursor:1,limit:100})).changes;
+        expect(healthy).toHaveLength(1);expect(healthy[0]).toMatchObject({stamp:{clock:3},payload:{value:'newer'}});
+        expect(await raw.prepare('SELECT value FROM server_version_counter').get()).toEqual({value:2});
+    });
     it('contains notification defects without exposing a foreign or unknown owner identity', async () => {
         for (const [pk,owner] of [['mine','alice'],['foreign','bob'],['unknown',null]] as const) {
             await raw.prepare(`INSERT INTO s_notifications (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
