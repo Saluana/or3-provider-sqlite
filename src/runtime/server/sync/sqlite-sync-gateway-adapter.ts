@@ -958,7 +958,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             type StoredRow = { id: string; data_json: string; clock: number; deleted: number };
             const parse = (row: StoredRow): CanonicalHistoryRecord => {
                 const payload = JSON.parse(row.data_json) as CanonicalHistoryRecord;
-                if (payload.id !== row.id) throw new Error('Canonical history identity mismatch');
+                if (row.deleted !== 1 && payload.id !== row.id) throw new Error('Canonical history identity mismatch');
                 return { ...payload, id: row.id, clock: row.clock, deleted: row.deleted === 1 };
             };
             if (query.kind === 'thread') {
@@ -970,6 +970,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 if (!thread) return { status: 'ok' as const, project_ownership: 'resolved' as const,
                     revision: String(threadRevision?.value ?? 0), thread };
                 const ownership = resolveCanonicalProjectOwnership(raw, actor.workspaceId, query.thread_id, thread.project_id);
+                if (ownership.status === 'unresolved') return { status: 'scope_incomplete' as const, revision: String(threadRevision?.value ?? 0) };
                 return { status: 'ok' as const, project_ownership: ownership.status,
                     revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: ownership.projectId } };
             }

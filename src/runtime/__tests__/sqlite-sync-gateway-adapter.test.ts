@@ -144,6 +144,42 @@ describe('SqliteSyncGatewayAdapter', () => {
         await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]));
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     });
+    it.each(['not-json', {}, null])('reports unresolved legacy ownership for malformed project data %j without failing independent reads', async data => {
+        const raw = getRawDb();
+        raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
+        raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+        const actor = { userId: 'owner', workspaceId: WORKSPACE_ID };
+        await adapter.push(stubEvent, makeBatch([
+            makeOp({ tableName: 'projects', pk: 'broken', payload: { id: 'broken', data: [] } }),
+            makeOp({ tableName: 'projects', pk: 'chosen', payload: { id: 'chosen', data: [] } }),
+            makeOp({ tableName: 'threads', pk: 'legacy', payload: { id: 'legacy' } }),
+            makeOp({ tableName: 'threads', pk: 'explicit', payload: { id: 'explicit', project_id: 'chosen' } }),
+        ]));
+        raw.prepare("UPDATE s_projects SET data_json = ? WHERE id = 'broken'").run(data === null ? '{broken' : JSON.stringify({ id: 'broken', data }));
+        await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'legacy' }))
+            .resolves.toMatchObject({ status: 'scope_incomplete' });
+        await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'explicit' }))
+            .resolves.toMatchObject({ status: 'ok', project_ownership: 'resolved', thread: { project_id: 'chosen' } });
+        await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'missing' }))
+            .resolves.toMatchObject({ status: 'ok', thread: undefined });
+    });
+
+    it('reads a delete-before-put placeholder beside a live canonical sibling', async () => {
+        const raw = getRawDb();
+        raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Messages', 'owner');
+        raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+        await adapter.push(stubEvent, makeBatch([
+            makeOp({ tableName: 'messages', pk: 'absent', operation: 'delete', payload: undefined }),
+            makeOp({ tableName: 'messages', pk: 'live', payload: { id: 'live', thread_id: 'thread', index: 0 } }),
+        ]));
+        const result = await adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'messages', message_ids: ['absent', 'live'] });
+        expect(result.status).toBe('ok');
+        expect(result.messages).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id: 'absent', deleted: true, clock: 1 }),
+            expect.objectContaining({ id: 'live', deleted: false }),
+        ]));
+    });
+
     // A deleted/missing owner releases the chat even if LWW preserved its old
     // pointer. A same-ID project in another workspace cannot retain ownership,
     // and legacy membership must not override an explicit released pointer.
