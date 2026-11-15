@@ -59,6 +59,7 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
+import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { readRequestUsage } from '~~/shared/chat/compaction';
 import { matchesToolResultStorage, parseToolResultArtifact, prepareToolResultStorage, toolResultArtifactPrefix, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
 import { validateCanonicalChatQuery, encodeCanonicalChatSeek, parseCanonicalChatSeek, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
@@ -166,6 +167,7 @@ type SnapshotItemRow = {
     pk: string;
     kind: SnapshotKind;
     payload_json: string | null;
+    intent_fingerprint?: string | null;
     clock: number;
     hlc: string;
     op_id: string;
@@ -294,11 +296,19 @@ function operationFingerprint(op: PendingOp): string {
     });
 }
 
+function prepareFinalOperation(op: PendingOp): PendingOp {
+    const payload = op.operation === 'put' && op.payload && typeof op.payload === 'object'
+        ? { ...(op.payload as Record<string, unknown>), clock: op.stamp.clock, hlc: op.stamp.hlc, op_id: op.stamp.opId }
+        : op.payload;
+    return { ...op, ...prepareSyncWrite({ ...op, payload }) };
+}
+
 function changeLogFingerprint(row: {
     table_name: string;
     op: string;
     pk: string;
     payload_json: string | null;
+    intent_fingerprint?: string | null;
     clock: number;
     hlc: string;
     device_id: string;
@@ -1097,6 +1107,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 materialized: 's_threads' | 's_messages';
                 record: Record<string, unknown> & { id: string; clock: number; hlc?: string };
             }>;
+            const prepared = records.map(entry => {
+                const opId = backgroundHistoryOpId(admission, entry.table === 'threads' ? 'thread' : entry.record.id === admission.messageId ? 'assistant' : 'user');
+                const hlc = entry.record.hlc ?? `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                return prepareSyncWrite({ tableName: entry.table, pk: entry.record.id, operation: 'put',
+                    payload: { ...sanitizePayloadForSync(entry.table, entry.record, 'put'), hlc, op_id: opId },
+                    stamp: { clock: entry.record.clock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
+            });
             const counter = raw
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
@@ -1108,15 +1125,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             ).run(admission.workspaceId, finalVersion);
             const now = nowEpoch();
             records.forEach((entry, index) => {
-                const opId = backgroundHistoryOpId(
-                    admission,
-                    entry.table === 'threads'
-                        ? 'thread'
-                        : entry.record.id === admission.messageId
-                          ? 'assistant'
-                          : 'user'
-                );
-                const hlc = entry.record.hlc ?? `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                const { stamp: { opId, hlc }, payload } = prepared[index]!;
                 const tombstone = raw.prepare(
                     `SELECT clock, hlc, op_id FROM tombstones
                      WHERE workspace_id = ? AND table_name = ? AND pk = ?`
@@ -1131,19 +1140,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 )) {
                     throw Object.assign(new Error('Background history record was superseded'), { code: 'SUPERSEDED' });
                 }
-                const sanitized = sanitizePayloadForSync(
-                    entry.table,
-                    entry.record,
-                    'put'
-                );
-                if (!sanitized) {
-                    throw Object.assign(new Error('Invalid background history payload'), { code: 'VALIDATION_ERROR' });
-                }
-                const payload = { ...sanitized, hlc, op_id: opId };
                 const payloadJson = JSON.stringify(payload);
-                if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
-                    throw Object.assign(new Error('Invalid background history payload size'), { code: 'VALIDATION_ERROR' });
-                }
                 const version = baseVersion + index + 1;
                 raw.prepare(
                     `INSERT INTO change_log
@@ -1303,10 +1300,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, superseded, now);
                 return { status: 'superseded' as const, reason: superseded };
             }
-            if (!Number.isSafeInteger(row!.clock) || row!.clock < 0 || row!.clock >= Number.MAX_SAFE_INTEGER) {
-                throw Object.assign(new Error('Background history clock exhausted or invalid'), { code: 'VALIDATION_ERROR' });
-            }
-            const nextClock = row!.clock + 1;
+            const nextClock = nextSyncClock(row!.clock);
             const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
             const opId = backgroundHistoryOpId(admission, 'finalize');
             const terminalState = input.snapshot.status === 'complete'
@@ -1335,10 +1329,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     error: input.snapshot.error ?? null,
                 },
             };
-            const payloadJson = JSON.stringify(payload);
-            if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
-                throw Object.assign(new Error('Invalid background history payload size'), { code: 'VALIDATION_ERROR' });
-            }
+            const prepared = prepareSyncWrite({ tableName: 'messages', pk: admission.messageId, operation: 'put', payload,
+                stamp: { clock: nextClock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
+            const payloadJson = JSON.stringify(prepared.payload);
             const counter = raw
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
@@ -1434,6 +1427,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 } else newRows.push(row);
             }
             if (!newRows.length) return;
+            const prepared = newRows.map(row => {
+                const opId = digestUuid(createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex'));
+                const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                return prepareSyncWrite({ tableName: 'kv', pk: row.id, operation: 'put',
+                    payload: { ...sanitizePayloadForSync('kv', row, 'put'), hlc, op_id: opId },
+                    stamp: { clock: row.clock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
+            });
             const counter = raw.prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
             const baseVersion = counter?.value ?? 0;
@@ -1441,13 +1441,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, safeVersionEnd(baseVersion, newRows.length));
             const now = nowEpoch();
             newRows.forEach((row, index) => {
-                const opId = digestUuid(createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex'));
-                const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
-                const sanitized = sanitizePayloadForSync('kv', row, 'put');
-                if (!sanitized) throw Object.assign(new Error('Invalid tool result payload'), { code: 'VALIDATION_ERROR' });
-                const payloadJson = JSON.stringify({ ...sanitized, hlc, op_id: opId });
-                if (new TextEncoder().encode(payloadJson).length > MAX_SYNC_PAYLOAD_BYTES)
-                    throw Object.assign(new Error('Invalid tool result payload size'), { code: 'VALIDATION_ERROR' });
+                const { stamp: { opId, hlc }, payload } = prepared[index]!;
+                const payloadJson = JSON.stringify(payload);
                 raw.prepare(`INSERT INTO s_kv (id, workspace_id, data_json, clock, hlc, device_id, op_id, deleted, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`).run(row.id, admission.workspaceId, payloadJson, row.clock, hlc,
                         backgroundHistoryDeviceId(admission.generationId), opId, now, now);
@@ -1884,7 +1879,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 }
                 continue;
             }
-            uniqueOps.push(scoped as PendingOp);
+            uniqueOps.push({ ...(scoped as PendingOp) });
             indicesByOpId.set(group.op.stamp.opId, group.indices);
         }
 
@@ -1939,7 +1934,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 const rows = raw
                     .prepare(
                         `SELECT op_id, server_version, workspace_id, table_name, pk, op,
-                                payload_json, clock, hlc, device_id
+                                payload_json, clock, hlc, device_id, intent_fingerprint
                          FROM change_log WHERE op_id IN (${placeholders})`
                     )
                     .all(...chunk) as Array<{
@@ -1950,6 +1945,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         pk: string;
                         op: string;
                         payload_json: string | null;
+    intent_fingerprint?: string | null;
                         clock: number;
                         hlc: string;
                         device_id: string;
@@ -1959,7 +1955,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     existingOps.set(row.op_id, {
                         server_version: row.server_version,
                         workspace_id: row.workspace_id,
-                        fingerprint: changeLogFingerprint(row),
+                        fingerprint: row.intent_fingerprint ?? changeLogFingerprint(row),
                         op_id: row.op_id,
                     });
                 }
@@ -1989,6 +1985,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 }
             }
 
+            const intentFingerprints = new Map(uniqueOps.map(op => [op.stamp.opId, operationFingerprint(op)]));
+            for (const op of uniqueOps) {
+                if (existingOps.has(op.stamp.opId) || failedBeforeAlloc.has(op.stamp.opId)) continue;
+                try { Object.assign(op, prepareFinalOperation(op)); }
+                catch (error) {
+                    failedBeforeAlloc.add(op.stamp.opId);
+                    uniqueResults.push({ opId: op.stamp.opId, success: false, error: (error as Error).message,
+                        errorCode: 'VALIDATION_ERROR' });
+                }
+            }
+
             // Deduplicate op_ids inside the same batch so repeats are idempotent.
             const uniqueNewOpIds = new Set<string>();
             for (const op of uniqueOps) {
@@ -2011,7 +2018,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ).run(baseVersion + uniqueNewOpIds.size, workspaceId);
             } else {
                 baseVersion = 0;
-                raw.prepare(
+                if (uniqueNewOpIds.size) raw.prepare(
                     'INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)'
                 ).run(workspaceId, uniqueNewOpIds.size);
             }
@@ -2045,7 +2052,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 if (existingLog !== undefined) {
                     if (
                         existingLog.workspace_id !== workspaceId ||
-                        existingLog.fingerprint !== operationFingerprint(op)
+                        existingLog.fingerprint !== intentFingerprints.get(opId)
                     ) {
                         uniqueResults.push({
                             opId,
@@ -2134,6 +2141,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     opId,
                     now
                 );
+
+                raw.prepare('UPDATE change_log SET intent_fingerprint = ? WHERE op_id = ?')
+                    .run(intentFingerprints.get(opId), opId);
 
                 const incomingRev = {
                     clock: op.stamp.clock,
@@ -3136,12 +3146,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 pk: string;
                 op: string;
                 payload_json: string | null;
+    intent_fingerprint?: string | null;
                 clock: number;
                 hlc: string;
                 device_id: string;
             }>(
                 `SELECT op_id, server_version, workspace_id, table_name, pk, op,
-                        payload_json, clock, hlc, device_id
+                        payload_json, clock, hlc, device_id, intent_fingerprint
                  FROM change_log WHERE op_id IN (${placeholders})`,
                 ...chunk
             );
@@ -3149,7 +3160,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 existingOps.set(row.op_id, {
                     server_version: row.server_version,
                     workspace_id: row.workspace_id,
-                    fingerprint: changeLogFingerprint(row),
+                    fingerprint: row.intent_fingerprint ?? changeLogFingerprint(row),
                 });
             }
         }
@@ -3200,9 +3211,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             }
         }
 
-        const newOps = uniqueOps.filter(
-            (op) => !existingOps.has(op.stamp.opId) && !rejected.has(op.stamp.opId)
-        );
+        const intentFingerprints = new Map(uniqueOps.map(op => [op.stamp.opId, operationFingerprint(op)]));
+        const newOps = uniqueOps.filter(op => {
+            if (existingOps.has(op.stamp.opId) || rejected.has(op.stamp.opId)) return false;
+            try { Object.assign(op, prepareFinalOperation(op)); return true; }
+            catch (error) {
+                rejected.add(op.stamp.opId);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = {
+                    opId: op.stamp.opId, success: false, error: (error as Error).message, errorCode: 'VALIDATION_ERROR',
+                };
+                return false;
+            }
+        });
 
         const existingMaterializedKeys = new Set<string>();
         const opsByTable = new Map<string, PendingOp[]>();
@@ -3304,11 +3324,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             statements.push({
                 sql: `INSERT INTO change_log (
                     id, workspace_id, server_version, table_name, pk, op,
-                    payload_json, clock, hlc, device_id, op_id, created_at
+                    payload_json, clock, hlc, device_id, op_id, created_at, intent_fingerprint
                 ) SELECT
                     ?, ?,
                     (SELECT value + 1 FROM server_version_counter WHERE workspace_id = ?),
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 ${op.tableName === 'notifications' ? `WHERE NOT EXISTS (
                     SELECT 1 FROM s_notifications WHERE id = ? AND workspace_id = ?
                     AND json_extract(data_json, '$.user_id') IS NOT ?
@@ -3326,6 +3346,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     op.stamp.deviceId,
                     op.stamp.opId,
                     now,
+                    intentFingerprints.get(op.stamp.opId),
                     ...(op.tableName === 'notifications' ? [op.pk, workspaceId, userId] : []),
                 ],
             });

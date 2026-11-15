@@ -77,6 +77,8 @@ import * as m031 from './migrations/031_storage_generation_uploads';
 import * as m032 from './migrations/032_sync_observations';
 import * as m033 from './migrations/033_tool_result_operation_ids';
 
+import * as m034 from './migrations/034_sync_intent_fingerprint';
+
 const migrations: Record<string, Migration> = {
     '001_init': m001,
     '002_sync_tables': m002,
@@ -110,7 +112,8 @@ const migrations: Record<string, Migration> = {
     '030_storage_generations': m030,
     '031_storage_generation_uploads': m031,
     '032_sync_observations': m032,
-    '033_tool_result_operation_ids': m033
+    '033_tool_result_operation_ids': m033,
+    '034_sync_intent_fingerprint': m034
 };
 
 class StaticMigrationProvider implements MigrationProvider {
