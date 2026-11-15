@@ -327,6 +327,34 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect(retained.evidenceRef).toBeTruthy();
         await expect(adapter.retainUnavailableRecord(event,{scope,source:'pull',record,marker:{...marker,pk:'forged'}})).rejects.toThrow();
     });
+    it('seeks evidence inspection by workspace and continuation without sorting retained history', async () => {
+        const details: string[] = [];
+        const prepare = d1?.database.prepare.bind(d1.database);
+        const observe = (statement: ReturnType<NonNullable<typeof prepare>>, query: string, parameters: unknown[] = []): ReturnType<NonNullable<typeof prepare>> => {
+            const bind = statement.bind.bind(statement); const all = statement.all.bind(statement);
+            statement.bind = (...values)=>observe(bind(...values),query,values);
+            statement.all = async <T>()=>{
+                if (query.includes('ORDER BY id LIMIT 50')) {
+                    const plan = await prepare!('EXPLAIN QUERY PLAN '+query).bind(...parameters).all<{detail:string}>();
+                    details.push(...(plan.results ?? []).map(row=>row.detail));
+                }
+                return all<T>();
+            }; return statement;
+        };
+        const nativePrepare = driver === 'native' ? raw.prepare.bind(raw) : undefined;
+        const spy = d1 && prepare ? vi.spyOn(d1.database,'prepare').mockImplementation(query=>observe(prepare(query),query))
+            : vi.spyOn(raw,'prepare').mockImplementation(query=>{
+                const statement = nativePrepare!(query); const all = statement.all.bind(statement);
+                statement.all = (...parameters)=>{
+                    if (query.includes('ORDER BY id LIMIT 50')) details.push(...(nativePrepare!('EXPLAIN QUERY PLAN '+query).all(...parameters) as {detail:string}[]).map(row=>row.detail));
+                    return all(...parameters);
+                }; return statement;
+            });
+        try {await adapter.maintainUnavailableRecords(event,scope.workspaceId,'inspect',{after:'cursor'});}
+        finally {spy.mockRestore();}
+        expect(details.some(detail=>/workspace_id=\? AND id>\?/.test(detail))).toBe(true);
+        expect(details.some(detail=>detail.includes('TEMP B-TREE'))).toBe(false);
+    });
     it('exports evidence in bounded chunks and repairs only the current revision atomically with a fresh winning operation', async () => {
         await adapter.push(event,{scope,ops:[op('repair')]});
         await raw.prepare("UPDATE change_log SET payload_json = '{bad'").run();

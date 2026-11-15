@@ -17,7 +17,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         resolved_op_id TEXT,
         UNIQUE (workspace_id, source, locator, revision)
     )`);
-    await ensureMigrationSchema(db, 'CREATE INDEX idx_sync_unavailable_workspace ON sync_unavailable_records (workspace_id, created_at, id)');
+    await ensureMigrationSchema(db, 'CREATE INDEX idx_sync_unavailable_workspace ON sync_unavailable_records (workspace_id, id)');
 }
 export async function down(db: Kysely<unknown>): Promise<void> {
     await sql`DROP TABLE sync_unavailable_records`.execute(db);
