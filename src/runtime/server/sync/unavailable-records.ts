@@ -3,6 +3,16 @@ import { getRawDb, isD1Driver } from '../db/kysely';
 import { d1All, d1Batch, type D1SqlStatement } from '../db/d1';
 
 export const SYNC_ROW_BYTES = 256 * 1024;
+export const SYNC_METADATA_BYTES = 1024 * 1024;
+
+export function syncMetadataBytes(...columns: string[]): string {
+    return columns.map(column => `coalesce(length(cast(${column} AS blob)),0)`).join(' + ');
+}
+/** Legacy snapshot revisions have no stamp-length limit. Bound their transfer
+ * at the page ceiling, preserving originals SQL-to-SQL for larger records. */
+export function boundedSyncMetadata(column: string, bytes = syncMetadataBytes(column)): string {
+    return `CASE WHEN (${bytes}) <= ${SYNC_METADATA_BYTES} THEN ${column} ELSE NULL END`;
+}
 
 /** SQL CASE, rather than WHERE order, guards both payload transfer and JSON evaluation. */
 export function boundedSyncPayload(column: string): string {
@@ -22,7 +32,7 @@ export async function syncBatch(statements: D1SqlStatement[]): Promise<void> {
 }
 
 export type EvidenceSource = {
-    workspaceId: string; source: 'pull' | 'snapshot' | 'canonical'; locator: string; revision: string;
+    workspaceId: string; source: 'pull' | 'snapshot' | 'canonical'; locator: string; revisionSql: string;
     table: string; where: string; parameters: unknown[]; payload: string; metadata: string;
 };
 /** Original bytes travel only database-to-database, including oversized records. */
@@ -31,13 +41,13 @@ export async function retainSqlEvidence(source: EvidenceSource, reason: string):
     await syncBatch([{
         sql: `INSERT OR IGNORE INTO sync_unavailable_records
             (id, workspace_id, source, locator, revision, payload_json, metadata_json, reason, status, created_at)
-            SELECT ?, ?, ?, ?, ?, ${source.payload}, ${source.metadata}, ?, 'unresolved', unixepoch()
+            SELECT ?, ?, ?, ?, ${source.revisionSql}, ${source.payload}, ${source.metadata}, ?, 'unresolved', unixepoch()
             FROM ${source.table} WHERE ${source.where}`,
-        parameters: [id, source.workspaceId, source.source, source.locator, source.revision, reason, ...source.parameters],
+        parameters: [id, source.workspaceId, source.source, source.locator, reason, ...source.parameters],
     }]);
     const [retained] = await syncRows<{ id: string }>(`SELECT id FROM sync_unavailable_records
-        WHERE workspace_id = ? AND source = ? AND locator = ? AND revision = ?`,
-    source.workspaceId, source.source, source.locator, source.revision);
+        WHERE workspace_id = ? AND source = ? AND locator = ? AND revision = (SELECT ${source.revisionSql} FROM ${source.table} WHERE ${source.where})`,
+    source.workspaceId, source.source, source.locator, ...source.parameters);
     if (!retained) throw new Error('Sync evidence source disappeared; coverage was not acknowledged');
     return retained.id;
 }

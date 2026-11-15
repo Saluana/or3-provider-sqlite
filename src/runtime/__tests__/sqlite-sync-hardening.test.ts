@@ -208,6 +208,43 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await raw.prepare('DELETE FROM change_log').run(); await raw.prepare('DELETE FROM sync_snapshots').run();
         expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({ n: 4 });
     });
+    it('contains oversized revision metadata before transfer and retains its original bytes once', async () => {
+        await adapter.push(event,{scope,ops:[op('large-stamp'),op('next')]});
+        // Construct original metadata inside SQLite, without transferring it to JS.
+        const huge = "replace(hex(zeroblob(1000000)), '0', 'h')";
+        await raw.prepare(`UPDATE change_log SET hlc = ${huge}, device_id = ${huge}, op_id = ${huge} WHERE pk = 'large-stamp'`).run();
+        await raw.prepare(`UPDATE s_kv SET hlc = ${huge}, op_id = ${huge} WHERE id = 'large-stamp'`).run();
+        const oversizedFields: string[] = [];
+        const account = (rows: unknown[]) => {for (const row of rows) for (const [field,value] of Object.entries(row as object)) {
+            if (typeof value === 'string' && Buffer.byteLength(value) > 262144) oversizedFields.push(field);
+        }};
+        const prepare = d1?.database.prepare.bind(d1.database);
+        const observe = (statement: ReturnType<NonNullable<typeof prepare>>): ReturnType<NonNullable<typeof prepare>> => {
+            const bind = statement.bind.bind(statement); const all = statement.all.bind(statement);
+            statement.bind = (...values)=>observe(bind(...values));
+            statement.all = async <T>()=>{const result = await all<T>();account(result.results ?? []);return result;}; return statement;
+        };
+        const nativePrepare = driver === 'native' ? raw.prepare.bind(raw) : undefined;
+        const spy = d1 && prepare ? vi.spyOn(d1.database,'prepare').mockImplementation(query=>observe(prepare(query)))
+            : vi.spyOn(raw,'prepare').mockImplementation(query=>{
+                const statement = nativePrepare!(query); const all = statement.all.bind(statement);
+                statement.all = (...parameters)=>{const rows = all(...parameters);account(rows);return rows;};return statement;
+            });
+        let pull; let snapshot;
+        try {
+            pull = await adapter.pull(event,{scope,cursor:0,limit:10});
+            snapshot = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10});
+        } finally {spy.mockRestore();}
+        expect(oversizedFields).toEqual([]);
+        expect(pull).toMatchObject({nextCursor:2,hasMore:false,changes:[{pk:'next'}],unavailable:[{pk:'large-stamp'}]});
+        expect(snapshot).toMatchObject({nextPageToken:null,items:[{pk:'next'}],unavailable:[{pk:'large-stamp'}]});
+        const id = snapshot.unavailable![0]!.evidenceRef;
+        const metadata = await raw.prepare("SELECT length(cast(metadata_json AS blob)) AS bytes FROM sync_unavailable_records WHERE id = ?").get(id) as {bytes:number};
+        expect(metadata.bytes).toBeGreaterThan(4000000);
+        expect((await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10})).unavailable![0]!.evidenceRef).toBe(id);
+        expect((await adapter.pull(event,{scope,cursor:0,limit:10})).unavailable![0]!.evidenceRef).toBe(pull.unavailable![0]!.evidenceRef);
+        expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:2});
+    });
     it.each(['uuid','payload','table'])('contains a %s defect inside a healthy pull window', async fault => {
         await adapter.push(event,{scope,ops:[op('before'),op('bad'),op('after')]});
         if (fault === 'uuid') await raw.prepare("UPDATE change_log SET op_id = 'invalid-uuid' WHERE pk = 'bad'").run();
@@ -296,7 +333,7 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         // Oversized revision/metadata evidence remains available through bounded
         // inspection and chunk export, without putting the whole revision in UI JSON.
         await adapter.push(event,{scope,ops:[op('oversized-metadata')]});
-        await raw.prepare("UPDATE s_kv SET hlc = ? WHERE id = 'oversized-metadata'").run('h'.repeat(300000));
+        await raw.prepare("UPDATE s_kv SET hlc = ?, clock = -1 WHERE id = 'oversized-metadata'").run('h'.repeat(300000));
         const snapshot = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10});
         const metadataId = snapshot.unavailable!.find(marker=>marker.pk === 'oversized-metadata')!.evidenceRef;
         const rows = (await admin('inspect',{})).items as Array<{id:string;revision:string|null}>;
