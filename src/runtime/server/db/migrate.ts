@@ -64,6 +64,7 @@ const REQUIRED_SCHEMA_TABLES = [
     'storage_object_heads',
     'storage_generation_uploads',
     'sync_unavailable_records',
+    'sync_history',
     'sync_observations'
 ] as const;
 
@@ -81,6 +82,8 @@ import * as m033 from './migrations/033_tool_result_operation_ids';
 import * as m034 from './migrations/034_sync_intent_fingerprint';
 
 import * as m035 from './migrations/035_sync_unavailable_records';
+import * as m036 from './migrations/036_sync_history_incarnation';
+import { readHistoryIncarnation } from '../sync/history-incarnation';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -117,7 +120,8 @@ const migrations: Record<string, Migration> = {
     '032_sync_observations': m032,
     '033_tool_result_operation_ids': m033,
     '034_sync_intent_fingerprint': m034,
-    '035_sync_unavailable_records': m035
+    '035_sync_unavailable_records': m035,
+    '036_sync_history_incarnation': m036
 };
 
 class StaticMigrationProvider implements MigrationProvider {
@@ -183,4 +187,5 @@ export async function runMigrations(db: Kysely<Or3SqliteDb>): Promise<void> {
     }
 
     await assertLatestSchemaIntegrity(db);
+    await readHistoryIncarnation();
 }

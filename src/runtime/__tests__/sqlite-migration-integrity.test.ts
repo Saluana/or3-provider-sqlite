@@ -110,7 +110,7 @@ describe('SQLite migration integrity boundaries', () => {
             }
             return statement;
         });
-        await runMigrations(db);
+        await migrateThrough(db as unknown as Kysely<unknown>, '035_sync_unavailable_records');
         spy.mockRestore();
         for (const table of ['s_kv', 'sync_snapshot_items', 'tombstones']) {
             expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE op_id LIKE 'background-tool:%'`).get()).toEqual({ count: 0 });
@@ -361,7 +361,7 @@ describe('SQLite migration integrity boundaries', () => {
             expect(getRawDb().prepare("SELECT execution_json FROM background_jobs WHERE id = 'preserved'").get())
                 .toEqual({ execution_json: '{"version":1}' });
             expect(getRawDb().prepare("SELECT name FROM kysely_migration WHERE name > '029_delegation_wait' ORDER BY name").all())
-                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }, { name: '033_tool_result_operation_ids' }, { name: '034_sync_intent_fingerprint' }, { name: '035_sync_unavailable_records' }]);
+                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }, { name: '033_tool_result_operation_ids' }, { name: '034_sync_intent_fingerprint' }, { name: '035_sync_unavailable_records' }, { name: '036_sync_history_incarnation' }]);
         } finally {
             vi.restoreAllMocks();
             await destroySqliteDb();
