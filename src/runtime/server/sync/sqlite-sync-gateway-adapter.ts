@@ -2326,21 +2326,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
         const fetchLimit = resolvePullLimit(limit);
 
-        let query = db
-            .selectFrom('change_log')
-            .where('workspace_id', '=', scope.workspaceId)
-            .where('server_version', '>', cursor)
-            .orderBy('server_version', 'asc');
-
-        if (tables?.length) {
-            query = query.where('table_name', 'in', tables);
-        }
-
-        const sizes = await query.select(sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes'))
-            .limit(fetchLimit + 1).execute();
-        const selected = boundedPayloadRowCount(sizes, fetchLimit);
-        const rows = selected ? await query.selectAll().limit(selected).execute() : [];
-
         const minLog = await db
             .selectFrom('change_log')
             .select('server_version')
@@ -2358,6 +2343,25 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             oldestLogVersion: minLog?.server_version ?? null,
             highWatermark: counter?.value ?? 0,
         });
+        if (retention.requiresSnapshot || cursor > (counter?.value ?? 0)) {
+            return { changes: [], nextCursor: cursor, hasMore: false, ...retention, requiresSnapshot: true };
+        }
+
+        let query = db
+            .selectFrom('change_log')
+            .where('workspace_id', '=', scope.workspaceId)
+            .where('server_version', '>', cursor)
+            .orderBy('server_version', 'asc');
+
+        if (tables?.length) {
+            query = query.where('table_name', 'in', tables);
+        }
+
+        const sizes = await query.select(sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes'))
+            .limit(fetchLimit + 1).execute();
+        const selected = boundedPayloadRowCount(sizes, fetchLimit);
+        const rows = selected ? await query.selectAll().limit(selected).execute() : [];
+
         const changes: SyncChange[] = [];
         let itemBytes = 0;
         let scanned = 0;

@@ -1284,6 +1284,24 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('pull', () => {
+        it.each(['native', 'd1'])('signals expired and ahead cursors before decoding poisoned history on %s', async driver => {
+            if (driver === 'd1') await useD1TestDatabase();
+            await adapter.push(stubEvent, makeBatch([1, 2, 3].map(n => makeOp({ tableName: 'threads', pk: `recovery-${n}` }))));
+            const db = getSqliteDb();
+            await sql`DELETE FROM change_log WHERE server_version < 3`.execute(db);
+            await sql`UPDATE change_log SET payload_json = '{broken'`.execute(db);
+            for (const cursor of [0, 4]) {
+                await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 }))
+                    .resolves.toEqual({ changes: [], nextCursor: cursor, hasMore: false, oldestRetainedVersion: 3, requiresSnapshot: true });
+            }
+            // oldest - 1 is covered and must attempt to read the retained row.
+            await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 })).rejects.toThrow();
+            await sql`UPDATE change_log SET payload_json = '{"id":"recovery-3"}'`.execute(db);
+            const covered = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 });
+            expect(covered.requiresSnapshot).toBe(false);
+            expect(covered.changes.map(change => change.serverVersion)).toEqual([3]);
+        });
+
         it('returns changes after cursor', async () => {
             const op1 = makeOp({ tableName: 'threads', pk: 't-1' });
             const op2 = makeOp({ tableName: 'threads', pk: 't-2' });
