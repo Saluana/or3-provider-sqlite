@@ -435,6 +435,16 @@ Migration 030 adds generation records, current-hash heads, and canonical write b
 
 Migrations 030–032 resume safely after interrupted startup and reject incompatible preexisting schema objects. Released migration 029 remains unchanged.
 
+Tool-result retention writes deterministic UUID operation IDs so both incremental
+pull and snapshot bootstrap remain valid. Migration 033 repairs legacy
+`background-tool:<sha256>` IDs in the change log, canonical KV, tombstones and
+captured snapshot pages, including embedded payload IDs. It preserves content,
+clocks, server versions and cursors; replay allocates no duplicate versions.
+With the updated host, every nonempty tool result uses immutable KV chunks and
+bounded transcript references instead of consuming the assistant response budget.
+Full results remain available after sync/reload and for model replay. The existing
+256 KiB per-result limit remains in force. D1 background retention remains unsupported.
+
 Migration 031 adds the upload ledger and restore tickets. Normal generation transfer routes remain unregistered. See [upload, restore, and recovery invariants](docs/storage-generation-uploads.md).
 
 Background history admission and finalization failures expose structured codes for validation, authorization, conflicts, and supersession. Transient SQLite failures retain their original errors for retry.

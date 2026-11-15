@@ -5,6 +5,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -380,6 +381,11 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(await adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).toBe(content);
             await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'other-call', reference })).rejects.toThrow();
             expect((getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value).toBe(version);
+            const pulled = await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: before, limit: 100 });
+            expect(pulled.changes.every(entry => z.uuid().safeParse(entry.stamp.opId).success)).toBe(true);
+            const pulledKv = new Map(pulled.changes.filter(entry => entry.tableName === 'kv')
+                .map(entry => [entry.pk, entry.payload as { value: string; deleted?: boolean }]));
+            expect(await readToolResultStorage(reference, async key => pulledKv.get(key))).toBe(content);
             const page = await adapter.snapshot(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
             const kv = new Map(page.items.filter((entry): entry is Extract<SnapshotItem, { kind: 'row' }> => entry.kind === 'row' && entry.tableName === 'kv')
                 .map(entry => [entry.pk, entry.payload as { value: string; deleted?: boolean }]));
@@ -398,6 +404,39 @@ describe('SqliteSyncGatewayAdapter', () => {
             getRawDb().prepare('DELETE FROM workspace_members WHERE id = ?').run('usage-membership');
             await expect(retainBackgroundToolResult(job, content, 'call-1')).rejects.toThrow();
             await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).rejects.toThrow();
+        });
+
+        it('repairs legacy tool operation IDs without changing cursors, content or replay identity', async () => {
+            const history = admission();
+            await adapter.admitChatGeneration(actor, history);
+            const content = 'retained legacy research '.repeat(1500);
+            const prepared = await prepareToolResultStorage(content, { threadId: history.threadId, parentAssistantId: history.messageId, callId: 'legacy' });
+            await adapter.retainChatToolResult(actor, { admission: history, callId: 'legacy', reference: prepared.result, rows: prepared.rows });
+            const raw = getRawDb();
+            const oldId = `background-tool:${'a'.repeat(64)}`;
+            const key = prepared.rows[0]!.id;
+            raw.prepare("UPDATE change_log SET op_id = ?, payload_json = json_set(payload_json, '$.op_id', ?) WHERE pk = ?").run(oldId, oldId, key);
+            raw.prepare("UPDATE s_kv SET op_id = ?, data_json = json_set(data_json, '$.op_id', ?) WHERE id = ?").run(oldId, oldId, key);
+            const captured = await adapter.snapshot(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+            const version = captured.highWatermark;
+            raw.prepare("DELETE FROM kysely_migration WHERE name = '033_tool_result_operation_ids'").run();
+            await runMigrations(getSqliteDb());
+            await reopen();
+            const pull = await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+            expect(pull.changes.every(entry => z.uuid().safeParse(entry.stamp.opId).success)).toBe(true);
+            expect(pull.nextCursor).toBe(version);
+            const repaired = pull.changes.find(entry => entry.pk === key)!;
+            expect(repaired.stamp.opId).toMatch(/^[a-f0-9-]{36}$/);
+            expect(repaired.payload).toMatchObject({ op_id: repaired.stamp.opId });
+            const snapshots = getRawDb().prepare('SELECT op_id, payload_json FROM sync_snapshot_items WHERE pk = ?').all(key) as { op_id: string; payload_json: string }[];
+            expect(snapshots.length).toBeGreaterThan(0);
+            for (const row of snapshots) {
+                expect(row.op_id).toBe(repaired.stamp.opId);
+                expect(JSON.parse(row.payload_json).op_id).toBe(repaired.stamp.opId);
+            }
+            await adapter.retainChatToolResult(actor, { admission: history, callId: 'legacy', reference: prepared.result, rows: prepared.rows });
+            expect(await adapter.readChatToolResult(actor, { admission: history, callId: 'legacy', reference: prepared.result })).toBe(content);
+            expect((await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: version, limit: 100 })).changes).toEqual([]);
         });
 
         it('emits created hooks once for admitted rows and does not create an existing thread', async () => {

@@ -13,7 +13,7 @@ import { DelegationWaitSchema } from '~~/shared/chat/delegation-checkpoint';
 import { getScopedAdmissionKey } from '~~/server/utils/background-jobs/admission-cancels';
 import { createNormalizedStreamState } from '~~/shared/chat/normalized-stream-reducer';
 import { toolCallFingerprint } from '~~/shared/chat/tool-ledger';
-import { prepareToolResultStorage, readToolResultStorage } from '~~/shared/chat/tool-result-artifact';
+import { parseToolResultArtifact, prepareToolResultStorage, readToolResultStorage } from '~~/shared/chat/tool-result-artifact';
 import type { ChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
 import { buildDelegationResume } from '~~/server/utils/background-jobs/delegation-resume';
 import { reconstructDelegationChild } from '~~/server/utils/background-jobs/delegation-child';
@@ -25,6 +25,14 @@ import { SqliteAuthWorkspaceStore } from '#sqlite-runtime/server/auth/sqlite-aut
 import { registerAuthWorkspaceStore } from '~~/server/auth/store/registry';
 import { registerSyncGatewayAdapter } from '~~/server/sync/gateway/registry';
 import { normalizeError, serializeError } from '~~/shared/errors';
+
+async function readToolOutput(value: string): Promise<string> {
+    if (!parseToolResultArtifact(value)) return value;
+    return readToolResultStorage(value, async id => {
+        const row = getRawDb().prepare('SELECT data_json, deleted FROM s_kv WHERE id = ?').get(id) as { data_json: string; deleted: number } | undefined;
+        return row ? { ...JSON.parse(row.data_json), deleted: Boolean(row.deleted) } : undefined;
+    });
+}
 
 function measuredUsage(promptTokens = 150, iteration = 0): RequestUsage {
     return {
@@ -326,7 +334,7 @@ describe('SQLite durable request usage', () => {
             expect(await provider.claimNextDelegationWait('resume-worker', Date.now(), Date.now() + 60_000)).toBeTruthy();
             expect(await resumeReconciledDelegation(provider, input.parentJobId, params.userId, 'resume-worker')).toBe('resumed');
             const resumed = await provider.getJob(input.parentJobId, params.userId);
-            const result = JSON.parse(resumed!.tool_calls![0]!.result!);
+            const result = JSON.parse(await readToolOutput(resumed!.tool_calls![0]!.result!));
             expect(result.results[0]).toMatchObject({ status: 'unavailable', code: 'tool_unavailable' });
             expect(result.results[0]).not.toHaveProperty('threadId');
         } finally {
@@ -442,7 +450,7 @@ describe('SQLite durable request usage', () => {
         expect(await reconcileDueDelegationWaits(eligible, 1)).toBe(1);
         const resumed = await provider.getJob(input.parentJobId, params.userId);
         expect((resumed!.execution as BackgroundJobExecution).delegationWait).toBeUndefined();
-        const result = JSON.parse(resumed!.tool_calls![0]!.result!).results[0];
+        const result = JSON.parse(await readToolOutput(resumed!.tool_calls![0]!.result!)).results[0];
         expect(result.status).toBe(stage === 'unadmitted' ? 'unavailable' : stage === 'dispatched' ? 'unknown' : 'stopped');
         expect(Boolean((resumed!.execution as BackgroundJobExecution).delegationBlocked)).toBe(stage === 'dispatched');
         if (stage === 'unadmitted') expect(result).not.toHaveProperty('threadId');
@@ -486,7 +494,7 @@ describe('SQLite durable request usage', () => {
         const parent = await provider.getJob(input.parentJobId, params.userId);
         expect((parent!.execution as BackgroundJobExecution).delegationWait).toBeUndefined();
         expect(parent!.tool_calls![0]).toMatchObject({ status: 'complete', delegation: { children: [{ outcome: 'complete' }] } });
-        expect(JSON.parse(parent!.tool_calls![0]!.result!).results[0]).toMatchObject({ status: 'complete', content: 'saved answer' });
+        expect(JSON.parse(await readToolOutput(parent!.tool_calls![0]!.result!)).results[0]).toMatchObject({ status: 'complete', content: 'saved answer' });
     });
 
     it('retains a large settled child in canonical KV across reopen', async () => {
@@ -589,7 +597,7 @@ describe('SQLite durable request usage', () => {
         expect(await resume()).toBe('resumed');
         const parent = await provider.getJob(input.parentJobId, params.userId);
         expect(parent!.tool_calls![0]).toMatchObject({ status: 'complete', delegation: { children: [{ outcome: 'unavailable' }] } });
-        const result = JSON.parse(parent!.tool_calls![0]!.result!);
+        const result = JSON.parse(await readToolOutput(parent!.tool_calls![0]!.result!));
         expect(result.results[0]).toMatchObject({ status: 'unavailable', code: 'result_unavailable' });
         expect(result.results[0]).not.toHaveProperty('content');
     });
@@ -614,7 +622,7 @@ describe('SQLite durable request usage', () => {
         expect(await resumeReconciledDelegation(provider, input.parentJobId, params.userId, 'resume-worker')).toBe('resumed');
         const parent = await provider.getJob(input.parentJobId, params.userId);
         expect(parent!.tool_calls![0]).toMatchObject({ status: 'complete', delegation: { children: [{ outcome: 'unavailable' }] } });
-        const result = JSON.parse(parent!.tool_calls![0]!.result!);
+        const result = JSON.parse(await readToolOutput(parent!.tool_calls![0]!.result!));
         expect(result.results[0]).toMatchObject({ status: 'unavailable', code: 'history_unavailable' });
         expect(result.results[0]).not.toHaveProperty('content');
     });
@@ -651,13 +659,13 @@ describe('SQLite durable request usage', () => {
             await provider.claimNextDelegationWait('resume-worker', Date.now(), Date.now() + 60_000);
             expect(await resumeReconciledDelegation(provider, input.parentJobId, params.userId, 'resume-worker')).toBe('resumed');
             const parent = (await provider.getJob(input.parentJobId, params.userId))!;
-            expect(JSON.parse(parent.tool_calls![0]!.result!).results[0]).toMatchObject(deleted
+            expect(JSON.parse(await readToolOutput(parent.tool_calls![0]!.result!)).results[0]).toMatchObject(deleted
                 ? { status: 'unavailable', code: 'history_unavailable' } : { status: outcome });
             expect(parent.tool_calls![0]!.delegation?.children[0]?.outcome).toBe(deleted ? 'unavailable' : outcome);
             if (outcome === 'unknown') {
                 expect((parent.execution as BackgroundJobExecution).delegationBlocked).toBe(true);
                 if (deleted) {
-                    expect(JSON.parse(parent.tool_calls![0]!.result!).results[0].executionUncertain).toBe(true);
+                    expect(JSON.parse(await readToolOutput(parent.tool_calls![0]!.result!)).results[0].executionUncertain).toBe(true);
                     expect(parent.tool_calls![0]!.delegation?.children[0]).toMatchObject({ executionUncertain: true });
                 }
             }
@@ -707,7 +715,7 @@ describe('SQLite durable request usage', () => {
         expect(await provider.claimNextDelegationWait('resume-worker', Date.now(), Date.now() + 60_000)).toBeTruthy();
         expect(await resumeReconciledDelegation(provider, input.parentJobId, params.userId, 'resume-worker')).toBe('resumed');
         const parent = (await provider.getJob(input.parentJobId, params.userId))!;
-        const result = JSON.parse(parent.tool_calls![0]!.result!).results[0];
+        const result = JSON.parse(await readToolOutput(parent.tool_calls![0]!.result!)).results[0];
         expect(result).toMatchObject({ status: 'unavailable', code: 'history_unavailable' });
         expect(result.executionUncertain).toBe(uncertain ? true : undefined);
         expect(parent.tool_calls![0]!.delegation?.children[0]).toMatchObject({ outcome: 'unavailable' });

@@ -196,7 +196,7 @@ describe('SQLite migration integrity boundaries', () => {
             expect(getRawDb().prepare("SELECT execution_json FROM background_jobs WHERE id = 'preserved'").get())
                 .toEqual({ execution_json: '{"version":1}' });
             expect(getRawDb().prepare("SELECT name FROM kysely_migration WHERE name > '029_delegation_wait' ORDER BY name").all())
-                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }]);
+                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }, { name: '033_tool_result_operation_ids' }]);
         } finally {
             vi.restoreAllMocks();
             await destroySqliteDb();
@@ -226,7 +226,7 @@ describe('SQLite migration integrity boundaries', () => {
         await runMigrations(db);
         await rollbackObservations(db as unknown as Kysely<unknown>);
         const raw = getRawDb();
-        raw.prepare("DELETE FROM kysely_migration WHERE name = '032_sync_observations'").run();
+        raw.prepare("DELETE FROM kysely_migration WHERE name >= '032_sync_observations'").run();
         raw.exec(statement);
 
         await expect(runMigrations(db)).rejects.toThrow(`Incompatible migration schema: ${name}`);
