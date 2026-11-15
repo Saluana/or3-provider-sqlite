@@ -2612,7 +2612,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     /** Archives retain full Trash metadata; normal sync still emits tombstones. */
     async backupSnapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
-        return this.captureSnapshot(event, input, true);
+        // Server exports discover their first history; every later page stays
+        // bound to that capture rather than adopting the current database.
+        const historyIncarnation = input.historyIncarnation === undefined
+            ? input.pageToken ? decodeSnapshotPageToken(input.pageToken).historyIncarnation ?? null : null
+            : input.historyIncarnation;
+        return this.captureSnapshot(event, { ...input, historyIncarnation }, true);
     }
 
     private async captureSnapshot(

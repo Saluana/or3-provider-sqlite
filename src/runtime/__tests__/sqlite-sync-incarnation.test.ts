@@ -88,6 +88,24 @@ describe.each(['native','d1'])('%s history incarnation',driver=>{
             pageToken:Buffer.from(JSON.stringify(token)).toString('base64url')})).rejects.toMatchObject({statusCode:409});
         expect(await rows('SELECT id FROM sync_snapshots')).toEqual([{id:first.snapshotId}]);
     });
+    it('binds internal archive discovery and continuations without requiring browser request fields',async()=>{
+        await adapter.push(event,{scope,historyIncarnation:history,ops:[op('a'),op('b')]});
+        // The workspace export route supplies no browser history fields.
+        const first=await adapter.backupSnapshot(event,{scope,pageSize:1,tables:['kv']});
+        expect(first).toMatchObject({historyIncarnation:history,highWatermark:2,items:[{pk:'a'}]});
+        expect(first.nextPageToken).toBeTruthy();
+        const last=await adapter.backupSnapshot(event,{scope,pageSize:1,tables:['kv'],pageToken:first.nextPageToken!});
+        expect(last).toMatchObject({historyIncarnation:history,snapshotId:first.snapshotId,highWatermark:2,items:[{pk:'b'}],nextPageToken:null});
+        // Internal discovery must not weaken the browser snapshot requirement.
+        await expect(adapter.snapshot(event,{scope,pageSize:1})).rejects.toMatchObject({statusCode:400});
+        const legacy=JSON.parse(Buffer.from(first.nextPageToken!,'base64url').toString('utf8'));
+        delete legacy.historyIncarnation;
+        await expect(adapter.backupSnapshot(event,{scope,pageSize:1,pageToken:Buffer.from(JSON.stringify(legacy)).toString('base64url')})).rejects.toMatchObject({statusCode:409});
+        const next=await rotate();
+        await expect(adapter.backupSnapshot(event,{scope,pageSize:1,pageToken:first.nextPageToken!})).rejects.toMatchObject({statusCode:409,data:{historyIncarnation:next}});
+        await expect(adapter.backupSnapshot(event,{scope,pageSize:1,historyIncarnation:history})).rejects.toMatchObject({statusCode:409});
+        expect(await rows('SELECT * FROM sync_snapshots')).toEqual([]);
+    });
     it('atomically resets sessions/ACKs, preserves history/evidence and rejects pre-reset tokens',async()=>{
         await adapter.push(event,{scope,historyIncarnation:history,ops:[op('a'),op('b')]});
         await execute("UPDATE s_kv SET data_json='{' WHERE id='a'");
