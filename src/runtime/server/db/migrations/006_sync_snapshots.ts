@@ -7,6 +7,7 @@
  */
 import type { Kysely } from 'kysely';
 import { sql } from 'kysely';
+import { ensureMigrationSchema, ensureMigrationTextColumn } from '../migration-schema';
 
 const SYNCED_TABLES = [
     ['s_threads', 'threads'],
@@ -20,9 +21,7 @@ const SYNCED_TABLES = [
 
 export async function up(db: Kysely<unknown>): Promise<void> {
     for (const [materializedTable, tableName] of SYNCED_TABLES) {
-        await sql.raw(
-            `ALTER TABLE "${materializedTable}" ADD COLUMN op_id TEXT NOT NULL DEFAULT ''`
-        ).execute(db);
+        await ensureMigrationTextColumn(db, materializedTable, 'op_id', true);
 
         await sql.raw(`
             UPDATE "${materializedTable}" AS materialized
@@ -45,12 +44,8 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         `).execute(db);
     }
 
-    await sql.raw(
-        `ALTER TABLE tombstones ADD COLUMN hlc TEXT NOT NULL DEFAULT ''`
-    ).execute(db);
-    await sql.raw(
-        `ALTER TABLE tombstones ADD COLUMN op_id TEXT NOT NULL DEFAULT ''`
-    ).execute(db);
+    await ensureMigrationTextColumn(db, 'tombstones', 'hlc', true);
+    await ensureMigrationTextColumn(db, 'tombstones', 'op_id', true);
 
     await sql.raw(`
         UPDATE tombstones AS tombstone
@@ -84,23 +79,18 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         WHERE tombstone.hlc = '' OR tombstone.op_id = ''
     `).execute(db);
 
-    await sql.raw(`
-        CREATE TABLE sync_snapshots (
+    await ensureMigrationSchema(db, `CREATE TABLE sync_snapshots (
             id TEXT PRIMARY KEY,
             workspace_id TEXT NOT NULL,
             high_watermark INTEGER NOT NULL,
             tables_json TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL
-        )
-    `).execute(db);
-    await sql.raw(`
-        CREATE INDEX idx_sync_snapshots_expires
-        ON sync_snapshots(expires_at)
-    `).execute(db);
+        )`);
+    await ensureMigrationSchema(db, `CREATE INDEX idx_sync_snapshots_expires
+        ON sync_snapshots(expires_at)`);
 
-    await sql.raw(`
-        CREATE TABLE sync_snapshot_items (
+    await ensureMigrationSchema(db, `CREATE TABLE sync_snapshot_items (
             snapshot_id TEXT NOT NULL,
             table_name TEXT NOT NULL,
             pk TEXT NOT NULL,
@@ -112,8 +102,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
             server_deleted_at INTEGER,
             PRIMARY KEY (snapshot_id, table_name, pk, kind),
             FOREIGN KEY (snapshot_id) REFERENCES sync_snapshots(id) ON DELETE CASCADE
-        ) WITHOUT ROWID
-    `).execute(db);
+        ) WITHOUT ROWID`);
 }
 
 export async function down(db: Kysely<unknown>): Promise<void> {

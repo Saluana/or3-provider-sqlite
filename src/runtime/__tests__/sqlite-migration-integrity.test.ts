@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { sql, type Kysely } from 'kysely';
+import { sql, Migrator, type Migration, type Kysely } from 'kysely';
 import {
     _resetForTest,
     destroySqliteDb,
@@ -27,7 +27,67 @@ afterEach(async () => {
 });
 
 describe('SQLite migration integrity boundaries', () => {
-    it('resumes a migration interrupted after preserving malformed execution bytes', async () => {
+    const historicalProvider = {
+        async getMigrations() {
+            const modules = import.meta.glob<Migration>('../server/db/migrations/*.ts');
+            return Object.fromEntries(await Promise.all(Object.entries(modules).map(async ([path, load]) =>
+                [path.split('/').at(-1)!.replace('.ts', ''), await load()])));
+        },
+    };
+    async function migrateThrough(db: Kysely<unknown>, name: string) {
+        const result = await new Migrator({ db, provider: historicalProvider }).migrateTo(name);
+        if (result.error) throw result.error;
+    }
+
+    it.each([
+        ['005_admin_stores', "ALTER TABLE s_threads ADD COLUMN op_id TEXT NOT NULL DEFAULT ''" ],
+        ['006_sync_snapshots', 'ALTER TABLE device_cursors ADD COLUMN owner_user_id TEXT'],
+        ['018_background_admission_cancels', "ALTER TABLE background_jobs ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''" ],
+        ['020_background_generation_receipts', 'ALTER TABLE background_jobs ADD COLUMN usage_json TEXT'],
+    ])('resumes a historical additive migration after %s', async (base, partial) => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, base!);
+        getRawDb().exec(partial!);
+        await expect(runMigrations(db)).resolves.toBeUndefined();
+        await expect(runMigrations(db)).resolves.toBeUndefined();
+    });
+
+    it('rolls back a destructive rebuild and its ledger before restarting', async () => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, '002_sync_tables');
+        const raw = getRawDb();
+        raw.exec(`INSERT INTO s_threads (id, workspace_id, data_json) VALUES ('original', 'ws', '{"id":"original"}')`);
+        const prepare = raw.prepare.bind(raw);
+        const spy = vi.spyOn(raw, 'prepare').mockImplementation(query => {
+            const statement = prepare(query);
+            if (query === 'DROP TABLE "s_threads"') {
+                const run = statement.run.bind(statement);
+                vi.spyOn(statement, 'run').mockImplementation((...parameters) => {
+                    run(...parameters);
+                    throw new Error('injected rebuild interruption');
+                });
+            }
+            return statement;
+        });
+        await expect(runMigrations(db)).rejects.toThrow('injected rebuild interruption');
+        spy.mockRestore();
+        expect(raw.prepare('SELECT id, data_json FROM s_threads').all()).toEqual([{ id: 'original', data_json: '{"id":"original"}' }]);
+        expect(raw.prepare("SELECT name FROM kysely_migration WHERE name > '002_sync_tables'").all()).toEqual([]);
+        await expect(runMigrations(db)).resolves.toBeUndefined();
+        expect(raw.prepare('SELECT id FROM s_threads').all()).toEqual([{ id: 'original' }]);
+    });
+
+    it('preserves a historical interrupted rebuild for explicit recovery', async () => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, '002_sync_tables');
+        const raw = getRawDb();
+        raw.exec(`INSERT INTO s_threads (id, workspace_id, data_json) VALUES ('preserved', 'ws', '{}')`);
+        raw.exec('ALTER TABLE s_threads RENAME TO s_threads__new');
+        await expect(runMigrations(db)).rejects.toThrow(/recover.*s_threads__new/i);
+        expect(raw.prepare('SELECT id FROM s_threads__new').all()).toEqual([{ id: 'preserved' }]);
+    });
+
+    it('atomically preserves original execution bytes across native migration interruptions', async () => {
         const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
         await rollbackObservations(db as unknown as Kysely<unknown>);
@@ -47,16 +107,14 @@ describe('SQLite migration integrity boundaries', () => {
         await expect(runMigrations(db)).rejects.toThrow('injected migration interruption');
         expect(raw.prepare("SELECT execution_json, lease_owner FROM background_jobs WHERE id = 'interrupted'").get())
             .toEqual({ execution_json: malformed, lease_owner: 'worker' });
-        expect(raw.prepare("SELECT execution_json FROM background_job_execution_quarantine WHERE job_id = 'interrupted'").get())
-            .toEqual({ execution_json: malformed });
+        expect(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'background_job_execution_quarantine'").all()).toEqual([]);
         raw.exec('DROP TRIGGER interrupt_delegation_migration');
         // Also interrupt after the replacement and several index creations.
         raw.exec('CREATE TABLE background_jobs_delegation_invalid_due (id INTEGER)');
         await expect(runMigrations(db)).rejects.toThrow(/background_jobs_delegation_invalid_due/);
-        expect(raw.prepare("SELECT execution_json, lease_owner, delegation_wait_active FROM background_jobs WHERE id = 'interrupted'").get())
-            .toEqual({ execution_json: '{"version":1,"delegationQuarantinedAt":0}', lease_owner: null, delegation_wait_active: 1 });
-        expect(raw.prepare("SELECT execution_json FROM background_job_execution_quarantine WHERE job_id = 'interrupted'").get())
-            .toEqual({ execution_json: malformed });
+        expect(raw.prepare("SELECT execution_json, lease_owner FROM background_jobs WHERE id = 'interrupted'").get())
+            .toEqual({ execution_json: malformed, lease_owner: 'worker' });
+        expect(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'background_job_execution_quarantine'").all()).toEqual([]);
         raw.exec('DROP TABLE background_jobs_delegation_invalid_due');
 
         await expect(runMigrations(db)).resolves.toBeUndefined();

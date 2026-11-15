@@ -3,12 +3,10 @@
  * them. Legacy rows remain unbound until their next authenticated update.
  */
 import type { Kysely } from 'kysely';
+import { ensureMigrationTextColumn } from '../migration-schema';
 
 export async function up(db: Kysely<unknown>): Promise<void> {
-    await db.schema
-        .alterTable('device_cursors')
-        .addColumn('owner_user_id', 'text')
-        .execute();
+    await ensureMigrationTextColumn(db, 'device_cursors', 'owner_user_id');
 }
 
 export async function down(_db: Kysely<unknown>): Promise<void> {

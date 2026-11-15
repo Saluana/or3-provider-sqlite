@@ -2,7 +2,7 @@
  * Migration runner for the SQLite provider.
  * Runs all migrations in order on module init.
  */
-import { type Kysely, type Migration, type MigrationProvider, Migrator } from 'kysely';
+import { sql, type Kysely, type Migration, type MigrationProvider, Migrator } from 'kysely';
 import type { Or3SqliteDb } from './schema';
 import * as m001 from './migrations/001_init';
 import * as m002 from './migrations/002_sync_tables';
@@ -140,6 +140,19 @@ async function assertLatestSchemaIntegrity(
  * Run all pending migrations. Safe to call repeatedly.
  */
 export async function runMigrations(db: Kysely<Or3SqliteDb>): Promise<void> {
+    // Old nontransactional rebuilds may have committed DROP/RENAME steps.
+    // Do not discard their only surviving copy or silently mark them complete.
+    const rebuildTables = [
+        ...['s_threads', 's_messages', 's_projects', 's_posts', 's_kv', 's_file_meta', 's_notifications'].map(table => `${table}__new`),
+        'connect_device_authorizations_legacy', 'connect_device_authorizations_before_redelivery',
+        'connect_device_authorizations_before_lifecycle', 'connect_environments_before_lifecycle',
+        'chat_history_revisions_v2',
+    ];
+    const interrupted = (await sql<{ name: string }>`SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name IN (${sql.join(rebuildTables)})`.execute(db)).rows;
+    if (interrupted.length) {
+        throw new Error(`Recover interrupted SQLite rebuild before retrying migrations; preserved tables: ${interrupted.map(row => row.name).join(', ')}`);
+    }
     const migrator = new Migrator({
         db,
         provider: new StaticMigrationProvider(),
