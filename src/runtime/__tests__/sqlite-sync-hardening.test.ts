@@ -212,8 +212,8 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await adapter.push(event,{scope,ops:[op('large-stamp'),op('next')]});
         // Construct original metadata inside SQLite, without transferring it to JS.
         const huge = "replace(hex(zeroblob(1000000)), '0', 'h')";
-        await raw.prepare(`UPDATE change_log SET hlc = ${huge}, device_id = ${huge}, op_id = ${huge} WHERE pk = 'large-stamp'`).run();
-        await raw.prepare(`UPDATE s_kv SET hlc = ${huge}, op_id = ${huge} WHERE id = 'large-stamp'`).run();
+        await raw.prepare(`UPDATE change_log SET clock = ${huge}, hlc = ${huge}, device_id = ${huge}, op_id = ${huge} WHERE pk = 'large-stamp'`).run();
+        await raw.prepare(`UPDATE s_kv SET clock = ${huge}, hlc = ${huge}, op_id = ${huge} WHERE id = 'large-stamp'`).run();
         const oversizedFields: string[] = [];
         const account = (rows: unknown[]) => {for (const row of rows) for (const [field,value] of Object.entries(row as object)) {
             if (typeof value === 'string' && Buffer.byteLength(value) > 262144) oversizedFields.push(field);

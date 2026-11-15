@@ -2477,7 +2477,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             previousVersion = row.server_version;
         }
         const selected = boundedPayloadRowCount(sizes, fetchLimit);
-        const rows = selected ? await query.select(['server_version','clock',
+        const rows = selected ? await query.select(['server_version',sql<number>`${sql.raw(boundedSyncMetadata('clock',PULL_METADATA_BYTES))}`.as('clock'),
             ...['id','table_name','pk','op'].map(column => sql<string>`${sql.raw(boundedSyncMetadata(column))}`.as(column as 'id' | 'table_name' | 'pk' | 'op')),
             ...['hlc','device_id','op_id'].map(column => sql<string>`${sql.raw(boundedSyncMetadata(column,PULL_METADATA_BYTES))}`.as(column as 'hlc' | 'device_id' | 'op_id')),
             sql<number>`${sql.raw(PULL_METADATA_BYTES)}`.as('metadata_bytes'),
@@ -2810,7 +2810,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             ${SNAPSHOT_METADATA_BYTES} AS metadata_bytes,
             hex(cast(${boundedSyncMetadata('pk')} AS blob)) AS pk_hex, hex(cast(${boundedSyncMetadata('table_name')} AS blob)) AS table_hex,
             CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner,
-            clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, server_deleted_at ${selection.clause}`)
+            ${boundedSyncMetadata('clock',SNAPSHOT_METADATA_BYTES)} AS clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, ${boundedSyncMetadata('server_deleted_at',SNAPSHOT_METADATA_BYTES)} AS server_deleted_at ${selection.clause}`)
             .all(...selection.parameters, selected) as SnapshotItemRow[] : [];
         return buildSnapshotPage(header, rows, pageSize, sizes.length, after, snapshotUserId);
     }
@@ -3234,7 +3234,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             ${SNAPSHOT_METADATA_BYTES} AS metadata_bytes,
             hex(cast(${boundedSyncMetadata('pk')} AS blob)) AS pk_hex, hex(cast(${boundedSyncMetadata('table_name')} AS blob)) AS table_hex,
             CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner,
-            clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, server_deleted_at ${selection.clause}`,
+            ${boundedSyncMetadata('clock',SNAPSHOT_METADATA_BYTES)} AS clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, ${boundedSyncMetadata('server_deleted_at',SNAPSHOT_METADATA_BYTES)} AS server_deleted_at ${selection.clause}`,
             ...selection.parameters, selected
         ) : [];
         // Captures and maintenance can evict a snapshot between these awaited
