@@ -52,6 +52,56 @@ describe('SQLite migration integrity boundaries', () => {
         await expect(runMigrations(db)).resolves.toBeUndefined();
     });
 
+    it('repairs legacy tool IDs with indexed updates across growing tables and never reruns completed 033', async () => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, '032_sync_observations');
+        const raw = getRawDb();
+        raw.exec("INSERT INTO sync_snapshots VALUES ('snapshot', 'ws', 1, '[]', 1, 9999999999)");
+        const kv = raw.prepare('INSERT INTO s_kv (id, workspace_id, data_json, op_id) VALUES (?, ?, ?, ?)');
+        const items = raw.prepare("INSERT INTO sync_snapshot_items (snapshot_id, table_name, pk, kind, payload_json, clock, hlc, op_id) VALUES ('snapshot', 'kv', ?, 'row', ?, 1, 'hlc', ?)");
+        const tombstones = raw.prepare("INSERT INTO tombstones (id, workspace_id, table_name, pk, deleted_at, clock, server_version, op_id) VALUES (?, 'ws', 'kv', ?, 1, 1, 1, ?)");
+        raw.transaction(() => {
+            for (let n = 0; n < 1100; n++) {
+                const id = `key-${n}`;
+                const opId = n < 600 ? `background-tool:${n.toString(16).padStart(4, '0').repeat(16)}` : `valid-${n}`;
+                const payload = JSON.stringify({ id, op_id: opId });
+                kv.run(id, 'ws', payload, opId);
+                items.run(id, payload, opId);
+                tombstones.run(id, id, opId);
+            }
+        })();
+        const plans: string[] = [];
+        const prepare = raw.prepare.bind(raw);
+        const spy = vi.spyOn(raw, 'prepare').mockImplementation(query => {
+            const statement = prepare(query);
+            if (/^UPDATE "?(s_kv|sync_snapshot_items|tombstones)"? SET/i.test(query)) {
+                const run = statement.run.bind(statement);
+                vi.spyOn(statement, 'run').mockImplementation((...parameters) => {
+                    const plan = prepare(`EXPLAIN QUERY PLAN ${query}`).all(...parameters) as { detail: string }[];
+                    plans.push(...plan.map(row => row.detail));
+                    return run(...parameters);
+                });
+            }
+            return statement;
+        });
+        await runMigrations(db);
+        spy.mockRestore();
+        for (const table of ['s_kv', 'sync_snapshot_items', 'tombstones']) {
+            expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE op_id LIKE 'background-tool:%'`).get()).toEqual({ count: 0 });
+            expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE op_id LIKE 'valid-%'`).get()).toEqual({ count: 500 });
+        }
+        expect(raw.prepare("SELECT op_id, data_json FROM s_kv WHERE id = 'key-0'").get()).toEqual({
+            op_id: '00000000-0000-4000-8000-000000000000',
+            data_json: '{"id":"key-0","op_id":"00000000-0000-4000-8000-000000000000"}',
+        });
+        expect(plans.length).toBe(1800);
+        expect(plans.every(plan => /SEARCH .* USING .*INDEX/.test(plan))).toBe(true);
+        const late = 'background-tool:' + 'a'.repeat(64);
+        kv.run('late', 'ws', '{"id":"late"}', late);
+        await runMigrations(db);
+        expect(raw.prepare("SELECT op_id FROM s_kv WHERE id = 'late'").get()).toEqual({ op_id: late });
+    });
+
     it('rolls back a destructive rebuild and its ledger before restarting', async () => {
         const db = await initializeSqliteDb({ path: ':memory:' });
         await migrateThrough(db as unknown as Kysely<unknown>, '002_sync_tables');

@@ -1,4 +1,5 @@
 import { sql, type Kysely } from 'kysely';
+import { ensureMigrationSchema } from '../migration-schema';
 import { digestUuid } from '../../utils/digest-uuid';
 
 /** Repair the exact legacy writer format without changing versions or clocks. */
@@ -10,6 +11,10 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         ['tombstones', null],
     ] as const;
     for (const [table, payload] of tables) {
+        // Only change_log has an op_id index in older schemas. Index the
+        // actual UPDATE predicate, not merely the paged discovery query.
+        const repairIndex = table === 'change_log' ? null : `or3_033_${table}_op_id`;
+        if (repairIndex) await ensureMigrationSchema(db, `CREATE INDEX ${repairIndex} ON ${table} (op_id)`);
         let after = '';
         for (;;) {
             const { rows } = await sql<{ op_id: string }>`SELECT DISTINCT op_id FROM ${sql.table(table)}
@@ -27,6 +32,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
             }
             after = rows.at(-1)!.op_id;
         }
+        if (repairIndex) await sql`DROP INDEX ${sql.id(repairIndex)}`.execute(db);
     }
 }
 
