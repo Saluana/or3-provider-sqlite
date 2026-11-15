@@ -8,16 +8,19 @@ import { SYNCED_TABLE_MAP } from '../db/schema';
 import { boundedSyncPayload, syncRows, syncBatch } from './unavailable-records';
 import type { D1SqlStatement } from '../db/d1';
 
-export type RepairGuard = { id: string; workspaceId: string; table: string; pk: string; clock: number; hlc: string; opId: string; deleted: number; tombstone: string | null };
+export type RepairGuard = { id: string; workspaceId: string; table: string; pk: string; clock: number; hlc: string; opId: string; deleted: number; materialized: boolean; tombstone: string | null };
 export function repairAssertion(guard: RepairGuard): D1SqlStatement {
+    const current = guard.materialized
+        ? `EXISTS (SELECT 1 FROM ${guard.table} WHERE workspace_id = ? AND id = ?
+            AND clock IS ? AND hlc IS ? AND op_id IS ? AND deleted IS ?)`
+        : `NOT EXISTS (SELECT 1 FROM ${guard.table} WHERE workspace_id = ? AND id = ?)`;
     return { sql: `SELECT json_extract('{}', CASE WHEN EXISTS (
         SELECT 1 FROM sync_unavailable_records WHERE workspace_id = ? AND id = ? AND status = 'unresolved'
-    ) AND EXISTS (SELECT 1 FROM ${guard.table} WHERE workspace_id = ? AND id = ?
-        AND clock IS ? AND hlc IS ? AND op_id IS ? AND deleted IS ?)
+    ) AND ${current}
         AND (SELECT json_array(clock,hlc,op_id) FROM tombstones WHERE workspace_id = ? AND table_name = ? AND pk = ?) IS ?
         THEN '$' ELSE 'OR3_SYNC_REPAIR_CHANGED' END)`,
-    parameters: [guard.workspaceId,guard.id,guard.workspaceId,guard.pk,guard.clock,guard.hlc,guard.opId,guard.deleted,
-        guard.workspaceId,guard.table.slice(2),guard.pk,guard.tombstone] };
+    parameters: [guard.workspaceId,guard.id,guard.workspaceId,guard.pk,
+        ...(guard.materialized ? [guard.clock,guard.hlc,guard.opId,guard.deleted] : []),guard.workspaceId,guard.table.slice(2),guard.pk,guard.tombstone] };
 }
 export function repairResolution(guard: RepairGuard, opId: string): D1SqlStatement {
     return { sql: `UPDATE sync_unavailable_records SET status = 'repaired', resolved_op_id = ?
@@ -87,7 +90,11 @@ export async function maintainEvidence(event: H3Event, workspaceId: string, acti
     const newerDelete = deletedRevision && current &&
         incomingRevisionWins({clock:deletedRevision[0],hlc:deletedRevision[1],opId:deletedRevision[2]},
             {clock:current.clock,hlc:current.hlc,opId:current.op_id});
-    if (!current || current.clock !== metadata.clock || current.hlc !== metadata.hlc || current.op_id !== metadata.op_id || newerDelete) {
+    // Orphan tombstones remain canonical deletion winners. Missing live state
+    // alone does not make their evidence obsolete.
+    const winner = current ?? (deletedRevision ? {clock:deletedRevision[0],hlc:deletedRevision[1],op_id:deletedRevision[2],deleted:1} : undefined);
+    const isDeletion = metadata.op === 'delete' || metadata.kind === 'tombstone';
+    if (!winner || !current && !isDeletion || winner.clock !== metadata.clock || winner.hlc !== metadata.hlc || winner.op_id !== metadata.op_id || newerDelete) {
         await syncBatch([{sql:"UPDATE sync_unavailable_records SET status = 'superseded' WHERE workspace_id = ? AND id = ? AND status = 'unresolved'",parameters:[workspaceId,evidence.id]}]);
         return {id:evidence.id,status:'superseded'};
     }
@@ -95,10 +102,10 @@ export async function maintainEvidence(event: H3Event, workspaceId: string, acti
     // Explicit operator replacement, never implicit replay of the retained bytes.
     if (!input.payload || typeof input.payload !== 'object' || Array.isArray(input.payload)) throw new Error('Repair replacement payload required');
     const opId = randomUUID();
-    const clock = nextSyncClock(current.clock);
+    const clock = nextSyncClock(winner.clock);
     const op: PendingOp = { id:opId,tableName:metadata.table_name,pk:metadata.pk,operation:input.operation === 'delete' ? 'delete' : 'put',
         payload:input.payload,stamp:{clock,hlc:`${Date.now().toString(36)}:000:repair`,opId,deviceId:'server:sync-repair'},createdAt:Date.now(),attempts:0,status:'pending' };
-    const result = await write(event,op,{id:evidence.id,workspaceId,table,pk:metadata.pk,...current,opId:current.op_id,tombstone:tombstone?.revision ?? null});
+    const result = await write(event,op,{id:evidence.id,workspaceId,table,pk:metadata.pk,...winner,opId:winner.op_id,materialized:!!current,tombstone:tombstone?.revision ?? null});
     if (!result.results[0]?.success || result.results[0]?.applied === false) throw new Error(result.results[0]?.error ?? 'Repair did not win');
     return {id:evidence.id,status:'repaired',opId,serverVersion:result.results[0].serverVersion};
 }

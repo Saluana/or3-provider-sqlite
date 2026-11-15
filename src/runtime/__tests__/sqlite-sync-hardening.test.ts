@@ -245,6 +245,22 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect((await adapter.pull(event,{scope,cursor:0,limit:10})).unavailable![0]!.evidenceRef).toBe(pull.unavailable![0]!.evidenceRef);
         expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:2});
     });
+    it('repairs the current orphan tombstone with a fresh winning delete at a new version', async () => {
+        const deletion = {...op('orphan'),operation:'delete' as const,payload:undefined};
+        await adapter.push(event,{scope,ops:[deletion]});
+        await raw.prepare("DELETE FROM s_kv WHERE id = 'orphan'").run();
+        await raw.prepare("UPDATE tombstones SET deleted_at = 'corrupt' WHERE pk = 'orphan'").run();
+        const snapshot = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10});
+        expect(snapshot).toMatchObject({items:[],unavailable:[{pk:'orphan',originalKind:'tombstone'}]});
+        const id = snapshot.unavailable![0]!.evidenceRef;
+        const repaired = await adapter.maintainUnavailableRecords(event,scope.workspaceId,'repair',{id,operation:'delete',payload:{}});
+        expect(repaired).toMatchObject({status:'repaired',serverVersion:2});
+        const page = await adapter.pull(event,{scope,cursor:1,limit:10});
+        expect(page.changes[0]).toMatchObject({pk:'orphan',op:'delete',stamp:{clock:2}});
+        expect(page.changes[0]!.stamp.opId).not.toBe(deletion.stamp.opId);
+        expect(await raw.prepare('SELECT status,resolved_op_id FROM sync_unavailable_records WHERE id = ?').get(id)).toEqual({status:'repaired',resolved_op_id:page.changes[0]!.stamp.opId});
+        expect((await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10})).unavailable ?? []).toEqual([]);
+    });
     it.each(['uuid','payload','table'])('contains a %s defect inside a healthy pull window', async fault => {
         await adapter.push(event,{scope,ops:[op('before'),op('bad'),op('after')]});
         if (fault === 'uuid') await raw.prepare("UPDATE change_log SET op_id = 'invalid-uuid' WHERE pk = 'bad'").run();
