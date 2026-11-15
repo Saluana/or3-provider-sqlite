@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { validSyncPayload } from '../../../test/support/sync-payload';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -343,8 +345,8 @@ describe('dormant managed storage generation coordinator', () => {
         const adapter = new SqliteSyncGatewayAdapter();
         const ops = ['safe', 'unsafe'].map((id, index) => ({
             id, tableName: 'messages', operation: 'put' as const, pk: id,
-            payload: { id, file_hashes: index ? [hash] : null },
-            stamp: { deviceId: 'device', opId: id, hlc: '2026-10-10T00:00:00.000Z-0000', clock: index + 1 },
+            payload: validSyncPayload("messages", id, { id, file_hashes: index ? [hash] : null }),
+            stamp: { deviceId: 'device', opId: randomUUID(), hlc: '2026-10-10T00:00:00.000Z-0000', clock: index + 1 },
             createdAt: now, attempts: 0, status: 'pending' as const,
         }));
         await expect(adapter.push({} as H3Event, { scope: { workspaceId: key.workspaceId }, ops })).rejects.toThrow(/CLAIMED/);
@@ -362,9 +364,9 @@ describe('dormant managed storage generation coordinator', () => {
         const admission: ChatGenerationAdmissionEnvelope = {
             version: 1, kind: 'new-turn', admissionId: 'admission', generationId: 'chat-generation',
             workspaceId: key.workspaceId, threadId: 'thread', messageId: 'assistant',
-            thread: { id: 'thread', clock: 1 },
-            userMessage: { id: 'user', thread_id: 'thread', role: 'user', clock: 1, file_hashes: [hash], data: { content: 'question' } },
-            assistantMessage: { id: 'assistant', thread_id: 'thread', role: 'assistant', clock: 1, pending: true, file_hashes: null, data: { content: '' } },
+            thread: validSyncPayload("threads", 'thread', { id: 'thread', clock: 1 }),
+            userMessage: validSyncPayload("messages", 'user', { id: 'user', thread_id: 'thread', role: 'user', clock: 1, file_hashes: [hash], data: { content: 'question' } }),
+            assistantMessage: validSyncPayload("messages", 'assistant', { id: 'assistant', thread_id: 'thread', role: 'assistant', clock: 1, pending: true, file_hashes: null, data: { content: '' } }),
         };
         const adapter = new SqliteSyncGatewayAdapter();
         await expect(adapter.admitChatGeneration({ userId: 'owner', workspaceId: key.workspaceId }, admission)).rejects.toThrow(/CLAIMED/);

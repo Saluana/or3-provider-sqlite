@@ -470,7 +470,6 @@ export const PushBatchSchema = z
         ops: z.array(PendingOpSchema).max(MAX_SYNC_PUSH_BATCH_OPS),
         fileKindCapability: z.literal(FILE_KIND_CAPABILITY).optional(),
     workspaceItemCapability: z.literal(WORKSPACE_ITEM_CAPABILITY).optional(),
-    unavailableRecordCapability: z.literal(UNAVAILABLE_RECORD_CAPABILITY).optional(),
     })
     .superRefine((batch, ctx) => {
         if (syncJsonByteLength(batch) > MAX_SYNC_PUSH_BATCH_BYTES) {

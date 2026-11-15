@@ -1,5 +1,5 @@
 {
-  "source_commit": "319a4504e604bc25cc63de76f1f190f79e256711",
+  "source_commit": "87c4c4f0d95aa0f396e4fcbb1225c04e4d23ff03",
   "files": [
     {
       "path": "shared/errors/index.ts",
@@ -31,7 +31,7 @@
     },
     {
       "path": "shared/sync/prepare-sync-write.ts",
-      "sha256": "a8e5b310628e8b81e88f6cc68e34fb9a1acf347c97c968f4c647404cc6ede1cc"
+      "sha256": "7a25ef53bf3049dc4d698846ff73634b7f79a90268af391f6c52848261f61596"
     },
     {
       "path": "shared/sync/sanitize.ts",
@@ -39,7 +39,7 @@
     },
     {
       "path": "shared/sync/schemas.ts",
-      "sha256": "9fd0bd833026b988364a3773c70dd891a224cc596b900b82e7385f19fc4dc97e"
+      "sha256": "1e30063fb933efed79d29b9d55e5044825cf5106e963579b92916d3f7d303469"
     },
     {
       "path": "shared/sync/table-metadata.ts",
@@ -47,7 +47,7 @@
     },
     {
       "path": "shared/sync/types.ts",
-      "sha256": "d8df5f6ec98ce4fb7367d87f07e9f734508645c54b4075e2cb674e5ccecad257"
+      "sha256": "e57d165f7aef790e04215c8b1981bf83074755355c6f72c5107ec9f528d7c257"
     },
     {
       "path": "shared/titles/title.ts",

@@ -1,3 +1,4 @@
+import { validSyncPayload } from '../../../test/support/sync-payload';
 /**
  * Integration tests for SQLite provider wiring across store + sync adapter.
  */
@@ -56,7 +57,7 @@ describe('sqlite provider integration', () => {
                     tableName: 'threads',
                     operation: 'put',
                     pk: 'thread-1',
-                    payload: { id: 'thread-1', title: 'integration' },
+                    payload: validSyncPayload("threads", 'thread-1', { id: 'thread-1', title: 'integration' }),
                     stamp: {
                         deviceId: 'device-1',
                         opId,
@@ -132,7 +133,7 @@ describe('sqlite provider integration', () => {
             tableName: 'threads',
             operation: 'put' as const,
             pk: `thread-${index}`,
-            payload: { id: `thread-${index}`, title: `Thread ${index}` },
+            payload: validSyncPayload("threads", `thread-${index}`, { id: `thread-${index}`, title: `Thread ${index}` }),
             stamp: {
                 deviceId: 'cursor-device',
                 opId: randomUUID(),
@@ -202,7 +203,7 @@ describe('sqlite provider D1 integration', () => {
                 scope: { workspaceId },
                 ops: [{
                     id: randomUUID(), tableName: 'file_meta', operation, pk: hash,
-                    payload: operation === 'put' ? { hash, size_bytes: 17, storage_id: 'd1-object' } : undefined,
+                    payload: operation === 'put' ? validSyncPayload('file_meta',hash,{ hash, size_bytes: 17, storage_id: 'd1-object' }) : undefined,
                     stamp: { deviceId: 'd1-storage', opId: randomUUID(), clock, hlc: `${clock}000-storage` },
                     createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
                 }],
@@ -250,7 +251,7 @@ describe('sqlite provider D1 integration', () => {
             tableName: 'threads',
             operation,
             pk: 'd1-replay-thread',
-            payload: operation === 'put' ? { id: 'd1-replay-thread', title } : undefined,
+            payload: operation === 'put' ? validSyncPayload('threads','d1-replay-thread',{ id: 'd1-replay-thread', title }) : undefined,
             stamp: {
                 deviceId: 'd1-replay-device',
                 opId: randomUUID(),
@@ -341,7 +342,7 @@ describe('sqlite provider D1 integration', () => {
                     tableName: 'threads',
                     operation: 'put',
                     pk: 'd1-thread-1',
-                    payload: { id: 'd1-thread-1', title: 'D1 integration' },
+                    payload: validSyncPayload("threads", 'd1-thread-1', { id: 'd1-thread-1', title: 'D1 integration' }),
                     stamp: {
                         deviceId: 'd1-device',
                         opId,
@@ -395,7 +396,7 @@ describe('sqlite provider D1 integration', () => {
             tableName: 'threads',
             operation: 'put' as const,
             pk: `d1-version-${clock}`,
-            payload: { id: `d1-version-${clock}` },
+            payload: validSyncPayload("threads", `d1-version-${clock}`, { id: `d1-version-${clock}` }),
             stamp: {
                 deviceId: 'd1-version-device',
                 opId: randomUUID(),
@@ -465,7 +466,7 @@ describe('sqlite provider D1 integration', () => {
             tableName: 'notifications' as const,
             operation: 'put' as const,
             pk,
-            payload: { id: pk, title: pk },
+            payload: validSyncPayload('notifications',pk,{ id: pk, title: pk }),
             stamp: {
                 deviceId: `${userId}-device`,
                 opId,
@@ -500,7 +501,7 @@ describe('sqlite provider D1 integration', () => {
             tableName: 'threads' as const,
             operation: 'put' as const,
             pk: 'd1-fp',
-            payload: { id: 'd1-fp', title: 'original' },
+            payload: validSyncPayload('threads','d1-fp',{ id: 'd1-fp', title: 'original' }),
             stamp: {
                 deviceId: 'd1-fp-device',
                 opId: sharedOpId,

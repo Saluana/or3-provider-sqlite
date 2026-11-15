@@ -59,7 +59,7 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
-import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH } from '~~/shared/sync/schemas';
+import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, normalizeWirePayloadForTable } from '~~/shared/sync/schemas';
 import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { readRequestUsage } from '~~/shared/chat/compaction';
 import { matchesToolResultStorage, parseToolResultArtifact, prepareToolResultStorage, toolResultArtifactPrefix, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
@@ -1111,8 +1111,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             const prepared = records.map(entry => {
                 const opId = backgroundHistoryOpId(admission, entry.table === 'threads' ? 'thread' : entry.record.id === admission.messageId ? 'assistant' : 'user');
                 const hlc = entry.record.hlc ?? `${Date.now().toString(36).padStart(9, '0')}:000:background`;
-                return prepareSyncWrite({ tableName: entry.table, pk: entry.record.id, operation: 'put',
-                    payload: { ...sanitizePayloadForSync(entry.table, entry.record, 'put'), hlc, op_id: opId },
+                const normalized = normalizeWirePayloadForTable(entry.table, entry.record) as Record<string, unknown>;
+                const payload: Record<string, unknown> = { ...sanitizePayloadForSync(entry.table, normalized, 'put'), hlc, op_id: opId };
+                if (entry.table === 'messages' && !payload.order_key) payload.order_key = hlc;
+                return prepareSyncWrite({ tableName: entry.table, pk: entry.record.id, operation: 'put', payload,
                     stamp: { clock: entry.record.clock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
             });
             const counter = raw
@@ -1330,7 +1332,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     error: input.snapshot.error ?? null,
                 },
             };
-            const prepared = prepareSyncWrite({ tableName: 'messages', pk: admission.messageId, operation: 'put', payload,
+            const finalPayload = normalizeWirePayloadForTable('messages', payload) as Record<string, unknown>;
+            if (!finalPayload.order_key) finalPayload.order_key = hlc;
+            const prepared = prepareSyncWrite({ tableName: 'messages', pk: admission.messageId, operation: 'put', payload: finalPayload,
                 stamp: { clock: nextClock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
             const payloadJson = JSON.stringify(prepared.payload);
             const counter = raw

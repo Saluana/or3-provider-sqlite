@@ -3,6 +3,9 @@
   "compilerOptions": {
     "noImplicitAny": false,
     "paths": {
+      "~~/shared/sync/prepare-sync-write": ["./test/fixtures/sync-v1/shared/sync/prepare-sync-write.ts"],
+      "~~/shared/sync/schemas": ["./test/fixtures/sync-v1/shared/sync/schemas.ts"],
+      "~~/shared/sync/types": ["./test/fixtures/sync-v1/shared/sync/types.ts"],
       "h3": ["./node_modules/h3"],
       "~~/*": ["./src/shims/or3-chat-contract.ts"],
       "~~": ["./src/shims/or3-chat-contract.ts"],

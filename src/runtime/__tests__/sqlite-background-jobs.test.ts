@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { validSyncPayload } from '../../../test/support/sync-payload';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -130,10 +132,10 @@ describe('SQLite durable request usage', () => {
                     ...(tool ? { tools: [tool], _toolRuntime: { [tool.function.name]: 'server' } } : {}) },
                 history: JSON.parse(JSON.stringify(prepareBackgroundHistory({ version: 1, kind: 'new-turn', admissionId: ids.admissionId, generationId: ids.generationId,
                     workspaceId: execution.workspaceId, threadId: ids.threadId, messageId: ids.assistantMessageId,
-                    thread: { id: ids.threadId, clock: 1 },
-                    userMessage: { id: ids.userMessageId, clock: 1, role: 'user', thread_id: ids.threadId },
-                    assistantMessage: { id: ids.assistantMessageId, clock: 1, role: 'assistant', thread_id: ids.threadId,
-                        pending: true, data: { content: '', generation_id: ids.generationId, generation_state: 'streaming' } } },
+                    thread: validSyncPayload("threads", ids.threadId, { id: ids.threadId, clock: 1 }),
+                    userMessage: validSyncPayload("messages", ids.userMessageId, { id: ids.userMessageId, clock: 1, role: 'user', thread_id: ids.threadId }),
+                    assistantMessage: validSyncPayload("messages", ids.assistantMessageId, { id: ids.assistantMessageId, clock: 1, role: 'assistant', thread_id: ids.threadId,
+                        pending: true, data: { content: '', generation_id: ids.generationId, generation_state: 'streaming' } }) },
                     { admissionId: ids.admissionId, workspaceId: execution.workspaceId, threadId: ids.threadId,
                         messageId: ids.assistantMessageId, syncProviderId: 'sqlite' }))) },
         };
@@ -216,10 +218,10 @@ describe('SQLite durable request usage', () => {
 
     const parentHistory: ChatGenerationAdmissionEnvelope = { version: 1, kind: 'new-turn', admissionId: 'parent-admission', generationId: params.generationId,
         workspaceId: execution.workspaceId, threadId: params.threadId, messageId: params.messageId,
-        thread: { id: params.threadId, clock: 1 },
-        userMessage: { id: 'parent-user', clock: 1, role: 'user', thread_id: params.threadId },
-        assistantMessage: { id: params.messageId, clock: 1, role: 'assistant', thread_id: params.threadId,
-            pending: true, data: { generation_id: params.generationId } } };
+        thread: validSyncPayload("threads", params.threadId, { id: params.threadId, clock: 1 }),
+        userMessage: validSyncPayload("messages", 'parent-user', { id: 'parent-user', clock: 1, role: 'user', thread_id: params.threadId }),
+        assistantMessage: validSyncPayload("messages", params.messageId, { id: params.messageId, clock: 1, role: 'assistant', thread_id: params.threadId,
+            pending: true, data: { generation_id: params.generationId } }) };
 
     async function prepareCanonicalWorkspace() {
         const raw = getRawDb();
@@ -532,8 +534,8 @@ describe('SQLite durable request usage', () => {
         racing.resumeDelegationWait = async input => {
             const pushed = await sync.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                 id: 'race-op', tableName: 'threads', operation: 'put', pk: params.threadId,
-                payload: { id: params.threadId, title: 'Edited during resume' },
-                stamp: { deviceId: 'race-device', opId: 'race-op', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
+                payload: validSyncPayload("threads", params.threadId, { id: params.threadId, title: 'Edited during resume' }),
+                stamp: { deviceId: 'race-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
                 createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
             }] });
             expect(pushed.results[0]).toMatchObject({ success: true });
@@ -586,7 +588,7 @@ describe('SQLite durable request usage', () => {
         if (damage === 'deleted') {
             const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                 id: 'delete-artifact', tableName: 'kv', operation: 'delete', pk: row.id,
-                stamp: { deviceId: 'another-device', opId: 'delete-artifact', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
+                stamp: { deviceId: 'another-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
                 createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
             }] });
             expect(deleted.results[0]).toMatchObject({ success: true });
@@ -613,7 +615,7 @@ describe('SQLite durable request usage', () => {
         expect(await reconcileDelegationChild(provider, input.parentJobId, params.userId, input.leaseOwner, 0)).toBe('committed');
         const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
             id: 'delete-child', tableName: 'messages', operation: 'delete', pk: ids.assistantMessageId,
-            stamp: { deviceId: 'another-device', opId: 'delete-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            stamp: { deviceId: 'another-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
         }] });
         expect(deleted.results[0]).toMatchObject({ success: true });
@@ -650,7 +652,7 @@ describe('SQLite durable request usage', () => {
             if (deleted) {
                 const result = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                     id: 'delete-terminal-child', tableName: 'messages', operation: 'delete', pk: ids.assistantMessageId,
-                    stamp: { deviceId: 'another-device', opId: 'delete-terminal-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                    stamp: { deviceId: 'another-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
                     createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
                 }] });
                 expect(result.results[0]).toMatchObject({ success: true });
@@ -697,7 +699,7 @@ describe('SQLite durable request usage', () => {
             }
             const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                 id: 'delete-before-settlement', tableName: 'messages', operation: 'delete', pk: ids.assistantMessageId,
-                stamp: { deviceId: 'another-device', opId: 'delete-before-settlement', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                stamp: { deviceId: 'another-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
                 createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
             }] });
             expect(deleted.results[0]).toMatchObject({ success: true });
@@ -936,9 +938,9 @@ describe('SQLite durable request usage', () => {
         const oldHistory = original.history!;
         const history = { ...oldHistory, admissionId: secondIds.admissionId, generationId: secondIds.generationId,
             threadId: secondIds.threadId, messageId: secondIds.assistantMessageId,
-            thread: { ...oldHistory.thread!, id: secondIds.threadId },
-            userMessage: { ...oldHistory.userMessage!, id: secondIds.userMessageId, thread_id: secondIds.threadId },
-            assistantMessage: { ...oldHistory.assistantMessage, id: secondIds.assistantMessageId, thread_id: secondIds.threadId } };
+            thread: validSyncPayload("threads", secondIds.threadId, { ...oldHistory.thread!, id: secondIds.threadId }),
+            userMessage: validSyncPayload("messages", secondIds.userMessageId, { ...oldHistory.userMessage!, id: secondIds.userMessageId, thread_id: secondIds.threadId }),
+            assistantMessage: validSyncPayload("messages", secondIds.assistantMessageId, { ...oldHistory.assistantMessage, id: secondIds.assistantMessageId, thread_id: secondIds.threadId }) };
         const second = { ...input.child, threadId: secondIds.threadId, messageId: secondIds.assistantMessageId,
             idempotencyKey: getScopedAdmissionKey(params.userId, execution.workspaceId, secondIds.admissionId),
             generationId: secondIds.generationId, execution: { ...original, history } };
@@ -1043,9 +1045,9 @@ describe('SQLite durable request usage', () => {
             messageId: foreign.assistantMessageId, generationId: foreign.generationId,
             execution: { ...childExecution, history: { ...history, admissionId: foreign.admissionId,
                 generationId: foreign.generationId, threadId: foreign.threadId, messageId: foreign.assistantMessageId,
-                thread: { ...history.thread!, id: foreign.threadId },
-                userMessage: { ...history.userMessage!, id: foreign.userMessageId, thread_id: foreign.threadId },
-                assistantMessage: { ...history.assistantMessage, id: foreign.assistantMessageId, thread_id: foreign.threadId } } } };
+                thread: validSyncPayload("threads", foreign.threadId, { ...history.thread!, id: foreign.threadId }),
+                userMessage: validSyncPayload("messages", foreign.userMessageId, { ...history.userMessage!, id: foreign.userMessageId, thread_id: foreign.threadId }),
+                assistantMessage: validSyncPayload("messages", foreign.assistantMessageId, { ...history.assistantMessage, id: foreign.assistantMessageId, thread_id: foreign.threadId }) } } };
         getRawDb().prepare(`UPDATE background_jobs SET execution_json = json_set(execution_json,
             '$.delegationWait.children[0].admissionId', ?, '$.delegationWait.children[0].threadId', ?,
             '$.delegationWait.children[0].userMessageId', ?, '$.delegationWait.children[0].assistantMessageId', ?,
@@ -1096,9 +1098,9 @@ describe('SQLite durable request usage', () => {
         } else {
             const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                 id: 'change-parent', tableName: 'messages', operation: invalidation === 'deleted parent' ? 'delete' : 'put', pk: params.messageId,
-                ...(invalidation === 'superseded parent' ? { payload: { id: params.messageId, thread_id: params.threadId,
+                ...(invalidation === 'superseded parent' ? { payload: { index:0,order_key:'a0',deleted:false,created_at:1,updated_at:1,id: params.messageId, thread_id: params.threadId,
                     role: 'assistant', data: { generation_id: 'newer-generation', content: 'newer' } } } : {}),
-                stamp: { deviceId: 'other-device', opId: 'change-parent', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
                 createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
             }] });
             expect(deleted.results[0]).toMatchObject({ success: true });
@@ -1135,9 +1137,9 @@ describe('SQLite durable request usage', () => {
         expect(await reconcileBackgroundJobHistory(provider, (await provider.getJob(admitted.jobId, params.userId))!)).toBe('committed');
         const pushed = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
             id: 'change-parent', tableName: 'messages', operation: state === 'deleted' ? 'delete' : 'put', pk: params.messageId,
-            ...(state === 'superseded' ? { payload: { id: params.messageId, thread_id: params.threadId,
+            ...(state === 'superseded' ? { payload: { index:0,order_key:'a0',deleted:false,created_at:1,updated_at:1,id: params.messageId, thread_id: params.threadId,
                 role: 'assistant', data: { generation_id: 'newer-generation', content: 'Newer answer' } } } : {}),
-            stamp: { deviceId: 'other-device', opId: 'change-parent', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: 1, attempts: 0, status: 'pending',
         }] });
         expect(pushed.results[0]).toMatchObject({ success: true });
@@ -1188,7 +1190,7 @@ describe('SQLite durable request usage', () => {
         await provider.saveTerminalSnapshot(admitted.jobId, { status: 'complete', content: 'Saved research', reasoning: '', completedAt: Date.now() });
         const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
             id: 'delete-child', tableName: 'messages', operation: 'delete', pk: ids.assistantMessageId,
-            stamp: { deviceId: 'other-device', opId: 'delete-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: 1, attempts: 0, status: 'pending',
         }] });
         expect(deleted.results[0]).toMatchObject({ success: true });
@@ -1218,7 +1220,7 @@ describe('SQLite durable request usage', () => {
         expect(await reconcileBackgroundJobHistory(provider, (await provider.getJob(admitted.jobId, params.userId))!)).toBe('committed');
         const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
             id: 'delete-thread', tableName: 'threads', operation: 'delete', pk: params.threadId,
-            stamp: { deviceId: 'other-device', opId: 'delete-thread', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: 1, attempts: 0, status: 'pending',
         }] });
         expect(deleted.results[0]).toMatchObject({ success: true });
@@ -1237,8 +1239,8 @@ describe('SQLite durable request usage', () => {
         if (change === 'restored') {
             const restored = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                 id: 'restore-after-receipt', tableName: 'threads', operation: 'put', pk: params.threadId,
-                payload: { id: params.threadId },
-                stamp: { deviceId: 'other-device', opId: 'restore-after-receipt', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 4 },
+                payload: validSyncPayload("threads", params.threadId, { id: params.threadId }),
+                stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 4 },
                 createdAt: 1, attempts: 0, status: 'pending',
             }] });
             expect(restored.results[0]).toMatchObject({ success: true });
@@ -1270,7 +1272,7 @@ describe('SQLite durable request usage', () => {
         expect(await reconcileBackgroundJobHistory(provider, (await provider.getJob(admitted.jobId, params.userId))!)).toBe('committed');
         const deleted = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
             id: 'delete-thread', tableName: 'threads', operation: 'delete', pk: params.threadId,
-            stamp: { deviceId: 'other-device', opId: 'delete-thread', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: 1, attempts: 0, status: 'pending',
         }] });
         expect(deleted.results[0]).toMatchObject({ success: true });
@@ -1285,8 +1287,8 @@ describe('SQLite durable request usage', () => {
         vi.spyOn(adapter, 'finalizeChatGeneration').mockImplementationOnce(async (actor, request) => {
             const restored = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
                 id: 'restore-thread', tableName: 'threads', operation: 'put', pk: params.threadId,
-                payload: { id: params.threadId },
-                stamp: { deviceId: 'other-device', opId: 'restore-thread', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 4 },
+                payload: validSyncPayload("threads", params.threadId, { id: params.threadId }),
+                stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 4 },
                 createdAt: 1, attempts: 0, status: 'pending',
             }] });
             expect(restored.results[0]).toMatchObject({ success: true });
@@ -1326,12 +1328,12 @@ describe('SQLite durable request usage', () => {
         const admitted = await provider.admitDelegationChild(input);
         if (admitted.status !== 'admitted') throw new Error('Child was not admitted');
         const ops = [{ id: 'new-project', tableName: 'projects', operation: 'put', pk: 'new-project',
-            payload: { id: 'new-project', name: 'Project', data: ownership !== 'explicit' ? [params.threadId] : [] },
-            stamp: { deviceId: 'other-device', opId: 'new-project', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
+            payload: validSyncPayload("projects", 'new-project', { id: 'new-project', name: 'Project', data: ownership !== 'explicit' ? [params.threadId] : [] }),
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
             createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending' }];
         if (ownership !== 'legacy') ops.push({ id: 'move-parent', tableName: 'threads', operation: 'put', pk: params.threadId,
-            payload: { id: params.threadId, project_id: ownership === 'explicit' ? 'new-project' : 'missing-project' } as never,
-            stamp: { deviceId: 'other-device', opId: 'move-parent', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            payload: validSyncPayload('threads',params.threadId,{ id: params.threadId, project_id: ownership === 'explicit' ? 'new-project' : 'missing-project' }) as never,
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending' });
         const pushed = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: ops as never });
         expect(pushed.results).toEqual(ops.map(() => expect.objectContaining({ success: true })));
@@ -1471,10 +1473,10 @@ describe('SQLite durable request usage', () => {
         const finalize = adapter.finalizeChatGeneration.bind(adapter);
         vi.spyOn(adapter, 'finalizeChatGeneration').mockImplementationOnce(async (actor, request) => {
             const pushed = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [
-                { id: 'new-project', tableName: 'projects', operation: 'put', pk: 'new-project', payload: { id: 'new-project', name: 'Project', data: [] },
-                    stamp: { deviceId: 'other-device', opId: 'new-project', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 }, createdAt: 1, attempts: 0, status: 'pending' },
-                { id: 'move-child', tableName: 'threads', operation: 'put', pk: ids.threadId, payload: { id: ids.threadId, project_id: 'new-project' },
-                    stamp: { deviceId: 'other-device', opId: 'move-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 }, createdAt: 1, attempts: 0, status: 'pending' },
+                { id: 'new-project', tableName: 'projects', operation: 'put', pk: 'new-project', payload: validSyncPayload("projects", 'new-project', { id: 'new-project', name: 'Project', data: [] }),
+                    stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 }, createdAt: 1, attempts: 0, status: 'pending' },
+                { id: 'move-child', tableName: 'threads', operation: 'put', pk: ids.threadId, payload: validSyncPayload("threads", ids.threadId, { id: ids.threadId, project_id: 'new-project' }),
+                    stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 }, createdAt: 1, attempts: 0, status: 'pending' },
             ] });
             expect(pushed.results).toEqual([expect.objectContaining({ success: true }), expect.objectContaining({ success: true })]);
             return finalize(actor, request);
@@ -1501,8 +1503,8 @@ describe('SQLite durable request usage', () => {
         await expect(reconcileBackgroundJobHistory(interrupted, (await provider.getJob(admitted.jobId, params.userId))!))
             .rejects.toThrow('Lost job-store acknowledgement');
         const pushed = await adapter.push({} as never, { scope: { workspaceId: execution.workspaceId }, ops: [{
-            id: 'later-edit', tableName: 'threads', operation: 'put', pk: 'other-thread', payload: { id: 'other-thread' },
-            stamp: { deviceId: 'other-device', opId: 'later-edit', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
+            id: 'later-edit', tableName: 'threads', operation: 'put', pk: 'other-thread', payload: validSyncPayload("threads", 'other-thread', { id: 'other-thread' }),
+            stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
             createdAt: 1, attempts: 0, status: 'pending',
         }] });
         expect(pushed.results[0]).toMatchObject({ success: true });
@@ -1518,10 +1520,10 @@ describe('SQLite durable request usage', () => {
         if (admitted.status !== 'admitted') throw new Error('Child was not admitted');
         vi.mocked(Date.now).mockReturnValue(Date.now() + 1);
         const otherHistory: ChatGenerationAdmissionEnvelope = { ...parentHistory, admissionId: 'other-admission', generationId: 'other-generation',
-            threadId: 'other-thread', messageId: 'other-message', thread: { id: 'other-thread', clock: 1 },
-            userMessage: { id: 'other-user', clock: 1, role: 'user', thread_id: 'other-thread' },
-            assistantMessage: { id: 'other-message', clock: 1, role: 'assistant', thread_id: 'other-thread', pending: true,
-                data: { generation_id: 'other-generation' } } };
+            threadId: 'other-thread', messageId: 'other-message', thread: validSyncPayload("threads", 'other-thread', { id: 'other-thread', clock: 1 }),
+            userMessage: validSyncPayload("messages", 'other-user', { id: 'other-user', clock: 1, role: 'user', thread_id: 'other-thread' }),
+            assistantMessage: validSyncPayload("messages", 'other-message', { id: 'other-message', clock: 1, role: 'assistant', thread_id: 'other-thread', pending: true,
+                data: { generation_id: 'other-generation' } }) };
         const unrelated = await provider.createJob({ ...params, threadId: 'other-thread', messageId: 'other-message',
             generationId: 'other-generation', historyPhase: 'admission_pending', syncProviderId: 'sqlite',
             execution: { ...execution, delegationRecoveryPolicy: undefined, history: otherHistory } });
@@ -1685,8 +1687,8 @@ describe('SQLite durable request usage', () => {
             id: 'terminal-race', tableName: deleted ? 'messages' : 'threads',
             operation: deleted ? 'delete' : 'put',
             pk: deleted ? ids.assistantMessageId : 'another-thread',
-            payload: deleted ? { deleted_at: 1 } : { id: 'another-thread', title: 'Concurrent edit' },
-            stamp: { deviceId: 'race-device', opId: 'terminal-race', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+            payload: deleted ? { deleted_at: 1 } : validSyncPayload('threads','another-thread',{ id: 'another-thread', title: 'Concurrent edit' }),
+            stamp: { deviceId: 'race-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
             createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
         }] });
         expect(pushed.results[0]).toMatchObject({ success: true });
@@ -2162,9 +2164,9 @@ describe('SQLite durable request usage', () => {
                 admissionFingerprint: `sha256:v1:${'b'.repeat(64)}`,
                 admission: { body: { model: 'test-model', messages: [] }, history: { version: 1, kind: 'new-turn',
                     admissionId: 'admission', generationId: 'generation', workspaceId: execution.workspaceId,
-                    threadId: 'child', messageId: ids.assistantMessageId, thread: { id: 'child', clock: 1 },
-                    userMessage: { id: ids.userMessageId, clock: 1, role: 'user', thread_id: 'child' },
-                    assistantMessage: { id: ids.assistantMessageId, clock: 1, role: 'assistant', thread_id: 'child' } } },
+                    threadId: 'child', messageId: ids.assistantMessageId, thread: validSyncPayload("threads", 'child', { id: 'child', clock: 1 }),
+                    userMessage: validSyncPayload("messages", ids.userMessageId, { id: ids.userMessageId, clock: 1, role: 'user', thread_id: 'child' }),
+                    assistantMessage: validSyncPayload("messages", ids.assistantMessageId, { id: ids.assistantMessageId, clock: 1, role: 'assistant', thread_id: 'child' }) } },
                 request: { task: 'Research', model: 'test-model' } }],
         } };
         expect(await provider.parkDelegationWait(id, 'wrong-worker', waiting, [])).toBe(false);
