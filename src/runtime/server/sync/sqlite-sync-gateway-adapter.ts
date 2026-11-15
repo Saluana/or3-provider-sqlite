@@ -59,6 +59,7 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
+import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH } from '~~/shared/sync/schemas';
 import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { readRequestUsage } from '~~/shared/chat/compaction';
 import { matchesToolResultStorage, parseToolResultArtifact, prepareToolResultStorage, toolResultArtifactPrefix, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
@@ -153,9 +154,9 @@ function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number 
 
 function snapshotPageSelection(headerId: string, after?: SnapshotPageToken['after']): { clause: string; parameters: string[] } {
     const clause = `FROM sync_snapshot_items WHERE snapshot_id = ?${after ? `
-        AND (table_name > ? OR (table_name = ? AND pk > ?)
-             OR (table_name = ? AND pk = ? AND kind > ?))` : ''}
-        ORDER BY table_name ASC, pk ASC, kind ASC LIMIT ?`;
+        AND (table_name COLLATE BINARY > ? OR (table_name COLLATE BINARY = ? AND pk COLLATE BINARY > ?)
+             OR (table_name COLLATE BINARY = ? AND pk COLLATE BINARY = ? AND kind COLLATE BINARY > ?))` : ''}
+        ORDER BY table_name COLLATE BINARY ASC, pk COLLATE BINARY ASC, kind COLLATE BINARY ASC LIMIT ?`;
     const parameters = after
         ? [headerId, after.tableName, after.tableName, after.pk, after.tableName, after.pk, after.kind]
         : [headerId];
@@ -2440,7 +2441,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         let after: SnapshotPageToken['after'] | undefined;
 
         if (input.pageToken) {
-            if (input.pageToken.length > 4096) {
+            if (input.pageToken.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) {
                 throw createError({
                     statusCode: 400,
                     statusMessage: 'Invalid snapshot page token',
@@ -2870,7 +2871,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         let after: SnapshotPageToken['after'] | undefined;
 
         if (input.pageToken) {
-            if (input.pageToken.length > 4096) {
+            if (input.pageToken.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) {
                 throw createError({ statusCode: 400, statusMessage: 'Invalid snapshot page token' });
             }
             const token = decodeSnapshotPageToken(input.pageToken);
