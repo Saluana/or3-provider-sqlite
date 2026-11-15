@@ -1035,8 +1035,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         return readHistoryIncarnation();
     }
 
-    private async checkHistory(event: H3Event, scope: {workspaceId:string}, expected: unknown, discovery = false): Promise<string> {
-        await assertWorkspaceScopeAuthorized(event,scope.workspaceId);
+    private async checkHistory(event: H3Event, input: {scope:{workspaceId:string};historyIncarnation?:unknown;historyIncarnationCapability?:unknown}, discovery = false): Promise<string> {
+        await assertWorkspaceScopeAuthorized(event,input.scope.workspaceId);
+        const expected = input.historyIncarnation;
+        // An old host strips the new fields before reaching the provider.
+        // Keep the existing update boundary instead of an opaque 400.
+        if (expected === undefined && input.historyIncarnationCapability !== 'incarnation-v1') {
+            throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat for history recovery',
+                data: { code: 'OR3_SYNC_UPDATE_REQUIRED', requiredCapability: 'incarnation-v1' } });
+        }
         validateExpectedHistory(expected);
         const current = await readHistoryIncarnation();
         if (!discovery && expected !== current) historyChanged(current);
@@ -1917,7 +1924,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const workspaceId = scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
 
-        const historyIncarnation = await this.checkHistory(event, scope, input.historyIncarnation);
+        const historyIncarnation = await this.checkHistory(event, input);
         if (!ops.length) {
             return { results: [], serverVersion: 0, historyIncarnation };
         }
@@ -2462,7 +2469,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const db = this.db;
         const { scope, cursor, limit, tables } = input;
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
-        const historyIncarnation = await this.checkHistory(event, scope, input.historyIncarnation, true);
+        const historyIncarnation = await this.checkHistory(event, input, true);
         const fetchLimit = resolvePullLimit(limit);
 
         const minLog = await db
@@ -2567,7 +2574,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     async retainUnavailableRecord(event: H3Event, input: { scope: {workspaceId:string}; source:'pull'|'snapshot'; historyIncarnation?:string; record:unknown; marker:Omit<PullUnavailableRecord,'evidenceRef'> | Omit<SnapshotUnavailableRecord,'evidenceRef'> }): Promise<{ evidenceRef: string }> {
         await assertWorkspaceScopeAuthorized(event,input.scope.workspaceId);
-        const historyIncarnation = await this.checkHistory(event,input.scope,input.historyIncarnation);
+        const historyIncarnation = await this.checkHistory(event,input);
         const marker = input.marker;
         assertCoverageKey(marker.tableName,marker.pk);
         let source: EvidenceSource;
@@ -2627,7 +2634,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     ): Promise<SnapshotResponse> {
         const workspaceId = input.scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
-        const historyIncarnation = await this.checkHistory(event,input.scope,input.historyIncarnation,
+        const historyIncarnation = await this.checkHistory(event,input,
             input.historyIncarnation === null && !input.pageToken);
         if (input.pageToken && decodeSnapshotPageToken(input.pageToken).historyIncarnation !== historyIncarnation) historyChanged(historyIncarnation);
         const pageSize = resolveSnapshotPageSize(input.pageSize);
@@ -2863,7 +2870,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     ): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
         const now = nowEpoch();
-        const historyIncarnation = await this.checkHistory(event,input.scope,input.historyIncarnation);
+        const historyIncarnation = await this.checkHistory(event,input);
         const deviceId = input.deviceId.trim();
         if (!deviceId || deviceId.length > 256) {
             throw createError({ statusCode: 400, statusMessage: 'Invalid device cursor' });

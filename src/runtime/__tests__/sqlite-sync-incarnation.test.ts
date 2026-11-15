@@ -74,9 +74,20 @@ describe.each(['native','d1'])('%s history incarnation',driver=>{
         const page=await adapter.snapshot(event,{scope,pageSize:1,historyIncarnation:null});
         expect(page).toMatchObject({historyIncarnation:history,highWatermark:0,items:[]});
         expect(await adapter.pull(event,{scope,limit:100,cursor:0,historyIncarnation:null})).toMatchObject({historyIncarnation:history,requiresSnapshot:true,nextCursor:0});
-        await expect(adapter.push(event,{scope,ops:[]})).rejects.toMatchObject({statusCode:400});
-        await expect(adapter.pull(event,{scope,limit:100,cursor:0})).rejects.toMatchObject({statusCode:400});
-        await expect(adapter.snapshot(event,{scope,pageSize:1})).rejects.toMatchObject({statusCode:400});
+        await expect(adapter.push(event,{scope,ops:[],historyIncarnationCapability:'incarnation-v1'})).rejects.toMatchObject({statusCode:400});
+        await expect(adapter.pull(event,{scope,limit:100,cursor:0,historyIncarnationCapability:'incarnation-v1'})).rejects.toMatchObject({statusCode:400});
+        await expect(adapter.snapshot(event,{scope,pageSize:1,historyIncarnationCapability:'incarnation-v1'})).rejects.toMatchObject({statusCode:400});
+    });
+    it('gives a legacy host an explicit update boundary before history dispatch',async()=>{
+        const required={statusCode:426,data:{code:'OR3_SYNC_UPDATE_REQUIRED',requiredCapability:'incarnation-v1'}};
+        await expect(adapter.pull(event,{scope,cursor:0,limit:100})).rejects.toMatchObject(required);
+        await expect(adapter.snapshot(event,{scope,pageSize:1})).rejects.toMatchObject(required);
+        await expect(adapter.push(event,{scope,ops:[op('legacy')]})).rejects.toMatchObject(required);
+        await expect(adapter.updateCursor(event,{scope,deviceId:'legacy',version:0})).rejects.toMatchObject(required);
+        for(const table of ['sync_snapshots','sync_snapshot_items','device_cursors','change_log','server_version_counter']) {
+            expect(await rows(`SELECT * FROM ${table}`)).toEqual([]);
+        }
+        expect(await adapter.getHistoryIncarnation(event,scope)).toBe(history);
     });
     it.each(['request','token'])('rejects stale snapshot %s before serving an archived session',async stale=>{
         await adapter.push(event,{scope,historyIncarnation:history,ops:[op('a'),op('b')]});
@@ -97,7 +108,7 @@ describe.each(['native','d1'])('%s history incarnation',driver=>{
         const last=await adapter.backupSnapshot(event,{scope,pageSize:1,tables:['kv'],pageToken:first.nextPageToken!});
         expect(last).toMatchObject({historyIncarnation:history,snapshotId:first.snapshotId,highWatermark:2,items:[{pk:'b'}],nextPageToken:null});
         // Internal discovery must not weaken the browser snapshot requirement.
-        await expect(adapter.snapshot(event,{scope,pageSize:1})).rejects.toMatchObject({statusCode:400});
+        await expect(adapter.snapshot(event,{scope,pageSize:1,historyIncarnationCapability:'incarnation-v1'})).rejects.toMatchObject({statusCode:400});
         const legacy=JSON.parse(Buffer.from(first.nextPageToken!,'base64url').toString('utf8'));
         delete legacy.historyIncarnation;
         await expect(adapter.backupSnapshot(event,{scope,pageSize:1,pageToken:Buffer.from(JSON.stringify(legacy)).toString('base64url')})).rejects.toMatchObject({statusCode:409});
