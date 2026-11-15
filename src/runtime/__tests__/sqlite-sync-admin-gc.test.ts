@@ -1,3 +1,4 @@
+import { validSyncPayload } from '../../../test/support/sync-payload';
 /**
  * Tests for the SQLite sync admin GC actions and maintenance state.
  *
@@ -30,7 +31,7 @@ function makeOp(overrides: Partial<PendingOp> & { tableName: string; pk: string 
         tableName: overrides.tableName,
         operation: overrides.operation ?? 'put',
         pk: overrides.pk,
-        payload: overrides.payload ?? { id: overrides.pk, title: 'test' },
+        payload: validSyncPayload(overrides.tableName, overrides.pk, overrides.payload ?? { id: overrides.pk, title: 'test' }),
         stamp: {
             deviceId: overrides.stamp?.deviceId ?? 'device-a',
             opId: overrides.stamp?.opId ?? randomUUID(),
@@ -90,6 +91,7 @@ describe('SQLite sync admin GC', () => {
         } as never);
 
         expect(status.actions.map((action) => action.id)).toEqual([
+            'sync.evidence-inspect','sync.evidence-export','sync.evidence-revalidate','sync.evidence-repair',
             'sync.gc-change-log',
             'sync.gc-tombstones',
         ]);

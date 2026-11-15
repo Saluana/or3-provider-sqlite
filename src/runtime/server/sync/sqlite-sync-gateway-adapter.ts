@@ -43,6 +43,8 @@ import {
 } from '~~/shared/chat/background-history';
 import type {
     PendingOp,
+    PullUnavailableRecord,
+    SnapshotUnavailableRecord,
     PullRequest,
     PullResponse,
     PushBatch,
@@ -59,7 +61,8 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
-import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, normalizeWirePayloadForTable } from '~~/shared/sync/schemas';
+import { boundedSyncPayload, notificationOwnerSql, syncRows, retainSqlEvidence, unknownNotificationEvidence, type EvidenceSource } from './unavailable-records';
+import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, SyncChangeSchema, SnapshotItemSchema, TABLE_PAYLOAD_SCHEMAS, isLosslessSyncIdentifier, PullResponseSchema, SnapshotResponseSchema, compareSyncTuple, normalizeWirePayloadForTable } from '~~/shared/sync/schemas';
 import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { readRequestUsage } from '~~/shared/chat/compaction';
 import { matchesToolResultStorage, parseToolResultArtifact, prepareToolResultStorage, toolResultArtifactPrefix, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
@@ -139,12 +142,12 @@ type PayloadSizeRow = { payload_bytes: number };
 
 // Read only a bounded amount of payload data across the database boundary.
 // Size metadata can cover the full row limit without transferring the payloads.
-// The first row is always admitted so even an oversized legacy row progresses.
+// Oversized rows consume a marker allowance; their payload never crosses into JS.
 function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number {
     let count = 0;
     let bytes = 0;
     for (const row of sizes.slice(0, limit)) {
-        const size = Math.max(0, Number(row.payload_bytes) || 0);
+        const size = row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES ? 1024 : Math.max(0, Number(row.payload_bytes) || 0);
         if (count && bytes + size > MAX_SYNC_PAGE_BYTES) break;
         count++;
         bytes += size;
@@ -154,11 +157,10 @@ function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number 
 
 function snapshotPageSelection(headerId: string, after?: SnapshotPageToken['after']): { clause: string; parameters: string[] } {
     const clause = `FROM sync_snapshot_items WHERE snapshot_id = ?${after ? `
-        AND (table_name COLLATE BINARY > ? OR (table_name COLLATE BINARY = ? AND pk COLLATE BINARY > ?)
-             OR (table_name COLLATE BINARY = ? AND pk COLLATE BINARY = ? AND kind COLLATE BINARY > ?))` : ''}
+        AND (table_name COLLATE BINARY, pk COLLATE BINARY, kind COLLATE BINARY) > (?, ?, ?)` : ''}
         ORDER BY table_name COLLATE BINARY ASC, pk COLLATE BINARY ASC, kind COLLATE BINARY ASC LIMIT ?`;
     const parameters = after
-        ? [headerId, after.tableName, after.tableName, after.pk, after.tableName, after.pk, after.kind]
+        ? [headerId, after.tableName, after.pk, after.kind]
         : [headerId];
     return { clause, parameters };
 }
@@ -168,41 +170,101 @@ type SnapshotItemRow = {
     pk: string;
     kind: SnapshotKind;
     payload_json: string | null;
-    intent_fingerprint?: string | null;
     clock: number;
     hlc: string;
     op_id: string;
     server_deleted_at: number | null;
+    payload_bytes?: number;
+    pk_hex?: string;
+    table_hex?: string;
+    notification_owner?: string | null;
 };
 
-// Include the continuation token and response envelope in the byte budget.
-// A single oversized item must still make progress rather than loop forever.
-function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRow[], pageSize: number, availableRows: number): SnapshotResponse {
+function assertCoverageKey(table: string, pk: string, pkHex?: string, tableHex?: string): void {
+    if (typeof table !== 'string' || !table || typeof pk !== 'string' || !pk ||
+        !isLosslessSyncIdentifier(table) || !isLosslessSyncIdentifier(pk) ||
+        (pkHex !== undefined && Buffer.from(pk).toString('hex').toUpperCase() !== pkHex) ||
+        (tableHex !== undefined && Buffer.from(table).toString('hex').toUpperCase() !== tableHex)) {
+        throw new Error('Untrustworthy sync coverage identity');
+    }
+}
+function validReadPayload(table: string, pk: string, payload: unknown, clock: number, hlc?: string, opId?: string): boolean {
+    if (!Object.hasOwn(TABLE_PAYLOAD_SCHEMAS, table)) return false;
+    const normalized = normalizeWirePayloadForTable(table, payload);
+    // Old messages derive ordering from the revision HLC. Validate that view
+    // without changing original wire bytes or persisted receipt content.
+    const validationPayload = table === 'messages' && normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+        ? { ...normalized, order_key: (normalized as Record<string, unknown>).order_key || hlc }
+        : normalized;
+    if (!TABLE_PAYLOAD_SCHEMAS[table]!.safeParse(validationPayload).success) return false;
+    const row = normalized as Record<string, unknown>;
+    for (const key of ['id','hash','thread_id','project_id','user_id','document_id','root_thread_id','summary_message_id']) {
+        if (typeof row[key] === 'string' && !isLosslessSyncIdentifier(row[key])) return false;
+    }
+    return row[table === 'file_meta' ? 'hash' : 'id'] === pk && row.clock === clock &&
+        (hlc === undefined || row.hlc === undefined || row.hlc === hlc) &&
+        (opId === undefined || row.op_id === undefined || row.op_id === opId);
+}
+function snapshotEvidence(header: SnapshotHeaderRow, row: SnapshotItemRow): EvidenceSource {
+    return { workspaceId: header.workspace_id, source: 'snapshot', locator: JSON.stringify([row.table_name, row.pk]),
+        revision: JSON.stringify([row.kind, row.clock, row.hlc, row.op_id]), table: 'sync_snapshot_items',
+        where: 'snapshot_id = ? AND table_name = ? AND pk = ? AND kind = ?',
+        parameters: [header.id, row.table_name, row.pk, row.kind], payload: 'coalesce(source_payload_json,payload_json)',
+        metadata: "json_object('snapshot_id',snapshot_id,'table_name',table_name,'pk',pk,'kind',kind,'clock',clock,'hlc',hlc,'op_id',op_id,'server_deleted_at',server_deleted_at)" };
+}
+async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRow[], pageSize: number,
+    availableRows: number, after?: SnapshotPageToken['after'], userId?: string): Promise<SnapshotResponse> {
+    if (!Number.isSafeInteger(header.high_watermark) || header.high_watermark < 0) throw new Error('Untrustworthy snapshot watermark');
     const items: SnapshotItem[] = [];
-    let itemBytes = 0;
+    const unavailable: NonNullable<SnapshotResponse['unavailable']> = [];
     let scanned = 0;
+    let itemBytes = 0;
     let token: string | null = null;
+    let previous = after ? [after.tableName, after.pk, after.kind] : undefined;
     for (const row of rows.slice(0, pageSize)) {
-        const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
-        const item: SnapshotItem = row.kind === 'row'
-            ? { kind: 'row', tableName: row.table_name, pk: row.pk,
-                payload: JSON.parse(row.payload_json ?? 'null') as unknown, revision }
-            : { kind: 'tombstone', tableName: row.table_name, pk: row.pk,
-                revision, serverDeletedAt: row.server_deleted_at ?? 0 };
+        assertCoverageKey(row.table_name, row.pk, row.pk_hex, row.table_hex);
+        const key = [row.table_name, row.pk, row.kind];
+        if (!['row', 'tombstone'].includes(row.kind) || previous &&
+            (compareSyncTuple(previous, key) >= 0 || compareSyncTuple(previous.slice(0,2),key.slice(0,2)) === 0)) {
+            throw new Error('Untrustworthy snapshot ordering');
+        }
+        let item: SnapshotItem | undefined;
+        let reason = row.payload_bytes! > MAX_SYNC_PAYLOAD_BYTES ? 'payload_oversized' : 'invalid_record';
+        if (reason !== 'payload_oversized') {
+            try {
+                const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
+                const candidate = row.kind === 'row'
+                    ? { kind: 'row' as const, tableName: row.table_name, pk: row.pk, payload: JSON.parse(row.payload_json ?? 'null'), revision }
+                    : { kind: 'tombstone' as const, tableName: row.table_name, pk: row.pk, revision, serverDeletedAt: row.server_deleted_at };
+                if (SnapshotItemSchema.safeParse(candidate).success && Number.isSafeInteger(row.clock) &&
+                    (row.kind === 'row' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc,row.op_id) : ALLOWED_SYNC_TABLES.includes(row.table_name))) item = candidate as SnapshotItem;
+            } catch { reason = 'invalid_json'; }
+        }
+        const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.kind,
+            snapshotId: header.id, highWatermark: header.high_watermark, evidenceRef: '', reason };
         const next = encodeSnapshotPageToken({ version: 1, snapshotId: header.id,
             after: { tableName: row.table_name, pk: row.pk, kind: row.kind } });
-        const bytes = jsonBytes(item) + (items.length ? 1 : 0);
-        const envelope = jsonBytes({ workspaceId: header.workspace_id, snapshotId: header.id,
-            highWatermark: header.high_watermark, items: [], nextPageToken: next });
-        if (items.length && envelope + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) break;
-        items.push(item);
+        const visible = row.table_name !== 'notifications' || row.kind === 'tombstone' || !!row.notification_owner && row.notification_owner === userId;
+        const bytes = visible ? jsonBytes(item ?? {...marker,evidenceRef:'x'.repeat(36)}) + ((item ? items.length : unavailable.length) ? 1 : 0) : 0;
+        const envelopeBytes = jsonBytes({workspaceId:header.workspace_id,snapshotId:header.id,highWatermark:header.high_watermark,
+            items:[],unavailable:[],nextPageToken:next});
+        if (envelopeBytes + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) {
+            if (!scanned) throw new Error('Sync identity exceeds page byte budget');
+            break;
+        }
+        if (item && visible) items.push(item);
+        else if (!item) {
+            marker.evidenceRef = await retainSqlEvidence(snapshotEvidence(header,row), reason);
+            if (visible) unavailable.push(marker);
+        }
         itemBytes += bytes;
-        scanned++;
-        token = next;
+        scanned++; token = next; previous = key;
     }
-    return { workspaceId: header.workspace_id, snapshotId: header.id,
-        highWatermark: header.high_watermark, items,
-        nextPageToken: availableRows > scanned ? token : null };
+    const [retained] = await syncRows<{expires_at:number}>('SELECT expires_at FROM sync_snapshots WHERE id = ?',header.id);
+    if (!retained || retained.expires_at <= nowEpoch()) throw createError({statusCode:410,statusMessage:'Snapshot expired or unavailable'});
+    return SnapshotResponseSchema.parse({ workspaceId: header.workspace_id, snapshotId: header.id,
+        highWatermark: header.high_watermark, items, ...(unavailable.length ? { unavailable } : {}),
+        nextPageToken: availableRows > scanned ? token : null });
 }
 
 type HookEmission = {
@@ -333,15 +395,6 @@ function notificationPayloadUserId(payload: unknown): string | undefined {
     return typeof userId === 'string' && userId.trim().length > 0 ? userId : undefined;
 }
 
-function isNotificationVisibleToUser(
-    change: { tableName: string; payload?: unknown },
-    userId: string | undefined
-): boolean {
-    if (change.tableName !== 'notifications') return true;
-    if (!userId) return false;
-    return notificationPayloadUserId(change.payload) === userId;
-}
-
 function scopeNotificationWrite(
     op: PendingOp,
     userId: string | undefined
@@ -431,7 +484,7 @@ function snapshotNotificationOwnerClause(
     if (tableName !== 'notifications') return { sql: '', params: [] };
     if (!userId) return { sql: ' AND 1 = 0', params: [] };
     return {
-        sql: ` AND json_extract(${jsonExpr}, '$.user_id') = ?`,
+        sql: ` AND ${notificationOwnerSql(jsonExpr)} = ?`,
         params: [userId],
     };
 }
@@ -546,6 +599,7 @@ function encodeSnapshotPageToken(token: SnapshotPageToken): string {
 
 function decodeSnapshotPageToken(value: string): SnapshotPageToken {
     try {
+        if (value.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) throw new Error('Token exceeds ceiling');
         const parsed = JSON.parse(
             Buffer.from(value, 'base64url').toString('utf8')
         ) as Partial<SnapshotPageToken>;
@@ -561,6 +615,7 @@ function decodeSnapshotPageToken(value: string): SnapshotPageToken {
         ) {
             throw new Error('Invalid token payload');
         }
+        assertCoverageKey(after.tableName,after.pk);
         return parsed as SnapshotPageToken;
     } catch {
         throw createError({
@@ -1950,7 +2005,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         pk: string;
                         op: string;
                         payload_json: string | null;
-    intent_fingerprint?: string | null;
+                        intent_fingerprint?: string | null;
                         clock: number;
                         hlc: string;
                         device_id: string;
@@ -2368,6 +2423,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             .select('value')
             .where('workspace_id', '=', scope.workspaceId)
             .executeTakeFirst();
+        if (!Number.isSafeInteger(counter?.value ?? 0) || (counter?.value ?? 0) < 0 ||
+            minLog && (!Number.isSafeInteger(minLog.server_version) || minLog.server_version <= 0)) throw new Error('Untrustworthy sync retention version');
         const retention = computePullRetention({
             cursor,
             oldestLogVersion: minLog?.server_version ?? null,
@@ -2387,34 +2444,102 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             query = query.where('table_name', 'in', tables);
         }
 
-        const sizes = await query.select(sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes'))
+        const sizes = await query.select(['server_version',sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes')])
             .limit(fetchLimit + 1).execute();
+        // Validate the lookahead too: a duplicate at the boundary would otherwise
+        // disappear behind nextCursor on the following request.
+        let previousVersion = cursor;
+        for (const row of sizes) {
+            if (!Number.isSafeInteger(row.server_version) || row.server_version <= previousVersion || row.server_version > (counter?.value ?? 0)) {
+                throw new Error('Untrustworthy sync server version');
+            }
+            previousVersion = row.server_version;
+        }
         const selected = boundedPayloadRowCount(sizes, fetchLimit);
-        const rows = selected ? await query.selectAll().limit(selected).execute() : [];
+        const rows = selected ? await query.select(['id','server_version','table_name','pk','op','clock','hlc','device_id','op_id',
+            sql<string | null>`${sql.raw(boundedSyncPayload('payload_json'))}`.as('payload_json'),
+            sql<number>`coalesce(length(cast(payload_json AS blob)),0)`.as('payload_bytes'),
+            sql<string>`hex(cast(pk AS blob))`.as('pk_hex'), sql<string>`hex(cast(table_name AS blob))`.as('table_hex'),
+            sql<string | null>`${sql.raw(`CASE WHEN table_name = 'notifications' THEN ${notificationOwnerSql('payload_json')} END`)}`.as('notification_owner'),
+        ]).limit(selected).execute() : [];
 
         const changes: SyncChange[] = [];
-        let itemBytes = 0;
+        const unavailable: NonNullable<PullResponse['unavailable']> = [];
         let scanned = 0;
+        let itemBytes = 0;
         let nextCursor = cursor;
-        for (const row of rows.slice(0, fetchLimit)) {
-            const change: SyncChange = {
-                serverVersion: row.server_version, tableName: row.table_name, pk: row.pk,
-                op: row.op as 'put' | 'delete',
-                payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
-                stamp: { clock: row.clock, hlc: row.hlc, deviceId: row.device_id, opId: row.op_id },
-            };
-            if (isNotificationVisibleToUser(change, resolveSessionUserId(event))) {
-                const bytes = jsonBytes(change) + (changes.length ? 1 : 0);
-                // Account for the actual JSON envelope and a continuation flag.
-                const envelope = jsonBytes({ changes: [], nextCursor: row.server_version, hasMore: false, ...retention });
-                if (changes.length && envelope + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) break;
-                changes.push(change);
-                itemBytes += bytes;
+        for (const row of rows) {
+            if (!Number.isSafeInteger(row.server_version) || row.server_version <= nextCursor || row.server_version > (counter?.value ?? 0)) {
+                throw new Error('Untrustworthy sync server version');
             }
-            scanned++;
-            nextCursor = row.server_version;
+            assertCoverageKey(row.table_name, row.pk, row.pk_hex, row.table_hex);
+            if (row.op !== 'put' && row.op !== 'delete') throw new Error('Untrustworthy sync operation kind');
+            const visible = row.table_name !== 'notifications' || !!row.notification_owner && row.notification_owner === resolveSessionUserId(event);
+            let change: SyncChange | undefined;
+            let reason = row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES ? 'payload_oversized' : 'invalid_record';
+            if (reason !== 'payload_oversized') {
+                try {
+                    const candidate = { serverVersion: row.server_version, tableName: row.table_name, pk: row.pk, op: row.op as 'put' | 'delete',
+                        payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
+                        stamp: { clock: row.clock, hlc: row.hlc, deviceId: row.device_id, opId: row.op_id } };
+                    if (SyncChangeSchema.safeParse(candidate).success && Number.isSafeInteger(row.clock) &&
+                        (row.op === 'put' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc,row.op_id) : ALLOWED_SYNC_TABLES.includes(row.table_name))) change = candidate;
+                } catch { reason = 'invalid_json'; }
+            }
+            const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.op as 'put' | 'delete',
+                serverVersion: row.server_version, evidenceRef: '', reason };
+            const bytes = visible ? jsonBytes(change ?? {...marker,evidenceRef:'x'.repeat(36)}) + ((change ? changes.length : unavailable.length) ? 1 : 0) : 0;
+            const envelopeBytes = jsonBytes({changes:[],unavailable:[],nextCursor:row.server_version,hasMore:false,...retention});
+            if (envelopeBytes + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) {
+                if (!scanned) throw new Error('Sync identity exceeds page byte budget');
+                break;
+            }
+            if (!change) {
+                marker.evidenceRef = await retainSqlEvidence({ workspaceId: scope.workspaceId, source: 'pull',
+                    locator: row.id, revision: String(row.server_version), table: 'change_log', where: 'workspace_id = ? AND id = ? AND server_version = ?',
+                    parameters: [scope.workspaceId, row.id, row.server_version], payload: 'payload_json',
+                    metadata: "json_object('id',id,'table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version,'created_at',created_at)" }, reason);
+                if (visible) unavailable.push(marker);
+            } else if (visible) changes.push(change);
+            itemBytes += bytes;
+            scanned++; nextCursor = row.server_version;
         }
-        return { changes, nextCursor, hasMore: sizes.length > scanned, ...retention };
+        return PullResponseSchema.parse({ changes, ...(unavailable.length ? { unavailable } : {}),
+            nextCursor, hasMore: sizes.length > scanned, ...retention });
+    }
+
+    async retainUnavailableRecord(event: H3Event, input: { scope: {workspaceId:string}; source:'pull'|'snapshot'; record:unknown; marker:Omit<PullUnavailableRecord,'evidenceRef'> | Omit<SnapshotUnavailableRecord,'evidenceRef'> }): Promise<{ evidenceRef: string }> {
+        await assertWorkspaceScopeAuthorized(event,input.scope.workspaceId);
+        const marker = input.marker;
+        assertCoverageKey(marker.tableName,marker.pk);
+        let source: EvidenceSource;
+        let record: unknown;
+        if (input.source === 'pull' && 'serverVersion' in marker) {
+            const [row] = await syncRows<{id:string;table_name:string;pk:string;op:string;clock:number;hlc:string;device_id:string;op_id:string;payload_json:string|null;owner:string|null}>(
+                `SELECT id,table_name,pk,op,clock,hlc,device_id,op_id,${boundedSyncPayload('payload_json')} AS payload_json,
+                ${notificationOwnerSql('payload_json')} AS owner FROM change_log WHERE workspace_id = ? AND server_version = ?`,input.scope.workspaceId,marker.serverVersion);
+            if (!row || row.table_name !== marker.tableName || row.pk !== marker.pk || row.op !== marker.originalKind ||
+                row.table_name === 'notifications' && (!row.owner || row.owner !== resolveSessionUserId(event))) throw new Error('Evidence source identity or visibility mismatch');
+            record = {serverVersion:marker.serverVersion,tableName:row.table_name,pk:row.pk,op:row.op,
+                payload:row.payload_json ? JSON.parse(row.payload_json) : undefined,stamp:{clock:row.clock,hlc:row.hlc,deviceId:row.device_id,opId:row.op_id}};
+            source = {workspaceId:input.scope.workspaceId,source:'pull',locator:row.id,revision:String(marker.serverVersion),table:'change_log',
+                where:'workspace_id = ? AND id = ? AND server_version = ?',parameters:[input.scope.workspaceId,row.id,marker.serverVersion],payload:'payload_json',
+                metadata:"json_object('id',id,'table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version)"};
+        } else if (input.source === 'snapshot' && 'snapshotId' in marker) {
+            const [header] = await syncRows<SnapshotHeaderRow>('SELECT * FROM sync_snapshots WHERE workspace_id = ? AND id = ?',input.scope.workspaceId,marker.snapshotId);
+            if (!header || header.expires_at <= nowEpoch() || header.high_watermark !== marker.highWatermark) throw new Error('Evidence snapshot unavailable');
+            assertSnapshotOwner(header.id,resolveSessionUserId(event));
+            const [row] = await syncRows<SnapshotItemRow>(`SELECT table_name,pk,kind,${boundedSyncPayload('payload_json')} AS payload_json,clock,hlc,op_id,server_deleted_at
+                FROM sync_snapshot_items WHERE snapshot_id = ? AND table_name = ? AND pk = ? AND kind = ?`,header.id,marker.tableName,marker.pk,marker.originalKind);
+            if (!row) throw new Error('Evidence snapshot source unavailable');
+            const payload = row.payload_json ? JSON.parse(row.payload_json) : undefined;
+            if (row.table_name === 'notifications' && row.kind === 'row' && notificationPayloadUserId(payload) !== resolveSessionUserId(event)) throw new Error('Evidence notification visibility mismatch');
+            record = {kind:row.kind,tableName:row.table_name,pk:row.pk,revision:{clock:row.clock,hlc:row.hlc,opId:row.op_id},
+                ...(row.kind === 'row' ? {payload} : {serverDeletedAt:row.server_deleted_at})};
+            source = snapshotEvidence(header,row);
+        } else throw new Error('Evidence source mismatch');
+        if (stableJson(record) !== stableJson(input.record)) throw new Error('Evidence source record mismatch');
+        return { evidenceRef: await retainSqlEvidence(source,'reader_invalid') };
     }
 
     async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
@@ -2528,6 +2653,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     expiresAt
                 );
 
+                if (tables.includes('notifications')) {
+                    const evidence = unknownNotificationEvidence(workspaceId);
+                    raw.prepare(evidence.sql).run(...evidence.parameters ?? []);
+                }
                 for (const tableName of tables) {
                     const materializedTable = SYNCED_TABLE_MAP[tableName];
                     if (!materializedTable) {
@@ -2567,11 +2696,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     raw.prepare(`
                         INSERT INTO sync_snapshot_items (
                             snapshot_id, table_name, pk, kind, payload_json,
-                            clock, hlc, op_id, server_deleted_at
+                            clock, hlc, op_id, server_deleted_at, source_payload_json
                         )
                         SELECT
                             ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
-                            ${retainedFiles && tableName === 'file_meta' ? "json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.updated_at', materialized.updated_at)" : 'NULL'},
+                            ${retainedFiles && tableName === 'file_meta' ? "CASE WHEN length(cast(materialized.data_json AS blob)) <= 262144 AND json_valid(materialized.data_json) THEN json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.op_id', materialized.op_id, '$.updated_at', materialized.updated_at) ELSE materialized.data_json END" : 'NULL'},
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc
@@ -2593,7 +2722,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                                 materialized.updated_at,
                                 materialized.created_at,
                                 0
-                            ))
+                            )),
+                            ${retainedFiles && tableName === 'file_meta' ? 'materialized.data_json' : 'NULL'}
                         FROM "${materializedTable}" AS materialized
                         WHERE materialized.workspace_id = ? AND materialized.deleted <> 0${deletedOwner.sql}
                     `).run(snapshotId, tableName, tableName, workspaceId, ...deletedOwner.params);
@@ -2645,9 +2775,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const sizes = raw.prepare(`SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes ${selection.clause}`)
             .all(...selection.parameters, pageSize + 1) as PayloadSizeRow[];
         const selected = boundedPayloadRowCount(sizes, pageSize);
-        const rows = selected ? raw.prepare(`SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at ${selection.clause}`)
+        const rows = selected ? raw.prepare(`SELECT table_name, pk, kind, ${boundedSyncPayload('payload_json')} AS payload_json, length(cast(payload_json AS blob)) AS payload_bytes, hex(cast(pk AS blob)) AS pk_hex, hex(cast(table_name AS blob)) AS table_hex, CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner, clock, hlc, op_id, server_deleted_at ${selection.clause}`)
             .all(...selection.parameters, selected) as SnapshotItemRow[] : [];
-        return buildSnapshotPage(header, rows, pageSize, sizes.length);
+        return buildSnapshotPage(header, rows, pageSize, sizes.length, after, snapshotUserId);
     }
 
     async updateCursor(
@@ -2943,6 +3073,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     ],
                 },
             ];
+            if (tables.includes('notifications')) statements.push(unknownNotificationEvidence(workspaceId));
             for (const tableName of tables) {
                 const materializedTable = SYNCED_TABLE_MAP[tableName];
                 if (!materializedTable) {
@@ -2981,11 +3112,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     {
                         sql: `INSERT INTO sync_snapshot_items (
                             snapshot_id, table_name, pk, kind, payload_json,
-                            clock, hlc, op_id, server_deleted_at
+                            clock, hlc, op_id, server_deleted_at, source_payload_json
                         )
                         SELECT
                             ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
-                            ${retainedFiles && tableName === 'file_meta' ? "json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.updated_at', materialized.updated_at)" : 'NULL'},
+                            ${retainedFiles && tableName === 'file_meta' ? "CASE WHEN length(cast(materialized.data_json AS blob)) <= 262144 AND json_valid(materialized.data_json) THEN json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.op_id', materialized.op_id, '$.updated_at', materialized.updated_at) ELSE materialized.data_json END" : 'NULL'},
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc
@@ -3007,7 +3138,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                                 materialized.updated_at,
                                 materialized.created_at,
                                 0
-                            ))
+                            )),
+                            ${retainedFiles && tableName === 'file_meta' ? 'materialized.data_json' : 'NULL'}
                         FROM "${materializedTable}" AS materialized
                         WHERE materialized.workspace_id = ? AND materialized.deleted <> 0${deletedOwner.sql}`,
                         parameters: [
@@ -3062,7 +3194,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         );
         const selected = boundedPayloadRowCount(sizes, pageSize);
         const rows = selected ? await d1All<SnapshotItemRow>(
-            `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at ${selection.clause}`,
+            `SELECT table_name, pk, kind, ${boundedSyncPayload('payload_json')} AS payload_json, length(cast(payload_json AS blob)) AS payload_bytes, hex(cast(pk AS blob)) AS pk_hex, hex(cast(table_name AS blob)) AS table_hex, CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner, clock, hlc, op_id, server_deleted_at ${selection.clause}`,
             ...selection.parameters, selected
         ) : [];
         // Captures and maintenance can evict a snapshot between these awaited
@@ -3073,7 +3205,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (!retained || retained.expires_at <= nowEpoch()) {
             throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
         }
-        return buildSnapshotPage(header, rows, pageSize, sizes.length);
+        return buildSnapshotPage(header, rows, pageSize, sizes.length, after, snapshotUserId);
     }
 
     private async updateCursorInD1(
@@ -3151,7 +3283,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 pk: string;
                 op: string;
                 payload_json: string | null;
-    intent_fingerprint?: string | null;
+                intent_fingerprint?: string | null;
                 clock: number;
                 hlc: string;
                 device_id: string;

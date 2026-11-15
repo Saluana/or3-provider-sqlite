@@ -1,3 +1,4 @@
+import { validSyncPayload } from '../../../test/support/sync-payload';
 /**
  * Unit tests for SqliteSyncGatewayAdapter.
  *
@@ -61,7 +62,7 @@ function makeOp(overrides: Partial<PendingOp> & { tableName: string; pk: string 
         tableName: overrides.tableName,
         operation: overrides.operation ?? 'put',
         pk: overrides.pk,
-        payload: overrides.payload ?? { id: overrides.pk, title: 'test' },
+        payload: validSyncPayload(overrides.tableName, overrides.pk, overrides.payload ?? { id: overrides.pk, title: 'test' }),
         stamp: {
             deviceId: overrides.stamp?.deviceId ?? DEVICE_A,
             opId: overrides.stamp?.opId ?? randomUUID(),
@@ -257,8 +258,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                 const measured = attachRequestUsage(prefix, { prompt_tokens: 300, completion_tokens: 20 }, { requestId: 'roundtrip-request', iteration: 1, measuredAt: 1000 });
                 expect(measured).toBeTruthy();
                 const admission: ChatGenerationAdmissionEnvelope = { version: 1, kind: 'new-turn', admissionId: 'roundtrip-admission', generationId: 'roundtrip-generation', workspaceId: workspace, threadId: child.thread.id, messageId: 'roundtrip-answer',
-                    thread: { ...child.thread, clock: 2 }, userMessage: { id: 'roundtrip-user-message', clock: 1, thread_id: child.thread.id, role: 'user', index: 1, created_at: 2, updated_at: 2, pending: false, deleted: false, data: { content: 'Continue summary' } },
-                    assistantMessage: { id: 'roundtrip-answer', clock: 1, thread_id: child.thread.id, role: 'assistant', index: 2, created_at: 2, updated_at: 2, pending: true, deleted: false, stream_id: 'roundtrip-generation', data: { content: '', generation_id: 'roundtrip-generation', generation_state: 'streaming', custom_metadata: { keep: true } } } };
+                    thread: { ...child.thread, clock: 2 }, userMessage: validSyncPayload("messages", 'roundtrip-user-message', { id: 'roundtrip-user-message', clock: 1, thread_id: child.thread.id, role: 'user', index: 1, created_at: 2, updated_at: 2, pending: false, deleted: false, data: { content: 'Continue summary' } }),
+                    assistantMessage: validSyncPayload("messages", 'roundtrip-answer', { id: 'roundtrip-answer', clock: 1, thread_id: child.thread.id, role: 'assistant', index: 2, created_at: 2, updated_at: 2, pending: true, deleted: false, stream_id: 'roundtrip-generation', data: { content: '', generation_id: 'roundtrip-generation', generation_state: 'streaming', custom_metadata: { keep: true } } }) };
                 await adapter.admitChatGeneration(actor, admission);
                 await adapter.finalizeChatGeneration(actor, { admission, snapshot: { status: 'complete', content: 'Continued from summary', reasoning: '', completedAt: 1001, usage: measured } });
                 const completed = await adapter.pull(event, { scope: { workspaceId: workspace }, cursor: pulled.nextCursor, limit: 100 });
@@ -350,10 +351,10 @@ describe('SqliteSyncGatewayAdapter', () => {
             return {
                 version: 1, kind: 'new-turn', admissionId: 'usage-admission', generationId: 'usage-generation',
                 workspaceId: WORKSPACE_ID, threadId: 'usage-thread', messageId: 'usage-assistant',
-                thread: { id: 'usage-thread', clock: 1, title: 'Usage conversation' },
-                userMessage: { id: 'usage-user', thread_id: 'usage-thread', role: 'user', clock: 1, data: { content: 'question' } },
-                assistantMessage: { id: 'usage-assistant', thread_id: 'usage-thread', role: 'assistant', clock: 1,
-                    pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } },
+                thread: validSyncPayload("threads", 'usage-thread', { id: 'usage-thread', clock: 1, title: 'Usage conversation' }),
+                userMessage: validSyncPayload("messages", 'usage-user', { id: 'usage-user', thread_id: 'usage-thread', role: 'user', clock: 1, data: { content: 'question' } }),
+                assistantMessage: validSyncPayload("messages", 'usage-assistant', { id: 'usage-assistant', thread_id: 'usage-thread', role: 'assistant', clock: 1,
+                    pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } }),
             };
         }
         const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & TerminalGenerationSnapshot => ({
@@ -397,10 +398,27 @@ describe('SqliteSyncGatewayAdapter', () => {
             await rm(directory, { recursive: true, force: true });
         });
 
+        it('rejects a reader-invalid finalized payload before any durable mutation', async () => {
+            const history = admission();
+            await adapter.admitChatGeneration(actor,history);
+            const raw = getRawDb();
+            raw.prepare("UPDATE s_messages SET data_json = json_set(data_json, '$.role', 42) WHERE id = ?").run(history.messageId);
+            const state = () => ['server_version_counter','change_log','s_messages','background_generation_receipts']
+                .map(table => raw.prepare(`SELECT * FROM ${table}`).all());
+            const before = state();
+            await expect(adapter.finalizeChatGeneration(actor,{admission:history,snapshot:snapshot()})).rejects.toMatchObject({code:'VALIDATION_ERROR'});
+            expect(state()).toEqual(before);
+        });
+
         it.each(['clock', 'version'] as const)('rejects terminal %s exhaustion without changing durable state', async exhausted => {
             const history = admission();
-            history.assistantMessage.clock = exhausted === 'clock' ? Number.MAX_SAFE_INTEGER : 1;
+            history.assistantMessage.clock = exhausted === 'clock' ? Number.MAX_SAFE_INTEGER - 1 : 1;
             await adapter.admitChatGeneration(actor, history);
+            if (exhausted === 'clock') {
+                history.assistantMessage.clock = Number.MAX_SAFE_INTEGER;
+                getRawDb().prepare("UPDATE s_messages SET clock = ?, data_json = json_set(data_json, '$.clock', ?) WHERE id = ?")
+                    .run(Number.MAX_SAFE_INTEGER,Number.MAX_SAFE_INTEGER,history.messageId);
+            }
             if (exhausted === 'version') setWorkspaceVersion(Number.MAX_SAFE_INTEGER);
             const raw = getRawDb();
             const state = () => ['server_version_counter', 'change_log', 's_messages', 'background_generation_receipts']
@@ -477,7 +495,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             raw.prepare("UPDATE s_kv SET op_id = ?, data_json = json_set(data_json, '$.op_id', ?) WHERE id = ?").run(oldId, oldId, key);
             const captured = await adapter.snapshot(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
             const version = captured.highWatermark;
-            raw.prepare("DELETE FROM kysely_migration WHERE name = '033_tool_result_operation_ids'").run();
+            raw.prepare("DELETE FROM kysely_migration WHERE name >= '033_tool_result_operation_ids'").run();
             await runMigrations(getSqliteDb());
             await reopen();
             const pull = await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
@@ -622,7 +640,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             [{ key: 'or3.workspace-item', value: { version: 1 } }],
             JSON.stringify([{ key: 'or3.workspace-item', value: { version: 1 } }]),
         ].map(meta => ({ tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', meta }, omitted: { id: 'workspace-item' } })),
-        { tableName: 'posts', payload: { id: 'workspace-item', postType: 'or3:file' }, omitted: { id: 'workspace-item' } },
+        { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'or3:file' }, omitted: { id: 'workspace-item' } },
         { tableName: 'projects', payload: { id: 'workspace-item', data: JSON.stringify([{ kind: 'file', id: 'saved' }]) }, omitted: { id: 'workspace-item', data: [] } },
     ].map(value => ({ ...value, runtime }))))('rejects old-writer omission transactionally for $tableName on $runtime', async ({ tableName, payload, omitted, runtime }) => {
         if (runtime === 'd1') await useD1TestDatabase();
@@ -675,7 +693,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         ]))).rejects.toMatchObject({ statusCode: 426 });
         expect(raced).toBe(true);
         expect((await database.prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').bind(first.pk).all<{ data_json: string }>()).results?.map(row => JSON.parse(row.data_json)))
-            .toEqual([canonical]);
+            .toEqual([expect.objectContaining(canonical)]);
         expect((await database.prepare('SELECT value FROM server_version_counter').all()).results).toEqual([{ value: 2 }]);
         expect((await database.prepare('SELECT count(*) AS total FROM change_log').all()).results).toEqual([{ total: 2 }]);
         expect((await database.prepare('SELECT id FROM s_threads').all()).results).toEqual([]);
@@ -1228,17 +1246,13 @@ describe('SqliteSyncGatewayAdapter', () => {
             await update('UPDATE change_log SET payload_json = ? WHERE workspace_id = ? AND pk = ?');
             await update('UPDATE s_threads SET data_json = ? WHERE workspace_id = ? AND id = ?');
             const first = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
-            expect(first.changes).toHaveLength(1);
-            expect(first.changes[0]).toMatchObject({ pk: 'large-legacy', payload });
-            expect(first.hasMore).toBe(true);
-            const second = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: first.nextCursor, limit: 100 });
-            expect(second.changes.map(item => item.pk)).toEqual(['small-next']);
+            expect(first.changes.map(item => item.pk)).toEqual(['small-next']);
+            expect(first.unavailable).toEqual([expect.objectContaining({pk:'large-legacy',reason:'payload_oversized'})]);
+            expect(first.hasMore).toBe(false);
             const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
-            expect(snapshot.items).toHaveLength(1);
-            expect(snapshot.items[0]).toMatchObject({ kind: 'row', pk: 'large-legacy', payload });
-            expect(snapshot.nextPageToken).toBeTruthy();
-            const next = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100, pageToken: snapshot.nextPageToken! });
-            expect(next.items.map(item => item.pk)).toEqual(['small-next']);
+            expect(snapshot.items.map(item => item.pk)).toEqual(['small-next']);
+            expect(snapshot.unavailable).toEqual([expect.objectContaining({pk:'large-legacy',reason:'payload_oversized'})]);
+            expect(snapshot.nextPageToken).toBeNull();
         });
 
         it.each(['pull', 'snapshot'] as const)('bounds D1 response payloads read for a large %s page', async method => {
@@ -1296,7 +1310,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 expect(++pullPages).toBeLessThan(10);
             }
             expect(changes).toEqual(ops.map(op => op.pk));
-            expect(changePayloads).toEqual(ops.map(op => op.payload));
+            expect(changePayloads).toMatchObject(ops.map(op => op.payload));
             expect(pullPages).toBeGreaterThan(1);
             const items: string[] = [];
             const itemPayloads: unknown[] = [];
@@ -1317,7 +1331,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 expect(++snapshotPages).toBeLessThan(10);
             } while (pageToken);
             expect(items).toEqual(ops.map(op => op.pk));
-            expect(itemPayloads).toEqual(ops.map(op => op.payload));
+            expect(itemPayloads).toMatchObject(ops.map(op => op.payload));
             expect(snapshotPages).toBeGreaterThan(1);
         });
     });
@@ -1372,8 +1386,8 @@ describe('SqliteSyncGatewayAdapter', () => {
             await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 }))
                 .resolves.toEqual({ changes: [], nextCursor: cursor, hasMore: false, oldestRetainedVersion: 3, requiresSnapshot: true });
             // oldest - 1 is covered and must attempt to read the retained row.
-            await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 })).rejects.toThrow();
-            await sql`UPDATE change_log SET payload_json = '{"id":"recovery-3"}'`.execute(db);
+            await expect(adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 })).resolves.toMatchObject({changes:[],nextCursor:3,unavailable:[{serverVersion:3}]});
+            await sql`UPDATE change_log SET payload_json = ${JSON.stringify(validSyncPayload('threads','recovery-3',{clock:1}))}`.execute(db);
             const covered = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 });
             expect(covered.requiresSnapshot).toBe(false);
             expect(covered.changes.map(change => change.serverVersion)).toEqual([3]);
@@ -1504,7 +1518,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 limit: 10,
             });
 
-            expect(result.changes[0]!.payload).toEqual({ id: 't-1', title: 'Hello' });
+            expect(result.changes[0]!.payload).toMatchObject({ id: 't-1', title: 'Hello' });
             expect(result.changes[0]!.stamp.opId).toBe(op.stamp.opId);
         });
     });
@@ -1806,9 +1820,10 @@ describe('SqliteSyncGatewayAdapter', () => {
         // stored value is malformed and would silently corrupt byte accounting.
         it.each([null, -1, '321', Number.MAX_SAFE_INTEGER + 1])('rejects malformed retained size %s', async (size) => {
             const hash = `sha256:${'a'.repeat(64)}`;
-            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: size } })]));
+            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: 1 } })]));
             await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
                 stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            getRawDb().prepare("UPDATE s_file_meta SET data_json = json_set(data_json, '$.size_bytes', json(?))").run(JSON.stringify(size));
             await expect(adapter.queryCanonicalStorage(stubEvent, {
                 scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
             })).rejects.toThrow('Invalid canonical file size');

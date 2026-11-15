@@ -73,6 +73,7 @@ export interface ServerVersionCounterTable {
 }
 
 export interface ChangeLogTable {
+    intent_fingerprint: Generated<string | null>;
     id: string;
     workspace_id: string;
     server_version: number;

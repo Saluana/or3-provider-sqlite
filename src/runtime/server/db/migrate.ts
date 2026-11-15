@@ -63,6 +63,7 @@ const REQUIRED_SCHEMA_TABLES = [
     'storage_object_generations',
     'storage_object_heads',
     'storage_generation_uploads',
+    'sync_unavailable_records',
     'sync_observations'
 ] as const;
 
@@ -78,6 +79,8 @@ import * as m032 from './migrations/032_sync_observations';
 import * as m033 from './migrations/033_tool_result_operation_ids';
 
 import * as m034 from './migrations/034_sync_intent_fingerprint';
+
+import * as m035 from './migrations/035_sync_unavailable_records';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -113,7 +116,8 @@ const migrations: Record<string, Migration> = {
     '031_storage_generation_uploads': m031,
     '032_sync_observations': m032,
     '033_tool_result_operation_ids': m033,
-    '034_sync_intent_fingerprint': m034
+    '034_sync_intent_fingerprint': m034,
+    '035_sync_unavailable_records': m035
 };
 
 class StaticMigrationProvider implements MigrationProvider {

@@ -1,12 +1,15 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { randomUUID, createHash } from 'node:crypto';
 import type { H3Event } from 'h3';
 import { initializeSqliteDb, destroySqliteDb, getRawDb, _resetForTest } from '../server/db/kysely';
 import { runMigrations } from '../server/db/migrate';
 import { createD1TestDatabase } from '../../../test/support/d1-test-database';
+import { SqliteBackgroundJobProvider } from '../server/background-jobs/sqlite-provider';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
+import { stableJson } from '../server/sync/background-history-fingerprint';
+import type { ChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
 import type { PendingOp } from '~~/shared/sync/types';
-import { SnapshotResponseSchema, PullResponseSchema } from '~~/shared/sync/schemas';
+import { SnapshotResponseSchema, PullResponseSchema, compareSyncTuple } from '~~/shared/sync/schemas';
 const scope = { workspaceId: 'hardening' };
 const event = {} as H3Event;
 const op = (pk: string, payload: Record<string, unknown> = {}): PendingOp => ({
@@ -33,6 +36,10 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect((await adapter.push(event, { scope, ops: [invalid] })).results[0]).toMatchObject({ success: false, errorCode: 'VALIDATION_ERROR' });
         expect(await raw.prepare('SELECT count(*) AS n FROM change_log').get()).toEqual({ n: 0 });
         expect(await raw.prepare('SELECT count(*) AS n FROM server_version_counter').get()).toEqual({ n: 0 });
+        const edge = op('edge');
+        (edge.payload as Record<string,unknown>).value = 'x'.repeat(262144 - Buffer.byteLength(JSON.stringify(edge.payload)));
+        expect((await adapter.push(event,{scope,ops:[edge]})).results[0]).toMatchObject({success:false,errorCode:'VALIDATION_ERROR'});
+        expect(await raw.prepare('SELECT count(*) AS n FROM server_version_counter').get()).toEqual({n:0});
         const good = op('good');
         expect((await adapter.push(event, { scope, ops: [good] })).results[0]?.success).toBe(true);
         const row = await raw.prepare('SELECT data_json FROM s_kv').get() as { data_json: string };
@@ -48,8 +55,70 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
         expect((await adapter.push(event, { scope, ops: [legacy] })).results[0]).toMatchObject({ success: true, serverVersion: 1 });
     });
+    it('preserves exact legacy delete intent on lost-ACK replay', async () => {
+        const legacy = {...op('deleted'),operation:'delete' as const,payload:{deletedAt:123,extensionKey:'original'}};
+        await raw.prepare(`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
+            VALUES (?, ?, 1, 'kv', ?, 'delete', ?, 1, ?, 'test', ?, 1)`).run(randomUUID(),scope.workspaceId,legacy.pk,JSON.stringify(legacy.payload),legacy.stamp.hlc,legacy.stamp.opId);
+        await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
+        expect((await adapter.push(event,{scope,ops:[legacy]})).results[0]).toMatchObject({success:true,serverVersion:1});
+        const fresh = {...legacy,id:randomUUID(),pk:'fresh',stamp:{...legacy.stamp,opId:randomUUID()}};
+        expect((await adapter.push(event,{scope,ops:[fresh]})).results[0]?.success).toBe(true);
+        expect(await raw.prepare("SELECT payload_json FROM change_log WHERE pk = 'fresh'").get()).toEqual({payload_json:JSON.stringify(legacy.payload)});
+        expect(await raw.prepare('SELECT count(*) AS n FROM change_log').get()).toEqual({n:2});
+    });
+    it('reads legacy message ordering without changing original bytes or retaining healthy evidence', async () => {
+        const payload = {id:'legacy-message',thread_id:'thread',role:'assistant',index:0,clock:1,created_at:1,updated_at:1,deleted:false};
+        const opId = randomUUID(); const bytes = JSON.stringify(payload);
+        await raw.prepare(`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
+            VALUES (?, ?, 1, 'messages', 'legacy-message', 'put', ?, 1, 'legacy:1', 'test', ?, 1)`).run(randomUUID(),scope.workspaceId,bytes,opId);
+        await raw.prepare(`INSERT INTO s_messages (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
+            VALUES ('legacy-message',?, ?,1,'legacy:1','test',?,0,1,1)`).run(scope.workspaceId,bytes,opId);
+        await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
+        const pull = await adapter.pull(event,{scope,cursor:0});
+        expect(pull.unavailable ?? []).toEqual([]); expect(pull.changes[0]?.payload).toEqual(payload);
+        const snapshot = await adapter.snapshot(event,{scope,tables:['messages'],pageSize:1});
+        expect(snapshot.unavailable ?? []).toEqual([]); expect(snapshot.items[0]).toMatchObject({payload});
+        expect(snapshot.items[0] && 'payload' in snapshot.items[0] && snapshot.items[0].payload).toEqual(payload);
+        expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:0});
+        expect(await raw.prepare('SELECT data_json FROM s_messages').get()).toEqual({data_json:bytes});
+    });
+    it.runIf(driver === 'native')('keeps historical background admission receipt identity and derives ordering only for new final writes', async () => {
+        const history = {version:1,kind:'new-turn',admissionId:'legacy-admission',generationId:'legacy-generation',workspaceId:scope.workspaceId,threadId:'thread',messageId:'assistant',
+            thread:{id:'thread',clock:1,status:'ready',pinned:false,deleted:false,created_at:1,updated_at:1,extensionKey:'original'},
+            userMessage:{id:'user',thread_id:'thread',clock:1,role:'user',index:0,deleted:false,created_at:1,updated_at:1,extensionKey:'original'},
+            assistantMessage:{id:'assistant',thread_id:'thread',clock:1,role:'assistant',index:1,deleted:false,created_at:1,updated_at:1,extensionKey:'original',data:{generation_id:'legacy-generation'}}} as ChatGenerationAdmissionEnvelope;
+        const fingerprint = createHash('sha256').update(stableJson({...history,expectedAssistant:undefined})).digest('hex');
+        await raw.prepare('INSERT INTO workspace_members (id,workspace_id,user_id,role) VALUES (?,?,?,?)').run('member',scope.workspaceId,'owner','owner');
+        await raw.prepare(`INSERT INTO background_generation_receipts (id,workspace_id,generation_id,stage,fingerprint,outcome,server_version,created_at)
+            VALUES (?,?,?,'admission',?,'admitted',3,1)`).run(randomUUID(),scope.workspaceId,history.generationId,fingerprint);
+        await raw.prepare('INSERT INTO server_version_counter VALUES (?,3)').run(scope.workspaceId);
+        const actor = {workspaceId:scope.workspaceId,userId:'owner'};
+        const original = JSON.stringify(history);
+        expect(await adapter.admitChatGeneration(actor,history)).toMatchObject({replayed:true,serverVersion:3});
+        expect(await raw.prepare('SELECT count(*) AS n FROM change_log').get()).toEqual({n:0});
+        expect(await raw.prepare('SELECT fingerprint FROM background_generation_receipts').get()).toEqual({fingerprint});
+        const provider = new SqliteBackgroundJobProvider();
+        await expect(provider.createJob({userId:'owner',threadId:'thread',messageId:'assistant',model:'test',kind:'chat',generationId:history.generationId,
+            execution:{version:1,workspaceId:scope.workspaceId,body:{model:'test',messages:[]},apiKeyCiphertext:'test',referer:'https://example.test',history}} as never)).resolves.toEqual(expect.any(String));
+        expect(JSON.stringify(history)).toBe(original);
+        history.generationId = 'fresh-generation';
+        history.assistantMessage.data = {generation_id:history.generationId};
+        expect(await adapter.admitChatGeneration(actor,history)).toMatchObject({replayed:false,serverVersion:6});
+        const row = await raw.prepare("SELECT data_json FROM s_messages WHERE id = 'assistant'").get() as {data_json:string};
+        const log = await raw.prepare("SELECT payload_json FROM change_log WHERE pk = 'assistant'").get() as {payload_json:string};
+        expect(log.payload_json).toBe(row.data_json);
+        expect(JSON.parse(row.data_json).order_key).toBe(JSON.parse(row.data_json).hlc);
+        await raw.prepare("UPDATE s_messages SET data_json = json_remove(data_json, '$.order_key') WHERE id = 'assistant'").run();
+        const finalized = await adapter.finalizeChatGeneration(actor,{admission:history,snapshot:{status:'complete',content:'answer',completedAt:1800000000000}});
+        expect(finalized).toMatchObject({status:'committed',replayed:false,serverVersion:7});
+        const finalRow = await raw.prepare("SELECT data_json FROM s_messages WHERE id = 'assistant'").get() as {data_json:string};
+        const finalLog = await raw.prepare("SELECT payload_json FROM change_log WHERE server_version = 7").get() as {payload_json:string};
+        expect(finalRow.data_json).toBe(finalLog.payload_json);
+        expect(JSON.parse(finalRow.data_json).order_key).toBe(JSON.parse(finalRow.data_json).hlc);
+        history.generationId = 'legacy-generation';history.assistantMessage.data = {generation_id:history.generationId};expect(JSON.stringify(history)).toBe(original);
+    });
     it('pages UTF-8 component keys including NUL prefixes and maximum escaped tokens', async () => {
-        const keys = ['a', 'a\0b', '\uE000', '😀', '界'.repeat(1024), '\0'.repeat(1024)];
+        const keys = ['a', 'a\0b', '\uE000', '\u{10000}', '😀', '界'.repeat(1024), ':'.repeat(1024), '\0'.repeat(1024), '\u{10ffff}'];
         expect((await adapter.push(event, { scope, ops: keys.map(key => op(key)) })).results.every(result => result.success)).toBe(true);
         const seen: string[] = []; let pageToken: string | undefined;
         do {
@@ -57,7 +126,15 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
             expect(SnapshotResponseSchema.safeParse(page).success).toBe(true);
             seen.push(...page.items.map(item => item.pk)); pageToken = page.nextPageToken ?? undefined;
         } while (pageToken);
-        expect(seen).toEqual([...keys].sort((a,b) => Buffer.compare(Buffer.from(a), Buffer.from(b))));
+        const expected = [...keys].sort((a,b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+        expect(seen).toEqual(expected);
+        expect([...keys].sort((a,b)=>compareSyncTuple(['kv',a,'row'],['kv',b,'row']))).toEqual(expected);
+        const together = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:100});
+        expect(SnapshotResponseSchema.safeParse(together).success).toBe(true);
+        expect(together.items.map(item=>item.pk)).toEqual(expected);
+        const invalid = op('\uD800');
+        expect((await adapter.push(event,{scope,ops:[invalid]})).results[0]).toMatchObject({success:false,errorCode:'VALIDATION_ERROR'});
+        expect(await raw.prepare('SELECT count(*) AS n FROM s_kv').get()).toEqual({n:keys.length});
     });
     it('retains poison and oversized originals before all-invalid pull progress and snapshot completion', async () => {
         await adapter.push(event, { scope, ops: [op('broken'), op('huge'), op('healthy')] });
@@ -66,7 +143,30 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         const huge = JSON.stringify({ padding: 'x'.repeat(300000) });
         await raw.prepare("UPDATE change_log SET payload_json = ? WHERE pk = 'huge'").run(huge);
         await raw.prepare("UPDATE s_kv SET data_json = ? WHERE id = 'huge'").run(huge);
-        const pull = await adapter.pull(event, { scope, cursor: 0, limit: 2 });
+        let largestPayload = 0;
+        const prepare = d1?.database.prepare.bind(d1.database);
+        const account = (rows: unknown[]) => {for (const row of rows) {
+            const payload = (row as {payload_json?:string|null}).payload_json;
+            if (typeof payload === 'string') largestPayload = Math.max(largestPayload,Buffer.byteLength(payload));
+        }};
+        const observe = (statement: ReturnType<NonNullable<typeof prepare>>): ReturnType<NonNullable<typeof prepare>> => {
+            const bind = statement.bind.bind(statement); const all = statement.all.bind(statement);
+            statement.bind = (...values)=>observe(bind(...values));
+            statement.all = async <T>()=>{const result = await all<T>();account(result.results ?? []);return result;};
+            return statement;
+        };
+        const nativePrepare = driver === 'native' ? raw.prepare.bind(raw) : undefined;
+        const readSpy = d1 && prepare ? vi.spyOn(d1.database,'prepare').mockImplementation(query=>observe(prepare(query)))
+            : vi.spyOn(raw,'prepare').mockImplementation(query=>{
+                const statement = nativePrepare!(query); const all = statement.all.bind(statement);
+                statement.all = (...parameters)=>{const rows = all(...parameters);account(rows);return rows;};return statement;
+            });
+        let pull;
+        try { pull = await adapter.pull(event, { scope, cursor: 0, limit: 2 }); }
+        finally {readSpy?.mockRestore();}
+        expect(largestPayload).toBeLessThanOrEqual(262144);
+        expect(largestPayload).toBeGreaterThanOrEqual(4);
+
         expect(PullResponseSchema.safeParse(pull).success).toBe(true);
         expect(pull).toMatchObject({ changes: [], nextCursor: 2, hasMore: true, unavailable: [
             { pk: 'broken', originalKind: 'put', serverVersion: 1 }, { pk: 'huge', originalKind: 'put', serverVersion: 2 },
@@ -81,4 +181,74 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await raw.prepare('DELETE FROM change_log').run(); await raw.prepare('DELETE FROM sync_snapshots').run();
         expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({ n: 4 });
     });
+    it('finishes an all-invalid final snapshot page, retains unknown owners privately and guards backup JSON', async () => {
+        await adapter.push(event, { scope, ops: [op('only')] });
+        await raw.prepare("UPDATE s_kv SET data_json = '{bad'").run();
+        const page = await adapter.snapshot(event, { scope, tables: ['kv'], pageSize: 1 });
+        expect(page).toMatchObject({ items: [], unavailable: [{ pk: 'only', originalKind: 'row' }], nextPageToken: null });
+        await raw.prepare(`INSERT INTO s_notifications (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
+            VALUES ('secret',?, '{bad',1,'legacy:1','test',?,0,1,1)`).run(scope.workspaceId,randomUUID());
+        const notifications = await adapter.snapshot(event, { scope, tables: ['notifications'], pageSize:10 });
+        expect(notifications.items).toEqual([]); expect(notifications.unavailable ?? []).toEqual([]);
+        expect(await raw.prepare("SELECT count(*) AS n FROM sync_unavailable_records WHERE source = 'canonical'").get()).toEqual({n:1});
+        await raw.prepare(`INSERT INTO s_file_meta (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
+            VALUES ('file',?, ?,1,'legacy:1','test',?,1,1,1)`).run(scope.workspaceId,JSON.stringify({unexpected:'original'}),randomUUID());
+        const backup = await adapter.backupSnapshot(event, { scope, tables: ['file_meta'], pageSize:10 });
+        expect(backup).toMatchObject({ items: [], unavailable: [{ pk: 'file' }], nextPageToken: null });
+    });
+    it('fails coverage for an untrustworthy identity or version and fails closed when evidence cannot persist', async () => {
+        await adapter.push(event, { scope, ops: [op('bad')] });
+        await adapter.push(event,{scope,ops:[op('duplicate')]});
+        await raw.prepare("UPDATE change_log SET server_version = 1 WHERE pk = 'duplicate'").run();
+        await expect(adapter.pull(event,{scope,cursor:0,limit:1})).rejects.toThrow('version');
+        await raw.prepare("DELETE FROM change_log WHERE pk = 'duplicate'").run();
+        await raw.prepare("UPDATE change_log SET server_version = 1.5").run();
+        await expect(adapter.pull(event, {scope,cursor:0})).rejects.toThrow();
+        await raw.prepare("UPDATE change_log SET server_version = 1, pk = ''").run();
+        await expect(adapter.pull(event, {scope,cursor:0})).rejects.toThrow('identity');
+        await raw.prepare("UPDATE change_log SET pk = 'bad', payload_json = '{bad'").run();
+        await raw.prepare(`CREATE TRIGGER fail_evidence BEFORE INSERT ON sync_unavailable_records BEGIN SELECT RAISE(ABORT,'evidence storage failure'); END`).run();
+        await expect(adapter.pull(event, {scope,cursor:0})).rejects.toThrow('evidence storage failure');
+    });
+    it('verifies fallback source identity and notification visibility before retaining reader evidence', async () => {
+        await adapter.push(event,{scope,ops:[op('fallback')]});
+        const page = await adapter.pull(event,{scope,cursor:0}); const record = page.changes[0]!;
+        const marker = {tableName: 'kv', pk:'fallback',originalKind:'put' as const,serverVersion:1,reason:'reader_invalid'};
+        const retained = await adapter.retainUnavailableRecord(event,{scope,source:'pull',record,marker});
+        expect(retained.evidenceRef).toBeTruthy();
+        await expect(adapter.retainUnavailableRecord(event,{scope,source:'pull',record,marker:{...marker,pk:'forged'}})).rejects.toThrow();
+    });
+    it.each(['payload','hlc','device'])('rejects invalid background %s before durable job acceptance', async fault => {
+        const history = {version:1,kind:'new-turn',admissionId:'admission',generationId:'generation',workspaceId:scope.workspaceId,threadId:'thread',messageId:'assistant',
+            thread:{id:'thread',clock:1,status:'ready',pinned:false,deleted:false,created_at:1,updated_at:1},
+            userMessage:{id:'user',thread_id:'thread',clock:1,role:'user',index:0,order_key:'a0',deleted:false,created_at:1,updated_at:1},
+            assistantMessage:{id:'assistant',thread_id:'thread',clock:1,role:fault === 'payload' ? 42 : 'assistant',index:1,order_key:'a1',deleted:false,created_at:1,updated_at:1,
+                ...(fault === 'hlc' ? {hlc:'x'.repeat(513)} : {})}};
+        if (fault === 'device') history.generationId = 'g'.repeat(246);
+        const provider = new SqliteBackgroundJobProvider();
+        await expect(provider.createJob({userId:'test',threadId:'thread',messageId:'assistant',model:'test',kind:'chat',generationId:'generation',
+            execution:{version:1,workspaceId:scope.workspaceId,body:{model:'test',messages:[]},apiKeyCiphertext:'test',referer:'https://example.test',history}} as never)).rejects.toThrow();
+        expect(await raw.prepare('SELECT count(*) AS n FROM background_jobs').get()).toEqual({n:0});
+    });
+
+    it('contains notification defects without exposing a foreign or unknown owner identity', async () => {
+        for (const [pk,owner] of [['mine','alice'],['foreign','bob'],['unknown',null]] as const) {
+            await raw.prepare(`INSERT INTO s_notifications (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
+                VALUES (?,?,?,1,'legacy:1','test',?,0,1,1)`).run(pk,scope.workspaceId,JSON.stringify({id:pk,user_id:owner,type:42}),randomUUID());
+        }
+        const alice = {context:{__or3_session_context_test:{authenticated:true,user:{id:'alice'},workspace:{id:scope.workspaceId}}}} as unknown as H3Event;
+        let version = 0;
+        for (const pk of ['mine','foreign','unknown']) {
+            await raw.prepare(`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
+                SELECT ?,workspace_id,?,'notifications',id,'put',data_json,clock,hlc,device_id,op_id,created_at FROM s_notifications WHERE id = ?`).run(randomUUID(),++version,pk);
+        }
+        await raw.prepare('INSERT INTO server_version_counter VALUES (?,?)').run(scope.workspaceId,version);
+        const pull = await adapter.pull(alice,{scope,cursor:0,limit:3});
+        expect(pull).toMatchObject({changes:[],nextCursor:3,hasMore:false});
+        expect(pull.unavailable?.map(marker=>marker.pk)).toEqual(['mine']);
+        const page = await adapter.snapshot(alice,{scope,tables:['notifications'],pageSize:10});
+        expect(page.items).toEqual([]);expect(page.unavailable?.map(marker=>marker.pk)).toEqual(['mine']);
+        expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:5});
+    });
+
 });
