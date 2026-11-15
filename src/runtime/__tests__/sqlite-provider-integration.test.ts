@@ -1,3 +1,4 @@
+import { readHistoryIncarnation } from '../server/sync/history-incarnation';
 import { validSyncPayload } from '../../../test/support/sync-payload';
 /**
  * Integration tests for SQLite provider wiring across store + sync adapter.
@@ -49,7 +50,7 @@ describe('sqlite provider integration', () => {
         const { workspaceId } = await store.getOrCreateDefaultWorkspace(userId);
 
         const opId = randomUUID();
-        const push = await adapter.push(stubEvent, {
+        const push = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops: [
                 {
@@ -73,7 +74,7 @@ describe('sqlite provider integration', () => {
 
         expect(push.results[0]?.success).toBe(true);
 
-        const pull = await adapter.pull(stubEvent, {
+        const pull = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             cursor: 0,
             limit: 10,
@@ -145,12 +146,12 @@ describe('sqlite provider integration', () => {
             status: 'pending' as const,
         }));
 
-        await adapter.push(stubEvent, {
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops,
         });
 
-        await adapter.updateCursor(makeAuthenticatedEvent(userId, workspaceId), {
+        await adapter.updateCursor(makeAuthenticatedEvent(userId, workspaceId), { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             deviceId: 'cursor-device',
             version: 2,
@@ -161,7 +162,7 @@ describe('sqlite provider integration', () => {
             retentionSeconds: 86400,
         });
 
-        const pull = await adapter.pull(stubEvent, {
+        const pull = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             cursor: 0,
             limit: 10,
@@ -199,7 +200,7 @@ describe('sqlite provider D1 integration', () => {
         const { workspaceId } = await store.getOrCreateDefaultWorkspace(userId);
         const event = makeAuthenticatedEvent(userId, workspaceId);
         const write = async (hash: string, clock: number, operation: 'put' | 'delete') =>
-            adapter.push(event, {
+            adapter.push(event, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId },
                 ops: [{
                     id: randomUUID(), tableName: 'file_meta', operation, pk: hash,
@@ -264,9 +265,9 @@ describe('sqlite provider D1 integration', () => {
         });
         const first = makePushOp(1, 'put', 'first');
         const second = makePushOp(2, 'put', 'second');
-        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [first] });
-        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [second] });
-        const liveReplay = await adapter.push(stubEvent, {
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId }, ops: [first] });
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId }, ops: [second] });
+        const liveReplay = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId }, ops: [first],
         });
         expect(liveReplay.results[0]).toMatchObject({
@@ -278,8 +279,8 @@ describe('sqlite provider D1 integration', () => {
             },
         });
         const deletion = makePushOp(3, 'delete', '');
-        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [deletion] });
-        const tombstoneReplay = await adapter.push(stubEvent, {
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId }, ops: [deletion] });
+        const tombstoneReplay = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId }, ops: [first],
         });
         expect(tombstoneReplay.results[0]).toMatchObject({
@@ -290,7 +291,7 @@ describe('sqlite provider D1 integration', () => {
             },
         });
         const stale = makePushOp(2, 'put', 'stale');
-        const staleResult = await adapter.push(stubEvent, {
+        const staleResult = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId }, ops: [stale],
         });
         expect(staleResult.results[0]).toMatchObject({
@@ -304,7 +305,7 @@ describe('sqlite provider D1 integration', () => {
         await d1.database.prepare(
             'DELETE FROM tombstones WHERE workspace_id = ? AND table_name = ? AND pk = ?'
         ).bind(workspaceId, 'threads', 'd1-replay-thread').run();
-        const afterGc = await adapter.push(stubEvent, {
+        const afterGc = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId }, ops: [first],
         });
         expect(afterGc.results[0]).toMatchObject({
@@ -334,7 +335,7 @@ describe('sqlite provider D1 integration', () => {
         await store.removeWorkspace({ userId, workspaceId: extraWorkspaceId });
         const opId = randomUUID();
 
-        const push = await adapter.push(stubEvent, {
+        const push = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops: [
                 {
@@ -355,18 +356,18 @@ describe('sqlite provider D1 integration', () => {
                 },
             ],
         });
-        const pull = await adapter.pull(stubEvent, {
+        const pull = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             cursor: 0,
             limit: 10,
         });
-        const snapshot = await adapter.snapshot(stubEvent, {
+        const snapshot = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             pageSize: 10,
         });
         await adapter.updateCursor(
             makeAuthenticatedEvent(userId, workspaceId),
-            {
+            { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId },
                 deviceId: 'd1-device',
                 version: 1,
@@ -408,11 +409,11 @@ describe('sqlite provider D1 integration', () => {
             status: 'pending' as const,
         }));
 
-        const firstPush = await adapter.push(stubEvent, {
+        const firstPush = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops,
         });
-        const replay = await adapter.push(stubEvent, {
+        const replay = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops: [ops[0]!],
         });
@@ -478,16 +479,16 @@ describe('sqlite provider D1 integration', () => {
             status: 'pending' as const,
         });
 
-        expect((await adapter.push(aliceEvent, {
+        expect((await adapter.push(aliceEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops: [makeNote(alice, 'd1-note-alice')],
         })).results[0]?.success).toBe(true);
-        expect((await adapter.push(bobEvent, {
+        expect((await adapter.push(bobEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops: [makeNote(bob, 'd1-note-bob')],
         })).results[0]?.success).toBe(true);
 
-        const alicePull = await adapter.pull(aliceEvent, {
+        const alicePull = await adapter.pull(aliceEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             cursor: 0,
             limit: 20,
@@ -512,8 +513,8 @@ describe('sqlite provider D1 integration', () => {
             attempts: 0,
             status: 'pending' as const,
         };
-        await adapter.push(stubEvent, { scope: { workspaceId }, ops: [original] });
-        const conflict = await adapter.push(stubEvent, {
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId }, ops: [original] });
+        const conflict = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId },
             ops: [{
                 ...original,

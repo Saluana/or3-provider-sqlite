@@ -1,6 +1,7 @@
+import { historyAssertion, historyBatch } from './history-incarnation';
 import { randomUUID } from 'node:crypto';
 import { getRawDb, isD1Driver } from '../db/kysely';
-import { d1All, d1Batch, type D1SqlStatement } from '../db/d1';
+import { d1All, type D1SqlStatement } from '../db/d1';
 
 export const SYNC_ROW_BYTES = 256 * 1024;
 export const SYNC_METADATA_BYTES = 1024 * 1024;
@@ -25,29 +26,24 @@ export function notificationOwnerSql(column: string): string {
 export async function syncRows<T>(query: string, ...parameters: unknown[]): Promise<T[]> {
     return isD1Driver() ? d1All<T>(query, ...parameters) : getRawDb().prepare(query).all(...parameters) as T[];
 }
-export async function syncBatch(statements: D1SqlStatement[]): Promise<void> {
-    if (isD1Driver()) { await d1Batch(statements); return; }
-    const raw = getRawDb();
-    raw.transaction(() => { for (const entry of statements) raw.prepare(entry.sql).run(...entry.parameters ?? []); }).immediate();
-}
 
 export type EvidenceSource = {
-    workspaceId: string; source: 'pull' | 'snapshot' | 'canonical'; locator: string; revisionSql: string;
+    historyIncarnation: string; workspaceId: string; source: 'pull' | 'snapshot' | 'canonical'; locator: string; revisionSql: string;
     table: string; where: string; parameters: unknown[]; payload: string; metadata: string;
 };
 /** Original bytes travel only database-to-database, including oversized records. */
 export async function retainSqlEvidence(source: EvidenceSource, reason: string): Promise<string> {
     const id = randomUUID();
-    await syncBatch([{
+    await historyBatch([historyAssertion(source.historyIncarnation),{
         sql: `INSERT OR IGNORE INTO sync_unavailable_records
             (id, workspace_id, source, locator, revision, payload_json, metadata_json, reason, status, created_at)
-            SELECT ?, ?, ?, ?, ${source.revisionSql}, ${source.payload}, ${source.metadata}, ?, 'unresolved', unixepoch()
+            SELECT ?, ?, ?, ?, json_array(?, ${source.revisionSql}), ${source.payload}, json_set(${source.metadata}, '$.historyIncarnation', ?), ?, 'unresolved', unixepoch()
             FROM ${source.table} WHERE ${source.where}`,
-        parameters: [id, source.workspaceId, source.source, source.locator, reason, ...source.parameters],
-    }]);
+        parameters: [id, source.workspaceId, source.source, source.locator, source.historyIncarnation, source.historyIncarnation, reason, ...source.parameters],
+    }],source.historyIncarnation);
     const [retained] = await syncRows<{ id: string }>(`SELECT id FROM sync_unavailable_records
-        WHERE workspace_id = ? AND source = ? AND locator = ? AND revision = (SELECT ${source.revisionSql} FROM ${source.table} WHERE ${source.where})`,
-    source.workspaceId, source.source, source.locator, ...source.parameters);
+        WHERE workspace_id = ? AND source = ? AND locator = ? AND revision = (SELECT json_array(?, ${source.revisionSql}) FROM ${source.table} WHERE ${source.where})`,
+    source.workspaceId, source.source, source.locator, source.historyIncarnation, ...source.parameters);
     if (!retained) throw new Error('Sync evidence source disappeared; coverage was not acknowledged');
     return retained.id;
 }
@@ -57,8 +53,8 @@ export function unknownNotificationEvidence(workspaceId: string): D1SqlStatement
     return { sql: `INSERT OR IGNORE INTO sync_unavailable_records
         (id, workspace_id, source, locator, revision, payload_json, metadata_json, reason, status, created_at)
         SELECT lower(hex(randomblob(16))), workspace_id, 'canonical', json_array('notifications', id),
-            json_array(clock, hlc, op_id, deleted), data_json,
-            json_object('table_name','notifications','pk',id,'clock',clock,'hlc',hlc,'op_id',op_id,'deleted',deleted),
+            json_array((SELECT incarnation FROM sync_history WHERE id=1), json_array(clock, hlc, op_id, deleted)), data_json,
+            json_object('historyIncarnation',(SELECT incarnation FROM sync_history WHERE id=1),'table_name','notifications','pk',id,'clock',clock,'hlc',hlc,'op_id',op_id,'deleted',deleted),
             'notification_owner_unavailable', 'unresolved', unixepoch()
         FROM s_notifications WHERE workspace_id = ? AND
             coalesce(length(cast(${notificationOwnerSql('data_json')} AS blob)),0) = 0`, parameters: [workspaceId] };

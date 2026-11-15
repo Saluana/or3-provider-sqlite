@@ -1,3 +1,4 @@
+import { readHistoryIncarnation } from '../server/sync/history-incarnation';
 import { validSyncPayload } from '../../../test/support/sync-payload';
 /**
  * Tests for the SQLite sync admin GC actions and maintenance state.
@@ -127,10 +128,10 @@ describe('SQLite sync admin GC', () => {
         const ops = Array.from({ length: 5 }, (_, index) =>
             makeOp({ tableName: 'threads', pk: `t-${index}` })
         );
-        await adapter.push(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, ops });
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, ops });
 
         // Device cursor at 3 — entries 1..3 are behind it, 4..5 are not.
-        await adapter.updateCursor(makeSessionEvent('user-a', WORKSPACE_ID), {
+        await adapter.updateCursor(makeSessionEvent('user-a', WORKSPACE_ID), { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId: WORKSPACE_ID },
             deviceId: 'device-a',
             version: 3,
@@ -162,7 +163,7 @@ describe('SQLite sync admin GC', () => {
 
     it('executes a real tombstone GC', async () => {
         const putOp = makeOp({ tableName: 'threads', pk: 't-1' });
-        await adapter.push(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, ops: [putOp] });
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, ops: [putOp] });
         const delOp = makeOp({
             tableName: 'threads',
             pk: 't-1',
@@ -174,9 +175,9 @@ describe('SQLite sync admin GC', () => {
                 opId: randomUUID(),
             },
         });
-        await adapter.push(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, ops: [delOp] });
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, ops: [delOp] });
 
-        await adapter.updateCursor(makeSessionEvent('user-a', WORKSPACE_ID), {
+        await adapter.updateCursor(makeSessionEvent('user-a', WORKSPACE_ID), { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId: WORKSPACE_ID },
             deviceId: 'device-a',
             version: 2,

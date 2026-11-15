@@ -1,3 +1,4 @@
+import { readHistoryIncarnation, validateExpectedHistory, validHistoryIncarnation, historyChanged, historyAssertion } from './history-incarnation';
 import { maintainEvidence, repairAssertion, repairResolution, type RepairGuard } from './evidence-maintenance';
 import { SqliteExternalStorageGenerationUploadCoordinator } from '../storage/sqlite-generation-upload-coordinator';
 import { backgroundFinalizationFingerprint, stableJson } from './background-history-fingerprint';
@@ -124,6 +125,7 @@ type SnapshotKind = 'row' | 'tombstone';
 type SnapshotPageToken = {
     version: 1;
     snapshotId: string;
+    historyIncarnation: string;
     after: {
         tableName: string;
         pk: string;
@@ -210,15 +212,15 @@ function validReadPayload(table: string, pk: string, payload: unknown, _clock: n
     // install the authoritative envelope revision; only new writes bind both.
     return row[table === 'file_meta' ? 'hash' : 'id'] === pk;
 }
-function snapshotEvidence(header: SnapshotHeaderRow, row: SnapshotItemRow): EvidenceSource {
-    return { workspaceId: header.workspace_id, source: 'snapshot', locator: JSON.stringify([row.table_name, row.pk]),
+function snapshotEvidence(header: SnapshotHeaderRow, row: SnapshotItemRow, historyIncarnation: string): EvidenceSource {
+    return { historyIncarnation, workspaceId: header.workspace_id, source: 'snapshot', locator: JSON.stringify([row.table_name, row.pk]),
         revisionSql: "json_array(kind,clock,hlc,op_id)", table: 'sync_snapshot_items',
         where: 'snapshot_id = ? AND table_name = ? AND pk = ? AND kind = ?',
         parameters: [header.id, row.table_name, row.pk, row.kind], payload: 'coalesce(source_payload_json,payload_json)',
         metadata: "json_object('snapshot_id',snapshot_id,'table_name',table_name,'pk',pk,'kind',kind,'clock',clock,'hlc',hlc,'op_id',op_id,'server_deleted_at',server_deleted_at)" };
 }
 async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRow[], pageSize: number,
-    availableRows: number, after?: SnapshotPageToken['after'], userId?: string): Promise<SnapshotResponse> {
+    availableRows: number, historyIncarnation: string, after?: SnapshotPageToken['after'], userId?: string): Promise<SnapshotResponse> {
     if (!Number.isSafeInteger(header.high_watermark) || header.high_watermark < 0) throw new Error('Untrustworthy snapshot watermark');
     const items: SnapshotItem[] = [];
     const unavailable: NonNullable<SnapshotResponse['unavailable']> = [];
@@ -247,11 +249,11 @@ async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRo
         }
         const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.kind,
             snapshotId: header.id, highWatermark: header.high_watermark, evidenceRef: '', reason };
-        const next = encodeSnapshotPageToken({ version: 1, snapshotId: header.id,
+        const next = encodeSnapshotPageToken({ version: 1, snapshotId: header.id, historyIncarnation,
             after: { tableName: row.table_name, pk: row.pk, kind: row.kind } });
         const visible = row.table_name !== 'notifications' || row.kind === 'tombstone' || !!row.notification_owner && row.notification_owner === userId;
         let bytes = visible ? jsonBytes(item ?? {...marker,evidenceRef:'x'.repeat(36)}) + ((item ? items.length : unavailable.length) ? 1 : 0) : 0;
-        const envelopeBytes = jsonBytes({workspaceId:header.workspace_id,snapshotId:header.id,highWatermark:header.high_watermark,
+        const envelopeBytes = jsonBytes({historyIncarnation,workspaceId:header.workspace_id,snapshotId:header.id,highWatermark:header.high_watermark,
             items:[],unavailable:[],nextPageToken:next});
         if (item && envelopeBytes + bytes > MAX_SYNC_PAGE_BYTES) {
             item = undefined; reason = marker.reason = 'record_oversized';
@@ -263,7 +265,7 @@ async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRo
         }
         if (item && visible) items.push(item);
         else if (!item) {
-            marker.evidenceRef = await retainSqlEvidence(snapshotEvidence(header,row), reason);
+            marker.evidenceRef = await retainSqlEvidence(snapshotEvidence(header,row,historyIncarnation), reason);
             if (visible) unavailable.push(marker);
         }
         itemBytes += bytes;
@@ -271,7 +273,7 @@ async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRo
     }
     const [retained] = await syncRows<{expires_at:number}>('SELECT expires_at FROM sync_snapshots WHERE id = ?',header.id);
     if (!retained || retained.expires_at <= nowEpoch()) throw createError({statusCode:410,statusMessage:'Snapshot expired or unavailable'});
-    return SnapshotResponseSchema.parse({ workspaceId: header.workspace_id, snapshotId: header.id,
+    return SnapshotResponseSchema.parse({ historyIncarnation, workspaceId: header.workspace_id, snapshotId: header.id,
         highWatermark: header.high_watermark, items, ...(unavailable.length ? { unavailable } : {}),
         nextPageToken: availableRows > scanned ? token : null });
 }
@@ -941,11 +943,11 @@ async function currentWinnerD1(
 export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'sqlite';
     private versionWatchers = new Map<string, {
-        listeners: Map<(version: number) => void, (error: unknown) => void>;
-        version?: number; timer?: ReturnType<typeof setTimeout>; running: boolean;
+        listeners: Map<(position: {historyIncarnation:string;version:number}) => void, (error: unknown) => void>;
+        position?: {historyIncarnation:string;version:number}; timer?: ReturnType<typeof setTimeout>; running: boolean;
     }>();
 
-    async watchVersion(event: H3Event, scope: { workspaceId: string }, onVersion: (version: number) => void,
+    async watchVersion(event: H3Event, scope: { workspaceId: string }, onVersion: (position: {historyIncarnation:string;version:number}) => void,
         onError: (error: unknown) => void): Promise<() => void> {
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
         let watcher = this.versionWatchers.get(scope.workspaceId);
@@ -955,17 +957,25 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         const current = watcher;
         current.listeners.set(onVersion, onError);
-        if (current.version !== undefined) onVersion(current.version);
+        if (current.position) onVersion(current.position);
         const poll = async () => {
             if (current.running || this.versionWatchers.get(scope.workspaceId) !== current) return;
             current.running = true;
             try {
-                const row = await getSqliteDb().selectFrom('server_version_counter').select('value')
-                    .where('workspace_id', '=', scope.workspaceId).executeTakeFirst();
-                const version = row?.value ?? 0;
-                if (current.version !== version) {
-                    current.version = version;
-                    for (const notify of [...current.listeners.keys()]) notify(version);
+                const [row] = await syncRows<{historyIncarnation:string;version:number}>(`SELECT incarnation AS historyIncarnation,
+                    coalesce((SELECT value FROM server_version_counter WHERE workspace_id=?),0) AS version FROM sync_history WHERE id=1`,scope.workspaceId);
+                if (!row || !validHistoryIncarnation(row.historyIncarnation)) throw new Error('Invalid sync history singleton');
+                if (current.position && current.position.historyIncarnation !== row.historyIncarnation) {
+                    // Never keep a stream from the replaced database alive.
+                    for (const fail of [...current.listeners.values()]) fail(createError({statusCode:409,
+                        data:{code:'OR3_SYNC_HISTORY_CHANGED',historyIncarnation:row.historyIncarnation,requiresSnapshot:true}}));
+                    current.listeners.clear();
+                    this.versionWatchers.delete(scope.workspaceId);
+                    return;
+                }
+                if (current.position?.version !== row.version) {
+                    current.position = row;
+                    for (const notify of [...current.listeners.keys()]) notify(row);
                 }
             } catch (error) {
                 for (const fail of [...current.listeners.values()]) fail(error);
@@ -1005,6 +1015,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   atomicUploadQuota: 'retained-v1',
               } as const)
             : ({
+                  historyIncarnation: 'v1',
                   snapshotBootstrap: 'snapshot-v1',
                   unavailableRecords: 'v1',
                   historyRetention: 'snapshot-v1',
@@ -1017,6 +1028,19 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   retainedStorageMetadata: 'v1',
                   atomicUploadQuota: 'retained-v1',
               } as const);
+    }
+
+    async getHistoryIncarnation(event: H3Event, scope: {workspaceId:string}): Promise<string> {
+        await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
+        return readHistoryIncarnation();
+    }
+
+    private async checkHistory(event: H3Event, scope: {workspaceId:string}, expected: unknown, discovery = false): Promise<string> {
+        await assertWorkspaceScopeAuthorized(event,scope.workspaceId);
+        validateExpectedHistory(expected);
+        const current = await readHistoryIncarnation();
+        if (!discovery && expected !== current) historyChanged(current);
+        return current;
     }
 
     private get db() {
@@ -1893,8 +1917,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const workspaceId = scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
 
+        const historyIncarnation = await this.checkHistory(event, scope, input.historyIncarnation);
         if (!ops.length) {
-            return { results: [], serverVersion: 0 };
+            return { results: [], serverVersion: 0, historyIncarnation };
         }
 
         const userId = resolveSessionUserId(event);
@@ -1963,6 +1988,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 indicesByOpId,
                 userId,
                 workspaceItemCapability: input.workspaceItemCapability,
+                historyIncarnation,
                 repair,
             });
         }
@@ -1976,6 +2002,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const hookEmissions: HookEmission[] = [];
 
         const runTx = raw.transaction(() => {
+            const current = raw.prepare('SELECT incarnation FROM sync_history WHERE id=1').get() as {incarnation:string} | undefined;
+            if (current?.incarnation !== historyIncarnation) {
+                if (!validHistoryIncarnation(current?.incarnation)) throw new Error('Invalid sync history singleton');
+                historyChanged(current.incarnation);
+            }
             if (repair) {
                 const assertion = repairAssertion(repair);
                 raw.prepare(assertion.sql).get(...assertion.parameters ?? []);
@@ -2423,6 +2454,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 (result): result is PushResult['results'][number] => Boolean(result)
             ),
             serverVersion: finalServerVersion,
+            historyIncarnation,
         };
     }
 
@@ -2430,6 +2462,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const db = this.db;
         const { scope, cursor, limit, tables } = input;
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
+        const historyIncarnation = await this.checkHistory(event, scope, input.historyIncarnation, true);
         const fetchLimit = resolvePullLimit(limit);
 
         const minLog = await db
@@ -2451,8 +2484,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             oldestLogVersion: minLog?.server_version ?? null,
             highWatermark: counter?.value ?? 0,
         });
-        if (retention.requiresSnapshot || cursor > (counter?.value ?? 0)) {
-            return { changes: [], nextCursor: cursor, hasMore: false, ...retention, requiresSnapshot: true };
+        if (input.historyIncarnation !== historyIncarnation || retention.requiresSnapshot || cursor > (counter?.value ?? 0)) {
+            return { historyIncarnation, changes: [], unavailable: [], nextCursor: cursor, hasMore: false, ...retention, requiresSnapshot: true };
         }
 
         let query = db
@@ -2513,13 +2546,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.op as 'put' | 'delete',
                 serverVersion: row.server_version, evidenceRef: '', reason };
             const bytes = visible ? jsonBytes(change ?? {...marker,evidenceRef:'x'.repeat(36)}) + ((change ? changes.length : unavailable.length) ? 1 : 0) : 0;
-            const envelopeBytes = jsonBytes({changes:[],unavailable:[],nextCursor:row.server_version,hasMore:false,...retention});
+            const envelopeBytes = jsonBytes({historyIncarnation,changes:[],unavailable:[],nextCursor:row.server_version,hasMore:false,...retention});
             if (envelopeBytes + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) {
                 if (!scanned) throw new Error('Sync identity exceeds page byte budget');
                 break;
             }
             if (!change) {
-                marker.evidenceRef = await retainSqlEvidence({ workspaceId: scope.workspaceId, source: 'pull',
+                marker.evidenceRef = await retainSqlEvidence({ historyIncarnation, workspaceId: scope.workspaceId, source: 'pull',
                     locator: row.id, revisionSql: "cast(server_version AS text)", table: 'change_log', where: 'workspace_id = ? AND id = ? AND server_version = ?',
                     parameters: [scope.workspaceId, row.id, row.server_version], payload: 'payload_json',
                     metadata: "json_object('id',id,'table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version,'created_at',created_at)" }, reason);
@@ -2528,12 +2561,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             itemBytes += bytes;
             scanned++; nextCursor = row.server_version;
         }
-        return PullResponseSchema.parse({ changes, ...(unavailable.length ? { unavailable } : {}),
+        return PullResponseSchema.parse({ historyIncarnation, changes, ...(unavailable.length ? { unavailable } : {}),
             nextCursor, hasMore: sizes.length > scanned, ...retention });
     }
 
-    async retainUnavailableRecord(event: H3Event, input: { scope: {workspaceId:string}; source:'pull'|'snapshot'; record:unknown; marker:Omit<PullUnavailableRecord,'evidenceRef'> | Omit<SnapshotUnavailableRecord,'evidenceRef'> }): Promise<{ evidenceRef: string }> {
+    async retainUnavailableRecord(event: H3Event, input: { scope: {workspaceId:string}; source:'pull'|'snapshot'; historyIncarnation?:string; record:unknown; marker:Omit<PullUnavailableRecord,'evidenceRef'> | Omit<SnapshotUnavailableRecord,'evidenceRef'> }): Promise<{ evidenceRef: string }> {
         await assertWorkspaceScopeAuthorized(event,input.scope.workspaceId);
+        const historyIncarnation = await this.checkHistory(event,input.scope,input.historyIncarnation);
         const marker = input.marker;
         assertCoverageKey(marker.tableName,marker.pk);
         let source: EvidenceSource;
@@ -2546,7 +2580,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 row.table_name === 'notifications' && (!row.owner || row.owner !== resolveSessionUserId(event))) throw new Error('Evidence source identity or visibility mismatch');
             record = {serverVersion:marker.serverVersion,tableName:row.table_name,pk:row.pk,op:row.op,
                 payload:row.payload_json ? JSON.parse(row.payload_json) : undefined,stamp:{clock:row.clock,hlc:row.hlc,deviceId:row.device_id,opId:row.op_id}};
-            source = {workspaceId:input.scope.workspaceId,source:'pull',locator:row.id,revisionSql:"cast(server_version AS text)",table:'change_log',
+            source = {historyIncarnation,workspaceId:input.scope.workspaceId,source:'pull',locator:row.id,revisionSql:"cast(server_version AS text)",table:'change_log',
                 where:'workspace_id = ? AND id = ? AND server_version = ?',parameters:[input.scope.workspaceId,row.id,marker.serverVersion],payload:'payload_json',
                 metadata:"json_object('id',id,'table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version)"};
         } else if (input.source === 'snapshot' && 'snapshotId' in marker) {
@@ -2560,7 +2594,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (row.table_name === 'notifications' && row.kind === 'row' && notificationPayloadUserId(payload) !== resolveSessionUserId(event)) throw new Error('Evidence notification visibility mismatch');
             record = {kind:row.kind,tableName:row.table_name,pk:row.pk,revision:{clock:row.clock,hlc:row.hlc,opId:row.op_id},
                 ...(row.kind === 'row' ? {payload} : {serverDeletedAt:row.server_deleted_at})};
-            source = snapshotEvidence(header,row);
+            source = snapshotEvidence(header,row,historyIncarnation);
         } else throw new Error('Evidence source mismatch');
         if (stableJson(record) !== stableJson(input.record)) throw new Error('Evidence source record mismatch');
         return { evidenceRef: await retainSqlEvidence(source,'reader_invalid') };
@@ -2569,7 +2603,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     async maintainUnavailableRecords(event: H3Event, workspaceId: string, action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
         await assertWorkspaceScopeAuthorized(event,workspaceId);
         return maintainEvidence(event,workspaceId,action,input,(event,op,guard) => this.push(event,
-            {scope:{workspaceId},ops:[op],workspaceItemCapability:WORKSPACE_ITEM_CAPABILITY},guard),validReadPayload);
+            {scope:{workspaceId},ops:[op],historyIncarnation:guard.historyIncarnation,workspaceItemCapability:WORKSPACE_ITEM_CAPABILITY},guard),validReadPayload);
     }
 
     async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
@@ -2588,10 +2622,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     ): Promise<SnapshotResponse> {
         const workspaceId = input.scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
+        const historyIncarnation = await this.checkHistory(event,input.scope,input.historyIncarnation,
+            input.historyIncarnation === null && !input.pageToken);
+        if (input.pageToken && decodeSnapshotPageToken(input.pageToken).historyIncarnation !== historyIncarnation) historyChanged(historyIncarnation);
         const pageSize = resolveSnapshotPageSize(input.pageSize);
         const snapshotUserId = resolveSessionUserId(event);
         if (isD1Driver()) {
-            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles);
+            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles, historyIncarnation);
         }
         const raw = getRawDb();
         const now = nowEpoch();
@@ -2812,15 +2849,16 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner,
             ${boundedSyncMetadata('clock',SNAPSHOT_METADATA_BYTES)} AS clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, ${boundedSyncMetadata('server_deleted_at',SNAPSHOT_METADATA_BYTES)} AS server_deleted_at ${selection.clause}`)
             .all(...selection.parameters, selected) as SnapshotItemRow[] : [];
-        return buildSnapshotPage(header, rows, pageSize, sizes.length, after, snapshotUserId);
+        return buildSnapshotPage(header, rows, pageSize, sizes.length, historyIncarnation, after, snapshotUserId);
     }
 
     async updateCursor(
         event: H3Event,
-        input: { scope: { workspaceId: string }; deviceId: string; version: number }
+        input: { scope: { workspaceId: string }; deviceId: string; version: number; historyIncarnation?: string | null }
     ): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
         const now = nowEpoch();
+        const historyIncarnation = await this.checkHistory(event,input.scope,input.historyIncarnation);
         const deviceId = input.deviceId.trim();
         if (!deviceId || deviceId.length > 256) {
             throw createError({ statusCode: 400, statusMessage: 'Invalid device cursor' });
@@ -2834,10 +2872,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
         }
         if (isD1Driver()) {
-            return this.updateCursorInD1(input.scope.workspaceId, deviceId, input.version, ownerUserId, now);
+            return this.updateCursorInD1(input.scope.workspaceId, deviceId, input.version, ownerUserId, now, historyIncarnation);
         }
         const raw = getRawDb();
         const update = raw.transaction(() => {
+            const current = raw.prepare('SELECT incarnation FROM sync_history WHERE id=1').get() as {incarnation:string}|undefined;
+            if(current?.incarnation !== historyIncarnation) {
+                if(!validHistoryIncarnation(current?.incarnation)) throw new Error('Invalid sync history singleton');
+                historyChanged(current.incarnation);
+            }
             const counter = raw.prepare(
                 'SELECT value FROM server_version_counter WHERE workspace_id = ?'
             ).get(input.scope.workspaceId) as { value: number } | undefined;
@@ -2866,7 +2909,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                    updated_at = excluded.updated_at`
             ).run(uid(), input.scope.workspaceId, deviceId, ownerUserId, input.version, now);
         });
-        update();
+        update.immediate();
     }
 
     async gcTombstones(
@@ -3033,7 +3076,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         input: SnapshotRequest,
         pageSize: number,
         snapshotUserId: string | undefined,
-        retainedFiles: boolean
+        retainedFiles: boolean,
+        historyIncarnation: string
     ): Promise<SnapshotResponse> {
         const now = nowEpoch();
         let header: SnapshotHeaderRow;
@@ -3245,7 +3289,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (!retained || retained.expires_at <= nowEpoch()) {
             throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
         }
-        return buildSnapshotPage(header, rows, pageSize, sizes.length, after, snapshotUserId);
+        return buildSnapshotPage(header, rows, pageSize, sizes.length, historyIncarnation, after, snapshotUserId);
     }
 
     private async updateCursorInD1(
@@ -3253,7 +3297,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         deviceId: string,
         version: number,
         ownerUserId: string,
-        now: number
+        now: number,
+        historyIncarnation: string
     ): Promise<void> {
         const [counter] = await d1All<{ value: number }>(
             'SELECT value FROM server_version_counter WHERE workspace_id = ?',
@@ -3275,22 +3320,25 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (existing && version < existing.last_seen_version) {
             throw createError({ statusCode: 409, statusMessage: 'Device cursor cannot regress' });
         }
-        const result = await d1Run(
-            `INSERT INTO device_cursors (
+        const results = await d1Batch([
+            historyAssertion(historyIncarnation),
+            {sql:`SELECT json_extract('{}',CASE WHEN ? <= coalesce((SELECT value FROM server_version_counter WHERE workspace_id=?),0)
+                AND ? >= coalesce((SELECT last_seen_version FROM device_cursors WHERE workspace_id=? AND owner_user_id=? AND device_id=?),0)
+                THEN '$' ELSE 'OR3_SYNC_CURSOR_CHANGED' END)`,parameters:[version,workspaceId,version,workspaceId,ownerUserId,deviceId]},
+            {sql:`INSERT INTO device_cursors (
                 id, workspace_id, device_id, owner_user_id, last_seen_version, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(workspace_id, owner_user_id, device_id) DO UPDATE SET
                 last_seen_version = excluded.last_seen_version,
                 updated_at = excluded.updated_at
              WHERE excluded.last_seen_version >= device_cursors.last_seen_version`,
-            uid(),
-            workspaceId,
-            deviceId,
-            ownerUserId,
-            version,
-            now
-        );
-        if ((result.meta?.changes ?? 0) !== 1) {
+            parameters:[uid(),workspaceId,deviceId,ownerUserId,version,now]},
+        ]).catch(async error=>{
+            if(String(error).includes('OR3_SYNC_HISTORY_CHANGED')) historyChanged(await readHistoryIncarnation());
+            if(String(error).includes('OR3_SYNC_CURSOR_CHANGED')) throw createError({statusCode:409,statusMessage:'Device cursor changed concurrently'});
+            throw error;
+        });
+        if ((results[2]?.meta?.changes ?? 0) !== 1) {
             throw createError({ statusCode: 409, statusMessage: 'Device cursor changed concurrently' });
         }
     }
@@ -3303,9 +3351,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         indicesByOpId: Map<string, number[]>;
         userId: string | undefined;
         workspaceItemCapability: PushBatch['workspaceItemCapability'];
+        historyIncarnation: string;
         repair?: RepairGuard;
     }): Promise<PushResult> {
-        const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId } = input;
+        const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId, historyIncarnation } = input;
         const existingOps = new Map<string, {
             server_version: number;
             workspace_id: string;
@@ -3459,7 +3508,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
 
         const now = nowEpoch();
-        const statements: D1SqlStatement[] = [];
+        const statements: D1SqlStatement[] = [historyAssertion(historyIncarnation)];
         if (input.repair) statements.push(repairAssertion(input.repair));
         if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
             for (const op of uniqueOps) {
@@ -3638,6 +3687,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             batchResults = statements.length > 0 ? await d1Batch(input.repair && newOps.length ? [...statements,repairResolution(input.repair,newOps[0]!.stamp.opId)] : statements) : [];
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            if (message.includes('OR3_SYNC_HISTORY_CHANGED')) historyChanged(await readHistoryIncarnation());
             if (/JSON path/i.test(message) && message.includes('OR3_SYNC_VERSION_EXHAUSTED')) {
                 throw Object.assign(new Error('Sync server version exhausted or invalid'), { code: 'VALIDATION_ERROR' });
             }
@@ -3763,6 +3813,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 (result): result is PushResult['results'][number] => Boolean(result)
             ),
             serverVersion: finalServerVersion,
+            historyIncarnation,
         };
     }
 

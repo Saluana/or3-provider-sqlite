@@ -1,3 +1,4 @@
+import { readHistoryIncarnation } from '../server/sync/history-incarnation';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { H3Event } from 'h3';
 import type { Kysely } from 'kysely';
@@ -157,7 +158,8 @@ describe('SQLite sync snapshot migration', () => {
             op_id: 'legacy-op-delete',
         });
 
-        const snapshot = await new SqliteSyncGatewayAdapter().snapshot(stubEvent, {
+        await (await import('../server/db/migrations/036_sync_history_incarnation')).up(migrationDb);
+        const snapshot = await new SqliteSyncGatewayAdapter().snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId: WORKSPACE_ID },
             pageSize: 10,
         });

@@ -1,3 +1,4 @@
+import { readHistoryIncarnation } from '../server/sync/history-incarnation';
 import { randomUUID } from 'node:crypto';
 import { validSyncPayload } from '../../../test/support/sync-payload';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -349,7 +350,7 @@ describe('dormant managed storage generation coordinator', () => {
             stamp: { deviceId: 'device', opId: randomUUID(), hlc: '2026-10-10T00:00:00.000Z-0000', clock: index + 1 },
             createdAt: now, attempts: 0, status: 'pending' as const,
         }));
-        await expect(adapter.push({} as H3Event, { scope: { workspaceId: key.workspaceId }, ops })).rejects.toThrow(/CLAIMED/);
+        await expect(adapter.push({} as H3Event, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: key.workspaceId }, ops })).rejects.toThrow(/CLAIMED/);
         expect(raw.prepare('SELECT count(*) AS n FROM s_messages').get()).toEqual({ n: 0 });
         expect(raw.prepare('SELECT count(*) AS n FROM change_log').get()).toEqual({ n: 0 });
         expect(raw.prepare('SELECT * FROM server_version_counter').all()).toEqual([]);

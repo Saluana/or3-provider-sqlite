@@ -1,3 +1,4 @@
+import { historyAssertion, historyBatch, readHistoryIncarnation, validateExpectedHistory, historyChanged } from './history-incarnation';
 import { randomUUID } from 'node:crypto';
 import type { H3Event } from 'h3';
 import type { PendingOp, PushResult } from '~~/shared/sync/types';
@@ -5,10 +6,10 @@ import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { SyncChangeSchema, SnapshotItemSchema, SyncRecordIdentifierSchema } from '~~/shared/sync/schemas';
 import { nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { SYNCED_TABLE_MAP } from '../db/schema';
-import { boundedSyncPayload, syncRows, syncBatch } from './unavailable-records';
+import { boundedSyncPayload, syncRows } from './unavailable-records';
 import type { D1SqlStatement } from '../db/d1';
 
-export type RepairGuard = { id: string; workspaceId: string; table: string; pk: string; clock: number; hlc: string; opId: string; deleted: number; materialized: boolean; tombstone: string | null };
+export type RepairGuard = { historyIncarnation: string; id: string; workspaceId: string; table: string; pk: string; clock: number; hlc: string; opId: string; deleted: number; materialized: boolean; tombstone: string | null };
 export function repairAssertion(guard: RepairGuard): D1SqlStatement {
     const current = guard.materialized
         ? `EXISTS (SELECT 1 FROM ${guard.table} WHERE workspace_id = ? AND id = ?
@@ -57,7 +58,7 @@ export async function maintainEvidence(event: H3Event, workspaceId: string, acti
         return { ...chunk as object, offset, chunkBytes:32768 };
     }
     if (!evidence.metadata_json) throw new Error('Evidence metadata requires explicit offline recovery');
-    const metadata = JSON.parse(evidence.metadata_json) as { table_name: string; pk: string; clock: number; hlc: string; op_id: string; kind?: string; op?: string; device_id?: string; server_version?: number; server_deleted_at?: number };
+    const metadata = JSON.parse(evidence.metadata_json) as { historyIncarnation?: string; table_name: string; pk: string; clock: number; hlc: string; op_id: string; kind?: string; op?: string; device_id?: string; server_version?: number; server_deleted_at?: number };
     if (action === 'revalidate') {
         let healthy = false;
         try {
@@ -76,6 +77,9 @@ export async function maintainEvidence(event: H3Event, workspaceId: string, acti
         return { id: evidence.id, valid: healthy, status: evidence.status };
     }
     if (action !== 'repair') throw new Error('Unknown evidence action');
+    validateExpectedHistory(input.historyIncarnation);
+    const historyIncarnation = await readHistoryIncarnation();
+    if(input.historyIncarnation !== historyIncarnation || metadata.historyIncarnation !== historyIncarnation) historyChanged(historyIncarnation);
     if (evidence.status !== 'unresolved') return {id:evidence.id,status:evidence.status};
     const table = Object.hasOwn(SYNCED_TABLE_MAP,metadata.table_name) ? SYNCED_TABLE_MAP[metadata.table_name] : undefined;
     if (!table || !SyncRecordIdentifierSchema.safeParse(metadata.pk).success || !Number.isSafeInteger(metadata.clock) || metadata.clock < 0 || !metadata.hlc || !metadata.op_id) {
@@ -95,7 +99,7 @@ export async function maintainEvidence(event: H3Event, workspaceId: string, acti
     const winner = current ?? (deletedRevision ? {clock:deletedRevision[0],hlc:deletedRevision[1],op_id:deletedRevision[2],deleted:1} : undefined);
     const isDeletion = metadata.op === 'delete' || metadata.kind === 'tombstone';
     if (!winner || !current && !isDeletion || winner.clock !== metadata.clock || winner.hlc !== metadata.hlc || winner.op_id !== metadata.op_id || newerDelete) {
-        await syncBatch([{sql:"UPDATE sync_unavailable_records SET status = 'superseded' WHERE workspace_id = ? AND id = ? AND status = 'unresolved'",parameters:[workspaceId,evidence.id]}]);
+        await historyBatch([historyAssertion(historyIncarnation),{sql:"UPDATE sync_unavailable_records SET status = 'superseded' WHERE workspace_id = ? AND id = ? AND status = 'unresolved'",parameters:[workspaceId,evidence.id]}],historyIncarnation);
         return {id:evidence.id,status:'superseded'};
     }
     if (input.operation !== undefined && input.operation !== 'put' && input.operation !== 'delete') throw new Error('Invalid repair operation');
@@ -105,7 +109,7 @@ export async function maintainEvidence(event: H3Event, workspaceId: string, acti
     const clock = nextSyncClock(winner.clock);
     const op: PendingOp = { id:opId,tableName:metadata.table_name,pk:metadata.pk,operation:input.operation === 'delete' ? 'delete' : 'put',
         payload:input.payload,stamp:{clock,hlc:`${Date.now().toString(36)}:000:repair`,opId,deviceId:'server:sync-repair'},createdAt:Date.now(),attempts:0,status:'pending' };
-    const result = await write(event,op,{id:evidence.id,workspaceId,table,pk:metadata.pk,...winner,opId:winner.op_id,materialized:!!current,tombstone:tombstone?.revision ?? null});
+    const result = await write(event,op,{historyIncarnation,id:evidence.id,workspaceId,table,pk:metadata.pk,...winner,opId:winner.op_id,materialized:!!current,tombstone:tombstone?.revision ?? null});
     if (!result.results[0]?.success || result.results[0]?.applied === false) throw new Error(result.results[0]?.error ?? 'Repair did not win');
     return {id:evidence.id,status:'repaired',opId,serverVersion:result.results[0].serverVersion};
 }
