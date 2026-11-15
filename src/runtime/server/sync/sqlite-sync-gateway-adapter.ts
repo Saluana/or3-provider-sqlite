@@ -10,6 +10,7 @@ import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspac
  */
 import type { H3Event } from 'h3';
 import { createHash } from 'node:crypto';
+import { digestUuid } from '../utils/digest-uuid';
 import { sql } from 'kysely';
 import { canRunSyncHistoryGc } from './history-gc-policy';
 import { createError } from 'h3';
@@ -255,15 +256,9 @@ function backgroundHistoryOpId(
     admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
     stage: 'thread' | 'user' | 'assistant' | 'finalize'
 ): string {
-    const hex = createHash('sha256')
+    return digestUuid(createHash('sha256')
         .update(`${admission.workspaceId}\0${admission.generationId}\0${stage}`)
-        .digest('hex')
-        .slice(0, 32)
-        .split('');
-    hex[12] = '4';
-    hex[16] = ((Number.parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
-    const value = hex.join('');
-    return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+        .digest('hex'));
 }
 
 function fingerprintPayload(tableName: string, operation: string, payload: unknown): unknown {
@@ -1432,7 +1427,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, baseVersion + newRows.length);
             const now = nowEpoch();
             newRows.forEach((row, index) => {
-                const opId = `background-tool:${createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex')}`;
+                const opId = digestUuid(createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex'));
                 const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
                 const sanitized = sanitizePayloadForSync('kv', row, 'put');
                 if (!sanitized) throw Object.assign(new Error('Invalid tool result payload'), { code: 'VALIDATION_ERROR' });

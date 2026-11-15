@@ -75,6 +75,7 @@ import * as m029 from './migrations/029_delegation_wait';
 import * as m030 from './migrations/030_storage_generations';
 import * as m031 from './migrations/031_storage_generation_uploads';
 import * as m032 from './migrations/032_sync_observations';
+import * as m033 from './migrations/033_tool_result_operation_ids';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -108,7 +109,8 @@ const migrations: Record<string, Migration> = {
     '029_delegation_wait': m029,
     '030_storage_generations': m030,
     '031_storage_generation_uploads': m031,
-    '032_sync_observations': m032
+    '032_sync_observations': m032,
+    '033_tool_result_operation_ids': m033
 };
 
 class StaticMigrationProvider implements MigrationProvider {
