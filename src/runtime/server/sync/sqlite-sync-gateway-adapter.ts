@@ -150,8 +150,8 @@ function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number 
     let count = 0;
     let bytes = 0;
     for (const row of sizes.slice(0, limit)) {
-        const size = row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES || row.metadata_bytes > SYNC_METADATA_BYTES
-            ? 1024 : Math.max(0, Number(row.payload_bytes) || 0) + row.metadata_bytes;
+        const size = (row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES ? 1024 : Math.max(0, Number(row.payload_bytes) || 0))
+            + Math.min(row.metadata_bytes, SYNC_METADATA_BYTES);
         if (count && bytes + size > MAX_SYNC_PAGE_BYTES) break;
         count++;
         bytes += size;

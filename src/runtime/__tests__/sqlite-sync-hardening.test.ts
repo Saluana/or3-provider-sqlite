@@ -236,14 +236,45 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
             snapshot = await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10});
         } finally {spy.mockRestore();}
         expect(oversizedFields).toEqual([]);
-        expect(pull).toMatchObject({nextCursor:2,hasMore:false,changes:[{pk:'next'}],unavailable:[{pk:'large-stamp'}]});
-        expect(snapshot).toMatchObject({nextPageToken:null,items:[{pk:'next'}],unavailable:[{pk:'large-stamp'}]});
+        expect(pull).toMatchObject({nextCursor:1,hasMore:true,changes:[],unavailable:[{pk:'large-stamp'}]});
+        expect(await adapter.pull(event,{scope,cursor:1,limit:10})).toMatchObject({nextCursor:2,hasMore:false,changes:[{pk:'next'}]});
+        expect(snapshot).toMatchObject({items:[],unavailable:[{pk:'large-stamp'}]});
+        expect(snapshot.nextPageToken).toEqual(expect.any(String));
+        expect(await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10,pageToken:snapshot.nextPageToken!})).toMatchObject({nextPageToken:null,items:[{pk:'next'}]});
         const id = snapshot.unavailable![0]!.evidenceRef;
         const metadata = await raw.prepare("SELECT length(cast(metadata_json AS blob)) AS bytes FROM sync_unavailable_records WHERE id = ?").get(id) as {bytes:number};
         expect(metadata.bytes).toBeGreaterThan(4000000);
         expect((await adapter.snapshot(event,{scope,tables:['kv'],pageSize:10})).unavailable![0]!.evidenceRef).toBe(id);
         expect((await adapter.pull(event,{scope,cursor:0,limit:10})).unavailable![0]!.evidenceRef).toBe(pull.unavailable![0]!.evidenceRef);
         expect(await raw.prepare('SELECT count(*) AS n FROM sync_unavailable_records').get()).toEqual({n:2});
+    });
+    it('bounds aggregate identity transfer before rejecting an out-of-domain legacy snapshot token', async () => {
+        await raw.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 8)
+            INSERT INTO s_kv (id,workspace_id,data_json,clock,hlc,device_id,op_id,deleted,created_at,updated_at)
+            SELECT i || replace(hex(zeroblob(65536)), '0', 'k'), ?, '{bad', 1,
+                replace(hex(zeroblob(600000)), '0', 'h'), 'test','legacy',0,1,1 FROM n`).run(scope.workspaceId);
+        let largestBatch = 0;
+        const account = (rows: unknown[])=>{
+            let bytes = 0;
+            for (const row of rows) for (const value of Object.values(row as object)) if (typeof value === 'string') bytes += Buffer.byteLength(value);
+            largestBatch = Math.max(largestBatch,bytes);
+        };
+        const prepare = d1?.database.prepare.bind(d1.database);
+        const observe = (statement: ReturnType<NonNullable<typeof prepare>>): ReturnType<NonNullable<typeof prepare>> => {
+            const bind = statement.bind.bind(statement); const all = statement.all.bind(statement);
+            statement.bind = (...values)=>observe(bind(...values));
+            statement.all = async <T>()=>{const result = await all<T>();account(result.results ?? []);return result;};return statement;
+        };
+        const nativePrepare = driver === 'native' ? raw.prepare.bind(raw) : undefined;
+        const spy = d1 && prepare ? vi.spyOn(d1.database,'prepare').mockImplementation(query=>observe(prepare(query)))
+            : vi.spyOn(raw,'prepare').mockImplementation(query=>{
+                const statement = nativePrepare!(query); const all = statement.all.bind(statement);
+                statement.all = (...parameters)=>{const rows = all(...parameters);account(rows);return rows;};return statement;
+            });
+        try {await expect(adapter.snapshot(event,{scope,tables:['kv'],pageSize:1000})).rejects.toThrow();}
+        finally {spy.mockRestore();}
+        expect(largestBatch).toBeGreaterThan(0);
+        expect(largestBatch).toBeLessThanOrEqual(2*1024*1024);
     });
     it('repairs the current orphan tombstone with a fresh winning delete at a new version', async () => {
         const deletion = {...op('orphan'),operation:'delete' as const,payload:undefined};
