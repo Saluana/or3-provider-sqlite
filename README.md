@@ -231,15 +231,26 @@ upload intents, and Connect credential/lifecycle hardening and rate limits.
 
 All tables use snake_case aligned with the sync wire format.
 
+Native SQLite migrations commit pending DDL, data changes, and migration ledger
+entries atomically. D1 retains its separate nontransactional migration path.
+Historical additive steps in 006, 007, 019, and 021 resume only when existing
+columns match their expected definitions; 006 also validates existing snapshot
+schema. A leftover historical rebuild table stops startup with a recovery error
+and preserves the surviving tables for operator inspection. Do not delete those
+tables to bypass the error. Migration 033 uses temporary repair indexes for its
+legacy tool-operation updates, preserves its deterministic UUID mapping, and
+does not rerun when already recorded as complete.
+
 ### Sync semantics
 
 - **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` values for admitted change-log entries → applies LWW to materialized tables → upserts tombstones for deletes. D1 admission and version allocation share one atomic batch; rejected notification races consume no versions.
-- **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, `oldestRetainedVersion`, and `requiresSnapshot` when the cursor is behind retained history
+- **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, and `oldestRetainedVersion`. Before reading payloads, a cursor below `max(0, oldestRetainedVersion - 1)` or ahead of the current head receives an empty `requiresSnapshot` response retaining the request cursor. This immediate ahead-of-head check does not detect every database history replacement.
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
 - **Page size**: pull and snapshot responses target at most 1 MiB of serialized JSON, including the envelope, as well as their row limit. A preliminary size scan limits payloads transferred from the database; the database may still read rows to determine their sizes. A single oversized record is returned whole so pagination always progresses. Filtered notifications still advance the pull cursor.
 - **Cursor**: forward-only tracking per authenticated user and device within a workspace. Migration 028 changes the unique key so accounts sharing a browser device ID cannot claim each other’s acknowledgements. Legacy unowned rows are never adopted and expire through normal cursor GC.
-- **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
+- **Retention safety**: GC is enabled only under the explicit `snapshot-v1` capability. Change-log GC removes only the contiguous version prefix that is both older than retention and acknowledged by every active device, stopping at the first recent or unacknowledged version. It does not certify history already damaged by older GC; that requires a verified recovery boundary.
 - **Notifications**: push forces `payload.user_id` to the session user on puts and deletes; foreign notification writes are rejected. Successful deletes remain visible to the owner's other devices while pull/snapshot omit other users' rows.
+- **Numeric limits**: terminal background writes reject exhausted clocks, and all version allocations reject unsafe integers with `VALIDATION_ERROR`. Rejection rolls back the transaction or D1 batch, preserving materialized rows, logs, counters, and generation receipts.
 - **Workspace Files/Trash admission**: a client without `workspaceItemCapability: 'v1'` cannot replace or delete a canonical post/project carrying workspace Files/Trash semantics, even if the submitted payload omits those fields. Native write transactions and the D1 atomic batch check canonical state before any operation or version allocation; a rejected batch returns HTTP 426 and leaves sibling writes unchanged.
 
 Snapshot continuations are bound to the capturing user and workspace, including
@@ -377,6 +388,14 @@ The canonical-history qualification lane defaults to a sibling `../or3-chat` che
 Persistent Projects uses this same capability for opaque `or3:project-settings`, `or3:project-memory`, and `or3:project-source` posts. Preserve their JSON, metadata, and every original/extraction `file_hashes` reference. The project-aware canonical reader resolves `threads.project_id` or a single legacy membership in its authorized SQLite snapshot, returning `project_ownership: resolved | conflict`. String entries and JSON-encoded membership arrays remain supported; chat IDs are trimmed and entry kinds ignore case and surrounding whitespace, matching the host's legacy normalization. Malformed or ambiguous memberships do not grant server execution. Hosts without this result must refuse project-sensitive server admission rather than infer ownership from the visible UI.
 
 Explicit ownership requires a live project in the same workspace. A missing or deleted project releases the chat even if a concurrent thread write retained its former pointer; legacy folders do not override that explicit release. Canonical reads leave the persisted pointer untouched.
+
+Malformed or oversized
+legacy project membership returns `status: 'scope_incomplete'` rather than
+assuming the chat is unowned. Explicit ownership and independent message reads
+remain usable. Legacy membership reads fetch one size-bounded project payload
+at a time through composite-key seeks; they still scan workspace projects and
+do not claim indexed membership lookup. Deleted message placeholders use their authoritative column
+identity/revision and do not fail a batch of sibling canonical reads.
 
 Current hosts refuse server tools and workflows when the reader cannot return
 resolved canonical ownership. Older providers require an upgrade even for chats

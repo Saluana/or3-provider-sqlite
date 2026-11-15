@@ -11,15 +11,18 @@ export function resolveCanonicalProjectOwnership(
             .get(workspaceId, explicitOwner);
         return { projectId: owner ? explicitOwner : null, status: 'resolved' };
     }
-    // Stream legacy memberships and bound each transfer by the sync payload
-    // ceiling. Unknown membership is uncertainty, never permission to run an
-    // otherwise unowned chat. Explicit owners do not depend on this scan.
-    const projects = raw.prepare(`SELECT id,
+    // Read one size-bounded membership at a time. Some native drivers buffer
+    // iterate(), so use composite-PK seeks rather than materializing a workspace.
+    // Unknown membership is uncertainty, never permission to run an unowned chat.
+    type Project = { id: string; data_json: string | null };
+    const select = `SELECT id,
         CASE WHEN length(cast(data_json AS blob)) <= 262144 THEN data_json END AS data_json
-        FROM s_projects WHERE workspace_id = ? AND COALESCE(deleted, 0) = 0`)
-        .iterate(workspaceId) as IterableIterator<{ id: string; data_json: string | null }>;
+        FROM s_projects WHERE workspace_id = ? AND COALESCE(deleted, 0) = 0`;
+    const first = raw.prepare(`${select} ORDER BY id LIMIT 1`);
+    const next = raw.prepare(`${select} AND id > ? ORDER BY id LIMIT 1`);
     let owner: string | null = null;
-    for (const project of projects) {
+    for (let project = first.get(workspaceId) as Project | undefined;
+        project; project = next.get(workspaceId, project.id) as Project | undefined) {
         if (project.data_json === null) return unresolved;
         let entries: unknown;
         try {
