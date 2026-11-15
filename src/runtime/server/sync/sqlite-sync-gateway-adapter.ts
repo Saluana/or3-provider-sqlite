@@ -2769,62 +2769,29 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         if (!canRunSyncHistoryGc()) return;
         const cutoff = nowEpoch() - input.retentionSeconds;
+        // Age need not increase with server version (wall clocks can move).
+        // The first recent row fences all later history, even if it is old.
+        const deletePrefix = `DELETE FROM change_log
+            WHERE workspace_id = ? AND server_version < COALESCE((
+                SELECT MIN(server_version) FROM change_log
+                WHERE workspace_id = ? AND created_at >= ?
+            ), 9223372036854775807)
+            AND server_version <= COALESCE((
+                SELECT MIN(last_seen_version) FROM device_cursors WHERE workspace_id = ?
+            ), 9223372036854775807)`;
+        const workspaceId = input.scope.workspaceId;
         if (isD1Driver()) {
             await d1Batch([
-                {
-                    sql: `DELETE FROM device_cursors
-                     WHERE workspace_id = ? AND updated_at < ?`,
-                    parameters: [input.scope.workspaceId, cutoff],
-                },
-                {
-                    sql: `DELETE FROM change_log
-                     WHERE workspace_id = ?
-                       AND created_at < ?
-                       AND (
-                           NOT EXISTS (
-                               SELECT 1 FROM device_cursors
-                               WHERE workspace_id = ?
-                           )
-                           OR server_version <= (
-                               SELECT MIN(last_seen_version)
-                               FROM device_cursors
-                               WHERE workspace_id = ?
-                           )
-                       )`,
-                    parameters: [
-                        input.scope.workspaceId,
-                        cutoff,
-                        input.scope.workspaceId,
-                        input.scope.workspaceId,
-                    ],
-                },
+                { sql: 'DELETE FROM device_cursors WHERE workspace_id = ? AND updated_at < ?', parameters: [workspaceId, cutoff] },
+                { sql: deletePrefix, parameters: [workspaceId, workspaceId, cutoff, workspaceId] },
             ]);
             return;
         }
         const raw = getRawDb();
         raw.transaction(() => {
-            // See gcTombstones: inactive devices are snapshot-bootstrapped, so
-            // they must not pin historical rows forever.
-            raw.prepare(
-                `DELETE FROM device_cursors
-                 WHERE workspace_id = ? AND updated_at < ?`
-            ).run(input.scope.workspaceId, cutoff);
-            const cursor = raw.prepare(
-                `SELECT MIN(last_seen_version) AS min_version
-                 FROM device_cursors WHERE workspace_id = ?`
-            ).get(input.scope.workspaceId) as { min_version: number | null };
-            if (cursor.min_version === null) {
-                raw.prepare(
-                    `DELETE FROM change_log
-                     WHERE workspace_id = ? AND created_at < ?`
-                ).run(input.scope.workspaceId, cutoff);
-            } else {
-                raw.prepare(
-                    `DELETE FROM change_log
-                     WHERE workspace_id = ? AND created_at < ? AND server_version <= ?`
-                ).run(input.scope.workspaceId, cutoff, cursor.min_version);
-            }
-        })();
+            raw.prepare('DELETE FROM device_cursors WHERE workspace_id = ? AND updated_at < ?').run(workspaceId, cutoff);
+            raw.prepare(deletePrefix).run(workspaceId, workspaceId, cutoff, workspaceId);
+        }).immediate();
     }
 
     private async reserveUploadIntentInD1(

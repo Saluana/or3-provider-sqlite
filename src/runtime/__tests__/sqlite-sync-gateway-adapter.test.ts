@@ -2281,6 +2281,28 @@ describe('SqliteSyncGatewayAdapter', () => {
     });
 
     describe('GC', () => {
+        it.each(['native', 'd1'])('collects only the age-and-ACK eligible version prefix on %s', async driver => {
+            if (driver === 'd1') await useD1TestDatabase();
+            await adapter.push(stubEvent, makeBatch(Array.from({ length: 5 }, (_, i) => makeOp({ tableName: 'threads', pk: `prefix-${i}` }))));
+            const db = getSqliteDb();
+            const collect = () => adapter.gcChangeLog(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, retentionSeconds: 86400 });
+            const versions = async () => (await db.selectFrom('change_log').select('server_version').orderBy('server_version').execute()).map(row => row.server_version);
+            await sql`UPDATE change_log SET created_at = 0 WHERE server_version IN (1, 3, 5)`.execute(db);
+            await collect();
+            expect(await versions()).toEqual([2, 3, 4, 5]);
+            expect(await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 10 }))
+                .toMatchObject({ oldestRetainedVersion: 2, requiresSnapshot: true, nextCursor: 0 });
+            await sql`UPDATE change_log SET created_at = 0 WHERE server_version = 2`.execute(db);
+            await adapter.updateCursor(makeSessionEvent('user-a'), { scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 2 });
+            await collect();
+            expect(await versions()).toEqual([3, 4, 5]);
+            await sql`DELETE FROM device_cursors`.execute(db);
+            await collect();
+            expect(await versions()).toEqual([4, 5]);
+            expect(await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 3, limit: 10 }))
+                .toMatchObject({ oldestRetainedVersion: 4, requiresSnapshot: false });
+        });
+
         it('gcChangeLog deletes only old history acknowledged by every device', async () => {
             // Push some ops
             const ops = Array.from({ length: 5 }, (_, i) =>
