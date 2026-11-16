@@ -67,30 +67,35 @@ describe.each(['native', 'd1', ...(process.env.OR3_PROJECT_HOST_ROOT ? ['host-ht
         adapter = new SqliteSyncGatewayAdapter(); history = await readHistoryIncarnation();
         if (driver === 'host-http') http = await hostHttp();
     });
-    it.each(['losing-put', 'losing-delete', 'replay', 'legacy-receipt', 'oversized', 'invalid-payload', 'invalid-revision', 'notification-owner'])('%s holds only the affected intent with exact durable originals', async kind => {
+    it.each(['losing-put', 'losing-delete', 'replay', 'legacy-receipt', 'oversized', 'invalid-payload', 'invalid-revision', 'notification-owner', 'deleted-notification-owner'])('%s holds only the affected intent with exact durable originals', async kind => {
         const existing = op('bad', 10);
-        if (kind === 'notification-owner') {
+        const notification = kind.endsWith('notification-owner');
+        if (notification) {
             existing.tableName = 'notifications';
             existing.payload = { id: 'bad', user_id: 'owner', type: 'info', title: 'notice', deleted: false, created_at: 1, updated_at: 1, clock: existing.stamp.clock, hlc: existing.stamp.hlc, op_id: existing.stamp.opId };
         }
         expect((await push([existing])).results[0]?.success).toBe(true);
-        const table = kind === 'notification-owner' ? 's_notifications' : 's_kv';
+        if (kind === 'deleted-notification-owner') {
+            expect((await push([{ ...op('bad', 20), tableName: 'notifications', operation: 'delete', payload: undefined }])).results[0]?.success).toBe(true);
+        }
+        const nextVersion = kind === 'deleted-notification-owner' ? 3 : 2;
+        const table = notification ? 's_notifications' : 's_kv';
         const badBytes = kind === 'oversized' ? JSON.stringify({ value: 'x'.repeat(400_000) }) : kind === 'invalid-payload' ? '{}' : '{';
         if (kind === 'legacy-receipt') await execute('UPDATE change_log SET payload_json=?,intent_fingerprint=NULL WHERE op_id=?', badBytes, existing.stamp.opId);
         else if (kind === 'invalid-revision') await execute(`UPDATE ${table} SET clock=-1 WHERE id='bad'`);
         else await execute(`UPDATE ${table} SET data_json=? WHERE id='bad'`, badBytes);
         const bad = ['replay', 'legacy-receipt'].includes(kind) ? existing : { ...op('bad'), tableName: existing.tableName,
             ...(kind === 'losing-delete' ? { operation: 'delete' as const, payload: undefined } : {}),
-            ...(kind === 'notification-owner' ? { payload: existing.payload } : {}) };
-        if (kind === 'notification-owner') bad.payload = {...bad.payload as Record<string,unknown>,clock:bad.stamp.clock,hlc:bad.stamp.hlc,op_id:bad.stamp.opId};
+            ...(notification ? { payload: existing.payload } : {}) };
+        if (notification) bad.payload = {...bad.payload as Record<string,unknown>,clock:bad.stamp.clock,hlc:bad.stamp.hlc,op_id:bad.stamp.opId};
         const originalIntent = JSON.parse(JSON.stringify(bad));
         const healthy = op('healthy');
         const response = await push([healthy, bad]);
-        expect(response.results[0]).toMatchObject({ success: true, applied: true, serverVersion: 2 });
+        expect(response.results[0]).toMatchObject({ success: true, applied: true, serverVersion: nextVersion });
         expect(response.results[1]).toMatchObject({ success: false, errorCode: 'STORED_RECORD_UNAVAILABLE', evidenceRef: expect.any(String) });
         expect(response.results[1]).not.toHaveProperty('replayed');
         expect(response.results[1]).not.toHaveProperty('payload');
-        expect(await rows('SELECT value FROM server_version_counter')).toEqual([{ value: 2 }]);
+        expect(await rows('SELECT value FROM server_version_counter')).toEqual([{ value: nextVersion }]);
         expect(await rows("SELECT id FROM s_kv WHERE id='healthy'")).toEqual([{ id: 'healthy' }]);
         const reference = (response.results[1] as { evidenceRef: string }).evidenceRef;
         const evidence = await rows<{ payload_json: string; metadata_json: string }>('SELECT payload_json,metadata_json FROM sync_unavailable_records WHERE id=?', reference);

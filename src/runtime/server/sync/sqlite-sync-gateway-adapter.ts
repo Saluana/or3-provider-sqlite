@@ -2131,6 +2131,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     )
                     .get(op.pk, workspaceId) as { owner: string | null } | undefined;
                 const owner = owned?.owner;
+                if (owned && !owner) {
+                    uniqueResults.push(retainPushFailureNative(op, new StoredRecordUnavailable(
+                        storedCanonicalSource(workspaceId, op.tableName, op.pk), 'notification_owner_unavailable'
+                    ), input));
+                    failedBeforeAlloc.add(op.stamp.opId);
+                    continue;
+                }
                 if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                     failedBeforeAlloc.add(op.stamp.opId);
                     uniqueResults.push({
