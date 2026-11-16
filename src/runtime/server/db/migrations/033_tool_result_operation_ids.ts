@@ -25,8 +25,10 @@ export async function up(db: Kysely<unknown>): Promise<void> {
                 if (!match) continue;
                 const opId = digestUuid(match[1]!);
                 const assignment = payload
-                    ? sql`, ${sql.ref(payload)} = CASE WHEN json_extract(${sql.ref(payload)}, '$.op_id') = ${oldId}
-                        THEN json_set(${sql.ref(payload)}, '$.op_id', ${opId}) ELSE ${sql.ref(payload)} END`
+                    ? sql`, ${sql.ref(payload)} = CASE WHEN json_valid(${sql.ref(payload)}) THEN
+                        CASE WHEN json_extract(${sql.ref(payload)}, '$.op_id') = ${oldId}
+                            THEN json_set(${sql.ref(payload)}, '$.op_id', ${opId}) ELSE ${sql.ref(payload)} END
+                        ELSE ${sql.ref(payload)} END`
                     : sql``;
                 await sql`UPDATE ${sql.table(table)} SET op_id = ${opId}${assignment} WHERE op_id = ${oldId}`.execute(db);
             }

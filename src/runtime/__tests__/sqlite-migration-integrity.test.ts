@@ -77,6 +77,35 @@ describe('SQLite migration integrity boundaries', () => {
         expect((await sql`SELECT name FROM kysely_migration WHERE name >= '019_background_generation_history'`.execute(db)).rows).toEqual([]);
     });
 
+    it.each(['native', 'd1'])('starts a published pre-034/032 schema with malformed incident bytes on %s', async driver => {
+        const d1 = driver === 'd1' ? createD1TestDatabase() : undefined;
+        try {
+            const db = await initializeSqliteDb(d1 ? {driver:'d1',d1Database:d1.database} : {path:':memory:'});
+            await migrateThrough(db as unknown as Kysely<unknown>, '032_sync_observations');
+            expect((await sql`PRAGMA table_info(change_log)`.execute(db)).rows).not.toContainEqual(expect.objectContaining({name:'intent_fingerprint'}));
+            const oldId = 'background-tool:' + 'a'.repeat(64);
+            await sql`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
+                VALUES ('incident','ws',1,'kv','bad','put','{',1,'legacy:1','test',${oldId},1)`.execute(db);
+            await sql`INSERT INTO s_kv (id,workspace_id,data_json,clock,hlc,op_id) VALUES ('bad','ws','{',1,'legacy:1',${oldId})`.execute(db);
+            await sql`INSERT INTO server_version_counter VALUES ('ws',1)`.execute(db);
+            await runMigrations(db);
+            const repairedId = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
+            expect((await sql`SELECT op_id,payload_json FROM change_log`.execute(db)).rows).toEqual([{op_id:repairedId,payload_json:'{'}]);
+            expect((await sql`SELECT op_id,data_json FROM s_kv`.execute(db)).rows).toEqual([{op_id:repairedId,data_json:'{'}]);
+            expect((await sql`SELECT name FROM kysely_migration WHERE name > '032_sync_observations' ORDER BY name`.execute(db)).rows).toEqual([
+                {name:'033_tool_result_operation_ids'},{name:'034_sync_intent_fingerprint'},{name:'035_sync_unavailable_records'},{name:'036_sync_history_incarnation'}]);
+            const {SqliteSyncGatewayAdapter} = await import('../server/sync/sqlite-sync-gateway-adapter');
+            const {readHistoryIncarnation} = await import('../server/sync/history-incarnation');
+            const page = await new SqliteSyncGatewayAdapter().pull({} as import('h3').H3Event,{scope:{workspaceId:'ws'},cursor:0,limit:10,historyIncarnation:await readHistoryIncarnation()});
+            expect(page).toMatchObject({changes:[],nextCursor:1,unavailable:[{evidenceRef:expect.any(String)}]});
+            expect((await sql`SELECT payload_json FROM sync_unavailable_records`.execute(db)).rows).toEqual([{payload_json:'{'}]);
+            // The ledger owns no-rerun; do not delete or forge an entry.
+            await sql`UPDATE s_kv SET op_id=${oldId}`.execute(db);
+            await runMigrations(db);
+            expect((await sql`SELECT op_id FROM s_kv`.execute(db)).rows).toEqual([{op_id:oldId}]);
+        } finally { await destroySqliteDb(); d1?.close(); }
+    });
+
     it('repairs legacy tool IDs with indexed updates across growing tables and never reruns completed 033', async () => {
         const db = await initializeSqliteDb({ path: ':memory:' });
         await migrateThrough(db as unknown as Kysely<unknown>, '032_sync_observations');
