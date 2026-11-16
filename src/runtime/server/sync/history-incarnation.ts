@@ -61,21 +61,3 @@ export async function historyBatch(statements: D1SqlStatement[], expected?: stri
         throw error;
     }
 }
-
-/** Only for a stopped replacement candidate. The caller durably journals a fresh
- * UUID before extraction and fences every writer/startup. Reconciliation may
- * repeat that UUID only for the same stopped bytes; any extraction needs a new one. */
-export async function rotateSyncHistory(incarnation: string): Promise<void> {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(incarnation)) {
-        throw new Error('Journaled fresh UUID required');
-    }
-    const expected = await readHistoryIncarnation();
-    await historyBatch([
-        historyAssertion(expected),
-        { sql: 'DELETE FROM sync_snapshot_items' },
-        { sql: 'DELETE FROM sync_snapshots' },
-        { sql: 'DELETE FROM device_cursors' },
-        { sql: 'UPDATE sync_history SET incarnation=? WHERE id=1', parameters: [incarnation] },
-    ], expected);
-    if (await readHistoryIncarnation() !== incarnation) throw new Error('Sync history reset verification failed');
-}

@@ -28,8 +28,11 @@ async function execute(query:string,...parameters:unknown[]) {
     else getRawDb().prepare(query).run(...parameters);
 }
 async function rotate(token=randomUUID()) {
-    const { rotateSyncHistory } = await import('../server/sync/history-incarnation');
-    await rotateSyncHistory(token);
+    // Fixture for runtime fencing after offline replacement. The real target
+    // reset implementation is exercised below, never a provider-only helper.
+    await execute('DELETE FROM sync_snapshots');
+    await execute('DELETE FROM device_cursors');
+    await execute('UPDATE sync_history SET incarnation=? WHERE id=1',token);
     return token;
 }
 afterEach(async()=>{vi.restoreAllMocks();vi.useRealTimers();await destroySqliteDb();d1?.close();d1=undefined;});
@@ -117,7 +120,7 @@ describe.each(['native','d1'])('%s history incarnation',driver=>{
         await expect(adapter.backupSnapshot(event,{scope,pageSize:1,historyIncarnation:history})).rejects.toMatchObject({statusCode:409});
         expect(await rows('SELECT * FROM sync_snapshots')).toEqual([]);
     });
-    it('atomically resets sessions/ACKs, preserves history/evidence and rejects pre-reset tokens',async()=>{
+    it('rejects pre-reset tokens and retains evidence across the DB history invariant',async()=>{
         await adapter.push(event,{scope,historyIncarnation:history,ops:[op('a'),op('b')]});
         await execute("UPDATE s_kv SET data_json='{' WHERE id='a'");
         const first=await adapter.snapshot(event,{scope,pageSize:1,historyIncarnation:history});
@@ -140,22 +143,6 @@ describe.each(['native','d1'])('%s history incarnation',driver=>{
         await rotate(next); // journal reconciliation of the same stopped candidate
         expect(await adapter.getHistoryIncarnation(event,scope)).toBe(next);
         expect(await rotate()).not.toBe(next);
-    });
-    it('rolls back an interrupted reset and reconciles the same stopped candidate',async()=>{
-        await adapter.push(event,{scope,historyIncarnation:history,ops:[op('a'),op('b')]});
-        const page=await adapter.snapshot(event,{scope,historyIncarnation:history,pageSize:1});
-        await adapter.updateCursor(event,{scope,deviceId:'test',version:2,historyIncarnation:history});
-        await execute("CREATE TRIGGER reset_fault BEFORE DELETE ON device_cursors BEGIN SELECT raise(ABORT,'reset fault'); END");
-        const next=randomUUID();
-        await expect(rotate(next)).rejects.toThrow('reset fault');
-        expect(await adapter.getHistoryIncarnation(event,scope)).toBe(history);
-        expect(await rows('SELECT id FROM sync_snapshots')).toEqual([{id:page.snapshotId}]);
-        expect(await rows('SELECT * FROM sync_snapshot_items')).toHaveLength(2);
-        expect(await rows('SELECT * FROM device_cursors')).toHaveLength(1);
-        await execute('DROP TRIGGER reset_fault');
-        await rotate(next); await rotate(next);
-        expect(await adapter.getHistoryIncarnation(event,scope)).toBe(next);
-        expect(await rows('SELECT * FROM device_cursors')).toEqual([]);
     });
     it('resumes initial migration atomically and preserves a committed singleton on ledger retry',async()=>{
         await execute("DELETE FROM kysely_migration WHERE name='036_sync_history_incarnation'");
@@ -245,6 +232,14 @@ describe.each(['native','d1'])('%s history incarnation',driver=>{
                 resetHistory(DatabaseCtor:typeof Database,path:string,incarnation:string,migrations:string[]):{historyIncarnation:string};
             };
             const next=randomUUID();
+            const interrupted=new Database(path);
+            interrupted.exec("CREATE TRIGGER reset_fault BEFORE DELETE ON device_cursors BEGIN SELECT raise(ABORT,'reset fault'); END");
+            expect(() => helper.resetHistory(Database,path,next,names)).toThrow('reset fault');
+            expect(interrupted.prepare('SELECT incarnation FROM sync_history').get()).toEqual({incarnation:history});
+            expect(interrupted.prepare('SELECT id FROM sync_snapshots').get()).toEqual({id:page.snapshotId});
+            expect(interrupted.prepare('SELECT count(*) AS n FROM sync_snapshot_items').get()).toEqual({n:2});
+            expect(interrupted.prepare('SELECT count(*) AS n FROM device_cursors').get()).toEqual({n:1});
+            interrupted.exec('DROP TRIGGER reset_fault'); interrupted.close();
             expect(helper.resetHistory(Database,path,next,names)).toMatchObject({historyIncarnation:next});
             const copy=new Database(path);
             try {
