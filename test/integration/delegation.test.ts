@@ -1,3 +1,6 @@
+import { randomUUID } from 'node:crypto';
+import { validSyncPayload } from '../support/sync-payload';
+import { readHistoryIncarnation } from '#sqlite-runtime/server/sync/history-incarnation';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp, toWebHandler } from 'h3';
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -27,6 +30,15 @@ import { projectJobView, projectJobViewWithChildStatus } from '~~/server/utils/b
 import { getJobLiveState } from '~~/server/utils/background-jobs/viewers';
 import { modelSearchDefinition } from '~~/shared/openrouter/delegation-model-catalog';
 import type { ChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
+import { parseToolResultArtifact, readToolResultStorage } from '~~/shared/chat/tool-result-artifact';
+
+async function readToolOutput(value: string): Promise<string> {
+    if (!parseToolResultArtifact(value)) return value;
+    return readToolResultStorage(value, async id => {
+        const row = getRawDb().prepare('SELECT data_json, deleted FROM s_kv WHERE id = ?').get(id) as { data_json: string; deleted: number } | undefined;
+        return row ? { ...JSON.parse(row.data_json), deleted: Boolean(row.deleted) } : undefined;
+    });
+}
 
 const limits = vi.hoisted(() => ({ active: 10 }));
 const draftStore = vi.hoisted(() => ({ provider: undefined as SqliteBackgroundJobProvider | undefined }));
@@ -76,10 +88,10 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
     const actor = { userId: 'owner', workspaceId: 'workspace' };
     const history: ChatGenerationAdmissionEnvelope = { version: 1, kind: 'new-turn', admissionId: 'parent-admission',
         generationId: 'parent-generation', workspaceId: actor.workspaceId, threadId: 'parent-thread', messageId: 'parent-assistant',
-        thread: { id: 'parent-thread', clock: 1 },
-        userMessage: { id: 'parent-user', thread_id: 'parent-thread', role: 'user', clock: 1 },
-        assistantMessage: { id: 'parent-assistant', thread_id: 'parent-thread', role: 'assistant', clock: 1,
-            pending: true, data: { generation_id: 'parent-generation' } } };
+        thread: validSyncPayload('threads', 'parent-thread', { id: 'parent-thread', clock: 1 }),
+        userMessage: validSyncPayload('messages', 'parent-user', { id: 'parent-user', thread_id: 'parent-thread', role: 'user', clock: 1 }),
+        assistantMessage: validSyncPayload('messages', 'parent-assistant', { id: 'parent-assistant', thread_id: 'parent-thread', role: 'assistant', clock: 1,
+            pending: true, data: { generation_id: 'parent-generation' } }) };
 
     function enableDraft() {
         provider = new SqliteBackgroundJobProvider();
@@ -128,10 +140,10 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         const delegate = { type: 'function' as const, function: { name: 'delegate_chat', description: 'Delegate',
             parameters: { type: 'object' as const, properties: {} } } };
         const admission: ChatGenerationAdmissionEnvelope = { ...history, admissionId: 'new-admission', generationId: 'new-generation',
-            threadId: 'new-thread', messageId: 'new-assistant', thread: { id: 'new-thread', clock: 1 },
-            userMessage: { id: 'new-user', thread_id: 'new-thread', role: 'user', clock: 1 },
-            assistantMessage: { id: 'new-assistant', thread_id: 'new-thread', role: 'assistant', clock: 1,
-                pending: true, data: { generation_id: 'new-generation' } } };
+            threadId: 'new-thread', messageId: 'new-assistant', thread: validSyncPayload('threads', 'new-thread', { id: 'new-thread', clock: 1 }),
+            userMessage: validSyncPayload('messages', 'new-user', { id: 'new-user', thread_id: 'new-thread', role: 'user', clock: 1 }),
+            assistantMessage: validSyncPayload('messages', 'new-assistant', { id: 'new-assistant', thread_id: 'new-thread', role: 'assistant', clock: 1,
+                pending: true, data: { generation_id: 'new-generation' } }) };
         let release!: () => void;
         const barrier = new Promise<void>(resolve => { release = resolve; });
         let entered!: () => void;
@@ -350,10 +362,10 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
             _context: { version: 1, user_max_context_tokens: 50_000, requested_completion_tokens: null } };
         const otherHistory: ChatGenerationAdmissionEnvelope = { ...history, admissionId: 'other-admission',
             generationId: 'other-generation', threadId: 'other-thread', messageId: 'other-assistant',
-            thread: { id: 'other-thread', clock: 1 },
-            userMessage: { id: 'other-user', thread_id: 'other-thread', role: 'user', clock: 1 },
-            assistantMessage: { id: 'other-assistant', thread_id: 'other-thread', role: 'assistant', clock: 1,
-                pending: true, data: { generation_id: 'other-generation' } } };
+            thread: validSyncPayload('threads', 'other-thread', { id: 'other-thread', clock: 1 }),
+            userMessage: validSyncPayload('messages', 'other-user', { id: 'other-user', thread_id: 'other-thread', role: 'user', clock: 1 }),
+            assistantMessage: validSyncPayload('messages', 'other-assistant', { id: 'other-assistant', thread_id: 'other-thread', role: 'assistant', clock: 1,
+                pending: true, data: { generation_id: 'other-generation' } }) };
         await sync.admitChatGeneration(actor, otherHistory);
         vi.stubGlobal('fetch', vi.fn(async () => sse({ choices: [{ delta: { tool_calls: [
             { index: 0, id: 'delegate-call', function: { name: 'delegate_chat',
@@ -437,10 +449,10 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
             const suffix = String(index);
             const envelope: ChatGenerationAdmissionEnvelope = { ...history, admissionId: `admission-${suffix}`,
                 generationId: `generation-${suffix}`, threadId: `thread-${suffix}`, messageId: `assistant-${suffix}`,
-                thread: { id: `thread-${suffix}`, clock: 1 },
-                userMessage: { id: `user-${suffix}`, thread_id: `thread-${suffix}`, role: 'user', clock: 1 },
-                assistantMessage: { id: `assistant-${suffix}`, thread_id: `thread-${suffix}`, role: 'assistant', clock: 1,
-                    pending: true, data: { generation_id: `generation-${suffix}` } } };
+                thread: validSyncPayload('threads', `thread-${suffix}`, { id: `thread-${suffix}`, clock: 1 }),
+                userMessage: validSyncPayload('messages', `user-${suffix}`, { id: `user-${suffix}`, thread_id: `thread-${suffix}`, role: 'user', clock: 1 }),
+                assistantMessage: validSyncPayload('messages', `assistant-${suffix}`, { id: `assistant-${suffix}`, thread_id: `thread-${suffix}`, role: 'assistant', clock: 1,
+                    pending: true, data: { generation_id: `generation-${suffix}` } }) };
             await sync.admitChatGeneration(actor, envelope);
             const execution = { version: 1 as const, workspaceId: actor.workspaceId, referer: 'https://example.test',
                 apiKeyCiphertext: 'fixture-ciphertext', body, history: envelope, delegationRecoveryPolicy: 'v1' as const,
@@ -667,9 +679,9 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         }
         const deleted = historyChange !== 'available';
         const deleteThread = async (clock: number) => {
-            const result = await sync.push(actor, { scope: { workspaceId: actor.workspaceId }, ops: [{
+            const result = await sync.push(actor, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: actor.workspaceId }, ops: [{
                 id: `delete-child-thread-${clock}`, tableName: 'threads', operation: 'delete', pk: child.threadId,
-                payload: { deleted_at: 1 }, stamp: { deviceId: 'other-device', opId: `delete-child-thread-${clock}`,
+                payload: { deleted_at: 1 }, stamp: { deviceId: 'other-device', opId: randomUUID(),
                     hlc: '2026-10-31T00:00:00.000Z-0000', clock }, createdAt: 1, attempts: 0, status: 'pending',
             }] });
             expect(result.results[0]).toMatchObject({ success: true });
@@ -678,14 +690,14 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         if (historyChange === 'restored during finalization') {
             const finalize = sync.finalizeChatGeneration.bind(sync);
             const race = vi.spyOn(sync, 'finalizeChatGeneration').mockImplementationOnce(async (writer, request) => {
-                const restored = await sync.push(actor, { scope: { workspaceId: actor.workspaceId }, ops: [
+                const restored = await sync.push(actor, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: actor.workspaceId }, ops: [
                     { id: 'new-project', tableName: 'projects', operation: 'put', pk: 'new-project',
-                        payload: { id: 'new-project', name: 'Project', data: [] },
-                        stamp: { deviceId: 'other-device', opId: 'new-project', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
+                        payload: validSyncPayload('projects', 'new-project', { id: 'new-project', name: 'Project', data: [], clock: 2 }),
+                        stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 2 },
                         createdAt: 1, attempts: 0, status: 'pending' },
                     { id: 'restore-child', tableName: 'threads', operation: 'put', pk: child.threadId,
-                        payload: { id: child.threadId, project_id: 'new-project' },
-                        stamp: { deviceId: 'other-device', opId: 'restore-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                        payload: validSyncPayload('threads', child.threadId, { id: child.threadId, project_id: 'new-project', clock: 3 }),
+                        stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
                         createdAt: 1, attempts: 0, status: 'pending' },
                 ] });
                 expect(restored.results).toEqual([expect.objectContaining({ success: true }), expect.objectContaining({ success: true })]);
@@ -986,10 +998,10 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
             ]) });
             if (change === 'edited' || change === 'deleted') {
                 const operation = change === 'deleted' ? 'delete' : 'put';
-                const pushed = await sync.push(actor, { scope: { workspaceId: actor.workspaceId }, ops: [{
+                const pushed = await sync.push(actor, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: actor.workspaceId }, ops: [{
                     id: `parent-${change}`, tableName: 'messages', operation, pk: history.messageId,
                     ...(operation === 'put' ? { payload: { ...saved.messages![0]!, data: { ...saved.messages![0]!.data, content: 'Later edit' } } } : {}),
-                    stamp: { deviceId: 'other-device', opId: `parent-${change}`, hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                    stamp: { deviceId: 'other-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
                     createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
                 }] });
                 expect(pushed.results[0]).toMatchObject({ success: true });
@@ -1200,8 +1212,9 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
         parked = (await provider.getJob(parentId, actor.userId))!;
         const result = parked.tool_calls?.find(call => call.id === 'batch-call');
         expect(result?.status).toBe('complete');
-        expect(result?.result).toContain('Answer to First task');
-        expect(result?.result).toContain('Answer to Second task');
+        const output = await readToolOutput(result!.result!);
+        expect(output).toContain('Answer to First task');
+        expect(output).toContain('Answer to Second task');
         expect(childRequests).toBe(2);
         const resumed = await provider.claimJob(parentId, 'parent-resume', Date.now(), Date.now() + 60_000);
         if (!resumed) throw new Error('Parent was not claimed after the batch');
@@ -1296,7 +1309,7 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
             expect(await provider.claimNextDelegationWait('resume', now, now + 60_000)).toMatchObject({ id: parentId });
             expect(await resumeReconciledDelegation(provider, parentId, actor.userId, 'resume')).toBe('resumed');
             const resumed = (await provider.getJob(parentId, actor.userId))!;
-            const result = JSON.parse(resumed.tool_calls!.find(call => call.id === 'batch-call')!.result!);
+            const result = JSON.parse(await readToolOutput(resumed.tool_calls!.find(call => call.id === 'batch-call')!.result!));
             expect(result.results.map((item: { status: string }) => item.status)).toEqual(['complete', 'unknown', 'unavailable']);
             expect(result.results[0].content).toContain('Answer to Completed');
             expect(result.results[2].code).toBe('deadline_expired');
@@ -1362,9 +1375,9 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
             expect(getChatJobExecution((await provider.getJob(child.jobId, actor.userId))!)?.delegationDispatch)
                 .toMatchObject({ state: 'started', sequence: 1 });
             if (historyOutcome === 'superseded') {
-                const deleted = await sync.push(actor, { scope: { workspaceId: actor.workspaceId }, ops: [{
+                const deleted = await sync.push(actor, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: actor.workspaceId }, ops: [{
                     id: 'delete-uncertain-child', tableName: 'messages', operation: 'delete', pk: child.assistantMessageId,
-                    stamp: { deviceId: 'another-device', opId: 'delete-uncertain-child', hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
+                    stamp: { deviceId: 'another-device', opId: randomUUID(), hlc: '2026-10-31T00:00:00.000Z-0000', clock: 3 },
                     createdAt: Math.floor(Date.now() / 1000), attempts: 0, status: 'pending',
                 }] });
                 expect(deleted.results[0]).toMatchObject({ success: true });
@@ -1390,7 +1403,7 @@ if (process.env.OR3_DELEGATION_RACE_WORKER) {
             expect(await resumeReconciledDelegation(provider, parentId, actor.userId, 'resume-coordinator')).toBe('resumed');
             const resumed = (await provider.getJob(parentId, actor.userId))!;
             expect(getChatJobExecution(resumed)?.delegationBlocked).toBe(true);
-            const result = JSON.parse(resumed.tool_calls!.find(call => call.id === 'delegate-call')!.result!);
+            const result = JSON.parse(await readToolOutput(resumed.tool_calls!.find(call => call.id === 'delegate-call')!.result!));
             expect(result).toMatchObject(historyOutcome === 'superseded'
                 ? { status: 'unavailable', code: 'history_unavailable', executionUncertain: true }
                 : { status: 'unknown', code: 'upstream_uncertain' });

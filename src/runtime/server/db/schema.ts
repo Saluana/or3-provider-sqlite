@@ -73,6 +73,7 @@ export interface ServerVersionCounterTable {
 }
 
 export interface ChangeLogTable {
+    intent_fingerprint: Generated<string | null>;
     id: string;
     workspace_id: string;
     server_version: number;
@@ -288,6 +289,7 @@ export interface AdminWorkspaceSettingsTable {
 }
 
 export interface Or3SqliteDb {
+    sync_history: { id: number; incarnation: string };
     users: UsersTable;
     auth_accounts: AuthAccountsTable;
     workspaces: WorkspacesTable;

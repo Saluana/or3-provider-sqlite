@@ -4,6 +4,17 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 
 Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Development and CI pin **24.22.1** in `.node-version`.
 
+## Release 0.0.31
+
+Requires an OR3 host with the matching sync contracts: [Saluana/or3-chat commit `2f34682144f8cef26f76248cebf2c62f4c1178f8`](https://github.com/Saluana/or3-chat/commit/2f34682144f8cef26f76248cebf2c62f4c1178f8) or a later commit on `or3-cloud` containing those contracts. Upgrade the host and provider together; do not activate this provider on an older host.
+
+- Validates final generic and background writes through the host's `prepareSyncWrite`, preserving atomic row/log writes and replay identity.
+- Retains unavailable-record evidence before advancing pull or snapshot coverage, with bounded inspect/export and validated repair at a fresh winning version. Push containment requires `stored-record-v1` so matching clients hold affected intents recoverably while healthy siblings proceed.
+- Adds persisted history incarnation `v1` fencing for pull, snapshot, push and ACK, and contiguous-prefix log GC. Recovery decisions run before stored payload reads or decode.
+- Adds atomic native migrations and resumable, validated historical migration handling for 034–036 (intent fingerprints, unavailable evidence and history incarnation). Migration 033 guards malformed payloads so their original bytes survive for evidence and repair.
+
+Keep a pre-upgrade database backup. These migrations are forward-only; rollback requires restoring the matching pre-upgrade snapshot. Native SQLite advertises history incarnation; D1 retains its explicit qualification boundary described below.
+
 ## What it provides
 
 - **AuthWorkspaceStore** (`sqlite`) — user identity mapping, workspace CRUD, role resolution
@@ -231,15 +242,26 @@ upload intents, and Connect credential/lifecycle hardening and rate limits.
 
 All tables use snake_case aligned with the sync wire format.
 
+Native SQLite migrations commit pending DDL, data changes, and migration ledger
+entries atomically. D1 retains its separate nontransactional migration path.
+Historical additive steps in 006, 007, 019, and 021 resume only when existing
+columns match their expected definitions; 006 also validates existing snapshot
+schema. A leftover historical rebuild table stops startup with a recovery error
+and preserves the surviving tables for operator inspection. Do not delete those
+tables to bypass the error. Migration 033 uses temporary repair indexes for its
+legacy tool-operation updates, preserves its deterministic UUID mapping, and
+does not rerun when already recorded as complete.
+
 ### Sync semantics
 
 - **Push**: validates ops (including a 256 KB serialized payload ceiling per operation) → checks `op_id` idempotency → allocates contiguous `server_version` values for admitted change-log entries → applies LWW to materialized tables → upserts tombstones for deletes. D1 admission and version allocation share one atomic batch; rejected notification races consume no versions.
-- **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, `oldestRetainedVersion`, and `requiresSnapshot` when the cursor is behind retained history
+- **Pull**: returns ordered changes for `server_version > cursor` with limit/pagination, optional table filtering, and `oldestRetainedVersion`. Before reading payloads, a cursor below `max(0, oldestRetainedVersion - 1)` or ahead of the current head receives an empty `requiresSnapshot` response retaining the request cursor. This immediate ahead-of-head check does not detect every database history replacement.
 - **Snapshot**: captures canonical live rows and current tombstones at one `highWatermark`, then serves immutable, keyset-paginated pages ordered by `(tableName, pk, kind)`. Notification live rows are filtered to the session user.
-- **Page size**: pull and snapshot responses target at most 1 MiB of serialized JSON, including the envelope, as well as their row limit. A preliminary size scan limits payloads transferred from the database; the database may still read rows to determine their sizes. A single oversized record is returned whole so pagination always progresses. Filtered notifications still advance the pull cursor.
+- **Page size**: pull and snapshot responses target at most 1 MiB of serialized JSON, including the envelope, as well as their row limit. A preliminary size scan limits payloads transferred from the database; the database may still read rows to determine their sizes. Oversized records retain their original bytes in durable evidence and produce unavailable markers within the page bounds. Filtered notifications still advance the pull cursor.
 - **Cursor**: forward-only tracking per authenticated user and device within a workspace. Migration 028 changes the unique key so accounts sharing a browser device ID cannot claim each other’s acknowledgements. Legacy unowned rows are never adopted and expire through normal cursor GC.
-- **Retention safety**: tombstone and `change_log` GC is enabled only under the explicit `snapshot-v1` capability and deletes old revisions acknowledged by every registered device
+- **Retention safety**: GC is enabled only under the explicit `snapshot-v1` capability. Change-log GC removes only the contiguous version prefix that is both older than retention and acknowledged by every active device, stopping at the first recent or unacknowledged version. It does not certify history already damaged by older GC; that requires a verified recovery boundary.
 - **Notifications**: push forces `payload.user_id` to the session user on puts and deletes; foreign notification writes are rejected. Successful deletes remain visible to the owner's other devices while pull/snapshot omit other users' rows.
+- **Numeric limits**: terminal background writes reject exhausted clocks, and all version allocations reject unsafe integers and reserve `Number.MAX_SAFE_INTEGER` for the empty-log retention sentinel, returning `VALIDATION_ERROR` on exhaustion. Rejection rolls back the transaction or D1 batch, preserving materialized rows, logs, counters, and generation receipts.
 - **Workspace Files/Trash admission**: a client without `workspaceItemCapability: 'v1'` cannot replace or delete a canonical post/project carrying workspace Files/Trash semantics, even if the submitted payload omits those fields. Native write transactions and the D1 atomic batch check canonical state before any operation or version allocation; a rejected batch returns HTTP 426 and leaves sibling writes unchanged.
 
 Snapshot continuations are bound to the capturing user and workspace, including
@@ -378,6 +400,14 @@ Persistent Projects uses this same capability for opaque `or3:project-settings`,
 
 Explicit ownership requires a live project in the same workspace. A missing or deleted project releases the chat even if a concurrent thread write retained its former pointer; legacy folders do not override that explicit release. Canonical reads leave the persisted pointer untouched.
 
+Malformed or oversized
+legacy project membership returns `status: 'scope_incomplete'` rather than
+assuming the chat is unowned. Explicit ownership and independent message reads
+remain usable. Legacy membership reads fetch one size-bounded project payload
+at a time through composite-key seeks; they still scan workspace projects and
+do not claim indexed membership lookup. Deleted message placeholders use their authoritative column
+identity/revision and do not fail a batch of sibling canonical reads.
+
 Current hosts refuse server tools and workflows when the reader cannot return
 resolved canonical ownership. Older providers require an upgrade even for chats
 with no explicit project pointer, because legacy folder membership may own them.
@@ -479,3 +509,53 @@ before activation.
 On Linux, the SQLite/filesystem pairing exposes managed-generation cleanup only when `OR3_STORAGE_FS_CLEANUP_NAMESPACE_ID` names the existing filesystem namespace UUID and SQLite runs with `OR3_SQLITE_PRAGMA_SYNCHRONOUS=FULL` (or `EXTRA`). The namespace must already have been provisioned by the generation protocol; this setting neither provisions it nor enrolls legacy files. It does not change normal upload/download routing. Leave the namespace setting unset to keep cleanup unavailable. D1 and other unsupported drivers remain unavailable.
 
 Manual admin cleanup rechecks canonical eligibility and uses the installed filesystem remover. Optional `OR3_STORAGE_RETENTION_WORKSPACES` selects explicit workspace IDs for the same audited primitive, with seven-day retention and at most 25 examined generations per hourly turn. Changing these environment settings requires a managed restart. Defaults remain disabled. Use the repaired managed backup/restore path for enrolled data; raw file copying is not a supported restore.
+
+### Unavailable sync records (matched host contract v1)
+
+This provider requires the host's `shared/sync/prepare-sync-write` contract. New generic and background writes validate their final payload and stamp before database mutation. Native writers use their existing immediate transaction; D1 prepares immutable values before its atomic batch and asserts allocation/repair preconditions inside that batch. Row and log use the same normalized value. Migration 034 retains the original generic intent fingerprint so normalization does not change replay identity; existing 0.0.30 log receipts still compare their original intent. Delete metadata and historical background envelopes keep their exact receipt identity. Legacy messages without order_key validate using the revision HLC without changing their wire payloads. Reader-valid historical payloads may contain older redundant revision fields; reads preserve those bytes and clients install the authoritative envelope revision. New writes still require consistent revision metadata. The existing generic log-GC replay horizon is unchanged.
+
+Migration 035 stores original unavailable bytes and metadata independently of logs and snapshots. Pull and snapshot pages classify each record, retain evidence before emitting `unavailable`, and account entries and markers together within the existing 1 MiB/1,000-entry limits. The payload transfer ceiling is 256 KiB per row, including the first row; larger evidence is copied within SQL. Stored revision metadata is measured before transfer and bounded by the 1 MiB page ceiling, including corrupt text in numeric columns; oversized revisions stay in SQL evidence. Backup capture also preserves pre-transformation file bytes for evidence. Unknown notification owners are retained privately and never emitted as keys or markers. Untrustworthy ordering, identities or server versions fail coverage. Storage failures fail the request. The provider advertises `unavailableRecords: 'v1'`; deploy with the matching host's browser capability gate before enabling it for clients.
+
+Snapshot ordering and continuation use component-wise UTF-8 BINARY tuples, preserving NUL, supplementary and CJK keys. Native and D1 accept the shared 65,536-character token ceiling. Identifiers that cannot round-trip through UTF-8 are rejected rather than renamed.
+
+The existing authorized provider-admin action endpoint supports these workspace-scoped actions:
+
+- `sync.evidence-inspect`: `{ after?: string }` uses an indexed workspace/ID continuation to return at most 50 metadata records and a `next` ID. Oversized locator/revision display fields are null; original metadata remains available by export.
+- `sync.evidence-export`: `{ id, offset?: number }` returns original payload and metadata as `payloadHex`/`metadataHex` chunks of 32,768 bytes. Decode hex and concatenate each field separately at offsets 0, 32768, … until `totalBytes` is covered. Oversized originals are never loaded whole into JavaScript.
+- `sync.evidence-revalidate`: `{ id }` checks the retained entry against the current reader contract without mutating its original bytes.
+- `sync.evidence-repair`: `{ id, historyIncarnation, payload, operation?: 'put'|'delete' }` requires an explicit valid replacement. It publishes a fresh UUID, winning clock and server version using the normal writer transaction and atomically records the resolution. Changed canonical revisions are marked superseded; exhausted/untrustworthy clocks require explicit offline recovery, with original evidence retained. Current orphan tombstones can be repaired through the same transaction, with an assertion that no materialized winner appeared concurrently. Repair never replays obsolete evidence over a newer winner.
+
+Provider contract regressions run with `bun run test src/runtime/__tests__/sqlite-sync-hardening.test.ts`. Set `OR3_PROJECT_HOST_ROOT` to test live matched host sources with the ordinary provider config. The separate `test:host-integration` lane enforces the release's exact pinned host commit and fixture bytes, recorded in `test/fixtures/host-next.json`; it must be qualified independently. The checked-in `test/fixtures/sync-v1/provenance.json` records the exact reviewed sync-contract bytes used by standalone tests and typechecking.
+
+### History incarnation (matched host contract v1)
+
+Migration 036 initializes one persisted `sync_history` UUID per database and atomically clears pre-contract snapshot sessions/items and device ACKs. Committed migration retries, normal startup, restart, backup capture and GC preserve that identity. A migrated database with a missing or invalid singleton fails closed and requires offline recovery.
+
+The internal `backupSnapshot` API allows server workspace exports to omit the initial incarnation: it discovers history on the first page and binds continuations to the incarnation in that page's token. A stale continuation is rejected after replacement; browser `snapshot` calls still require an explicit incarnation field.
+
+A legacy host that omits both incarnation and recognized request capability receives structured HTTP 426 `OR3_SYNC_UPDATE_REQUIRED` from pull/snapshot/push/ACK, before history dispatch. Upgrade the matching host and client together; the provider never substitutes the current history for a legacy write. A capable request missing the required field still returns 400. The old host's empty/all-invalid push shortcut and event transport remain host-owned and cannot provide the complete new protocol; independent provider-only rollout is not qualified.
+
+Native SQLite advertises `historyIncarnation: 'v1'`. The matching host requires browser `historyIncarnationCapability: 'incarnation-v1'` on all five HTTP endpoints, including empty pushes and ACKs; older browsers receive 426. Provider requests carry the expected `historyIncarnation` outside operations/fingerprints. Successful pull, snapshot and push responses carry the bound identity; ACK success is assembled by the host after the provider transaction. Push and ACK reject stale/null identity with structured 409 `OR3_SYNC_HISTORY_CHANGED` before receipts, allocation, writes or timestamp refresh, rechecking inside the transaction. Missing/malformed fields return 400. Pull accepts explicit null discovery and returns an empty snapshot-required recovery envelope for null/mismatch before decoding history, regardless of numeric cursor/head. Snapshot permits null only for an initial page; continuations bind identity, and old tokens return 409 even if presented with the new request identity. Same-history absent/expired sessions retain 410. Watcher hints carry `{historyIncarnation, version}` and close on a changed identity before comparing numeric heads.
+
+The managed image uses the target-owned `/app/scripts/docker/sync-history-reset.mjs` helper with exact qualified migration history. This is the sole production reset owner; its caller must stop/fence all writers and connections, prevent restart, and durably journal a fresh UUID outside replaced data **before each extraction attempt**. One immediate SQLite transaction replaces the singleton and deletes all snapshot items/headers and device ACKs; verification precedes startup. A stopped-candidate reconciliation may repeat the same UUID; re-extraction, repeated restore, rollback or safety-snapshot restoration needs a new UUID. Never invoke rotation on startup/update/GC. The helper never edits canonical rows, tombstones, log, counters or unavailable evidence; retention remains `MIN(log version)` or `head+1`, without a cross-history floor. The host Cloud CLI owns external journaling, capability preflight, safety backup retention and startup gates.
+
+New unavailable evidence deduplicates by `[incarnation, originalRevision]` with provenance in metadata. Legacy evidence remains unknown-origin and exportable. Rotation never resolves evidence. Repair requires both the supplied current identity and the evidence provenance to match; an old reference cannot publish or mark evidence superseded in a new history. D1 implements the runtime fences and passes the SQLite-backed D1 regression lane, but deliberately does **not** advertise history incarnation until its remote/offline lifecycle is separately qualified. Image profile/publication qualification, real managed lifecycle and browser-held-intent acceptance remain integration gates; this source change performs no release or deployment.
+
+Run `bun run test src/runtime/__tests__/sqlite-sync-incarnation.test.ts` for provider P0-5 regressions, and the ordinary full suite plus `type-check:host-contract` with `OR3_PROJECT_HOST_ROOT` pointing to the matched host. Standalone sync fixture provenance includes the exact H5 working-tree bytes and hashes; the delegation fixture is refreshed from the release's pinned host commit.
+
+### Push stored-record containment (`stored-record-v1`)
+
+A matched client advertises `storedRecordCapability: 'stored-record-v1'` on push. An unreadable stored receipt, losing winner, missing replay winner or notification owner yields only that operation's `STORED_RECORD_UNAVAILABLE` failure, with `evidenceRef` and a bounded fixed `error` reason. The matching host must hold the exact intent recoverably, retain its evidence link and settle healthy siblings without retrying or counting an outage. Existing `unavailable-v1` is insufficient: older clients already send it without supporting push holds. An affected batch without the new capability receives structured HTTP 426 `OR3_SYNC_UPDATE_REQUIRED` / `requiredCapability: 'stored-record-v1'`.
+
+Stored payload/fingerprint/revision reads are bounded in SQL. Original bad bytes stay in `sync_unavailable_records` independently of source GC; a separate `source='push'` entry retains each rejected intent and its evidence link. Operations rejected during preflight consume no version or receipt. A hold never invents a replacement UUID or reports a successful replay; a D1 fault discovered after its atomic commit retains the uncertain committed intent for recovery. A valid winning write may replace an unreadable older payload only after preserving its original bytes. Database/evidence storage failures remain request failures. Inspect/export uses the existing `sync.evidence-*` admin actions; rejected intent is exportable, and repair must target the original stored evidence rather than replaying an intent entry. The committed sync fixture records the explicit S4 additive contract delta and original source hashes; live-host qualification uses the host's actual shared contract.
+
+### Local migration capacity measurement
+
+A disposable native SQLite qualification on macOS arm64 used 1,000,000 log rows, 200,000 canonical KV rows and 200,000 snapshot items (256-character values; 1% exact legacy tool IDs). Historical schema structure was independently checked against published 0.0.30 source. Seed WAL was checkpointed; ordinary WAL/autocheckpoint settings were retained. External 5 ms sampling measured each candidate's logical files:
+
+| Starting ledger | Pending migrations | Elapsed | Peak WAL | Peak DB + WAL + SHM + journal |
+| --- | --- | ---: | ---: | ---: |
+| 032 | 033–036 | 1.586 s | 180.18 MiB | 1,064.54 MiB |
+| 033 | 034–036 | 0.528 s | 72.44 MiB | 956.80 MiB |
+
+Both runs retained every log/canonical row, finished ledger 36 and invalidated the snapshot items. These sampled local measurements do not qualify production hardware, physical allocated space or remote D1 limits; plan additional space for source/rollback backups. Migration 033 preserves malformed payload bytes for subsequent unavailable-record handling and retains its original deterministic UUID mapping and ledger no-rerun behavior.

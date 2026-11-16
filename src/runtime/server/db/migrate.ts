@@ -2,7 +2,7 @@
  * Migration runner for the SQLite provider.
  * Runs all migrations in order on module init.
  */
-import { type Kysely, type Migration, type MigrationProvider, Migrator } from 'kysely';
+import { sql, type Kysely, type Migration, type MigrationProvider, Migrator } from 'kysely';
 import type { Or3SqliteDb } from './schema';
 import * as m001 from './migrations/001_init';
 import * as m002 from './migrations/002_sync_tables';
@@ -63,6 +63,8 @@ const REQUIRED_SCHEMA_TABLES = [
     'storage_object_generations',
     'storage_object_heads',
     'storage_generation_uploads',
+    'sync_unavailable_records',
+    'sync_history',
     'sync_observations'
 ] as const;
 
@@ -76,6 +78,12 @@ import * as m030 from './migrations/030_storage_generations';
 import * as m031 from './migrations/031_storage_generation_uploads';
 import * as m032 from './migrations/032_sync_observations';
 import * as m033 from './migrations/033_tool_result_operation_ids';
+
+import * as m034 from './migrations/034_sync_intent_fingerprint';
+
+import * as m035 from './migrations/035_sync_unavailable_records';
+import * as m036 from './migrations/036_sync_history_incarnation';
+import { readHistoryIncarnation } from '../sync/history-incarnation';
 
 const migrations: Record<string, Migration> = {
     '001_init': m001,
@@ -110,7 +118,10 @@ const migrations: Record<string, Migration> = {
     '030_storage_generations': m030,
     '031_storage_generation_uploads': m031,
     '032_sync_observations': m032,
-    '033_tool_result_operation_ids': m033
+    '033_tool_result_operation_ids': m033,
+    '034_sync_intent_fingerprint': m034,
+    '035_sync_unavailable_records': m035,
+    '036_sync_history_incarnation': m036
 };
 
 class StaticMigrationProvider implements MigrationProvider {
@@ -140,6 +151,19 @@ async function assertLatestSchemaIntegrity(
  * Run all pending migrations. Safe to call repeatedly.
  */
 export async function runMigrations(db: Kysely<Or3SqliteDb>): Promise<void> {
+    // Old nontransactional rebuilds may have committed DROP/RENAME steps.
+    // Do not discard their only surviving copy or silently mark them complete.
+    const rebuildTables = [
+        ...['s_threads', 's_messages', 's_projects', 's_posts', 's_kv', 's_file_meta', 's_notifications'].map(table => `${table}__new`),
+        'connect_device_authorizations_legacy', 'connect_device_authorizations_before_redelivery',
+        'connect_device_authorizations_before_lifecycle', 'connect_environments_before_lifecycle',
+        'chat_history_revisions_v2',
+    ];
+    const interrupted = (await sql<{ name: string }>`SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name IN (${sql.join(rebuildTables)})`.execute(db)).rows;
+    if (interrupted.length) {
+        throw new Error(`Recover interrupted SQLite rebuild before retrying migrations; preserved tables: ${interrupted.map(row => row.name).join(', ')}`);
+    }
     const migrator = new Migrator({
         db,
         provider: new StaticMigrationProvider(),
@@ -163,4 +187,5 @@ export async function runMigrations(db: Kysely<Or3SqliteDb>): Promise<void> {
     }
 
     await assertLatestSchemaIntegrity(db);
+    await readHistoryIncarnation();
 }

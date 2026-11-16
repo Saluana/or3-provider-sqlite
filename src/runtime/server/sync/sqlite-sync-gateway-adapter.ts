@@ -1,3 +1,5 @@
+import { readHistoryIncarnation, validateExpectedHistory, validHistoryIncarnation, historyChanged, historyAssertion, historyBatch } from './history-incarnation';
+import { maintainEvidence, repairAssertion, repairResolution, type RepairGuard } from './evidence-maintenance';
 import { SqliteExternalStorageGenerationUploadCoordinator } from '../storage/sqlite-generation-upload-coordinator';
 import { backgroundFinalizationFingerprint, stableJson } from './background-history-fingerprint';
 import { hasWorkspaceItemSemantics, WORKSPACE_ITEM_CAPABILITY } from './workspace-item-capability';
@@ -43,6 +45,8 @@ import {
 } from '~~/shared/chat/background-history';
 import type {
     PendingOp,
+    PullUnavailableRecord,
+    SnapshotUnavailableRecord,
     PullRequest,
     PullResponse,
     PushBatch,
@@ -59,6 +63,9 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
+import { boundedSyncPayload, boundedSyncMetadata, syncMetadataBytes, SYNC_METADATA_BYTES, notificationOwnerSql, syncRows, retainSqlEvidence, unknownNotificationEvidence, type EvidenceSource, evidenceInsert, evidenceLookup } from './unavailable-records';
+import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, SyncChangeSchema, SnapshotItemSchema, TABLE_PAYLOAD_SCHEMAS, isLosslessSyncIdentifier, PullResponseSchema, SnapshotResponseSchema, compareSyncTuple, normalizeWirePayloadForTable } from '~~/shared/sync/schemas';
+import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { readRequestUsage } from '~~/shared/chat/compaction';
 import { matchesToolResultStorage, parseToolResultArtifact, prepareToolResultStorage, toolResultArtifactPrefix, type ToolResultArtifactRow } from '~~/shared/chat/tool-result-artifact';
 import { validateCanonicalChatQuery, encodeCanonicalChatSeek, parseCanonicalChatSeek, type CanonicalChatQuery, type CanonicalChatReadResult } from '~~/shared/chat/history-reader';
@@ -118,6 +125,7 @@ type SnapshotKind = 'row' | 'tombstone';
 type SnapshotPageToken = {
     version: 1;
     snapshotId: string;
+    historyIncarnation: string;
     after: {
         tableName: string;
         pk: string;
@@ -133,16 +141,19 @@ type SnapshotHeaderRow = {
     expires_at: number;
 };
 
-type PayloadSizeRow = { payload_bytes: number };
+type PayloadSizeRow = { payload_bytes: number; metadata_bytes: number };
+const PULL_METADATA_BYTES = syncMetadataBytes('table_name','pk','id','op','clock','hlc','device_id','op_id');
+const SNAPSHOT_METADATA_BYTES = syncMetadataBytes('table_name','pk','kind','clock','hlc','op_id','server_deleted_at');
 
 // Read only a bounded amount of payload data across the database boundary.
 // Size metadata can cover the full row limit without transferring the payloads.
-// The first row is always admitted so even an oversized legacy row progresses.
+// Oversized rows consume a marker allowance; their payload never crosses into JS.
 function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number {
     let count = 0;
     let bytes = 0;
     for (const row of sizes.slice(0, limit)) {
-        const size = Math.max(0, Number(row.payload_bytes) || 0);
+        const size = (row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES ? 1024 : Math.max(0, Number(row.payload_bytes) || 0))
+            + Math.min(row.metadata_bytes, SYNC_METADATA_BYTES);
         if (count && bytes + size > MAX_SYNC_PAGE_BYTES) break;
         count++;
         bytes += size;
@@ -152,11 +163,10 @@ function boundedPayloadRowCount(sizes: PayloadSizeRow[], limit: number): number 
 
 function snapshotPageSelection(headerId: string, after?: SnapshotPageToken['after']): { clause: string; parameters: string[] } {
     const clause = `FROM sync_snapshot_items WHERE snapshot_id = ?${after ? `
-        AND (table_name > ? OR (table_name = ? AND pk > ?)
-             OR (table_name = ? AND pk = ? AND kind > ?))` : ''}
-        ORDER BY table_name ASC, pk ASC, kind ASC LIMIT ?`;
+        AND (table_name COLLATE BINARY, pk COLLATE BINARY, kind COLLATE BINARY) > (?, ?, ?)` : ''}
+        ORDER BY table_name COLLATE BINARY ASC, pk COLLATE BINARY ASC, kind COLLATE BINARY ASC LIMIT ?`;
     const parameters = after
-        ? [headerId, after.tableName, after.tableName, after.pk, after.tableName, after.pk, after.kind]
+        ? [headerId, after.tableName, after.pk, after.kind]
         : [headerId];
     return { clause, parameters };
 }
@@ -170,36 +180,102 @@ type SnapshotItemRow = {
     hlc: string;
     op_id: string;
     server_deleted_at: number | null;
+    payload_bytes?: number;
+    metadata_bytes?: number;
+    pk_hex?: string;
+    table_hex?: string;
+    notification_owner?: string | null;
 };
 
-// Include the continuation token and response envelope in the byte budget.
-// A single oversized item must still make progress rather than loop forever.
-function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRow[], pageSize: number, availableRows: number): SnapshotResponse {
-    const items: SnapshotItem[] = [];
-    let itemBytes = 0;
-    let scanned = 0;
-    let token: string | null = null;
-    for (const row of rows.slice(0, pageSize)) {
-        const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
-        const item: SnapshotItem = row.kind === 'row'
-            ? { kind: 'row', tableName: row.table_name, pk: row.pk,
-                payload: JSON.parse(row.payload_json ?? 'null') as unknown, revision }
-            : { kind: 'tombstone', tableName: row.table_name, pk: row.pk,
-                revision, serverDeletedAt: row.server_deleted_at ?? 0 };
-        const next = encodeSnapshotPageToken({ version: 1, snapshotId: header.id,
-            after: { tableName: row.table_name, pk: row.pk, kind: row.kind } });
-        const bytes = jsonBytes(item) + (items.length ? 1 : 0);
-        const envelope = jsonBytes({ workspaceId: header.workspace_id, snapshotId: header.id,
-            highWatermark: header.high_watermark, items: [], nextPageToken: next });
-        if (items.length && envelope + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) break;
-        items.push(item);
-        itemBytes += bytes;
-        scanned++;
-        token = next;
+function assertCoverageKey(table: string, pk: string, pkHex?: string, tableHex?: string): void {
+    if (typeof table !== 'string' || !table || typeof pk !== 'string' || !pk ||
+        !isLosslessSyncIdentifier(table) || !isLosslessSyncIdentifier(pk) ||
+        (pkHex !== undefined && Buffer.from(pk).toString('hex').toUpperCase() !== pkHex) ||
+        (tableHex !== undefined && Buffer.from(table).toString('hex').toUpperCase() !== tableHex)) {
+        throw new Error('Untrustworthy sync coverage identity');
     }
-    return { workspaceId: header.workspace_id, snapshotId: header.id,
-        highWatermark: header.high_watermark, items,
-        nextPageToken: availableRows > scanned ? token : null };
+}
+function validReadPayload(table: string, pk: string, payload: unknown, _clock: number, hlc?: string): boolean {
+    if (!Object.hasOwn(TABLE_PAYLOAD_SCHEMAS, table)) return false;
+    const normalized = normalizeWirePayloadForTable(table, payload);
+    // Old messages derive ordering from the revision HLC. Validate that view
+    // without changing original wire bytes or persisted receipt content.
+    const validationPayload = table === 'messages' && normalized && typeof normalized === 'object' && !Array.isArray(normalized)
+        ? { ...normalized, order_key: (normalized as Record<string, unknown>).order_key || hlc }
+        : normalized;
+    if (!TABLE_PAYLOAD_SCHEMAS[table]!.safeParse(validationPayload).success) return false;
+    const row = normalized as Record<string, unknown>;
+    for (const key of ['id','hash','thread_id','project_id','user_id','document_id','root_thread_id','summary_message_id']) {
+        if (typeof row[key] === 'string' && !isLosslessSyncIdentifier(row[key])) return false;
+    }
+    // Historical payloads may retain older redundant revision fields. Readers
+    // install the authoritative envelope revision; only new writes bind both.
+    return row[table === 'file_meta' ? 'hash' : 'id'] === pk;
+}
+function snapshotEvidence(header: SnapshotHeaderRow, row: SnapshotItemRow, historyIncarnation: string): EvidenceSource {
+    return { historyIncarnation, workspaceId: header.workspace_id, source: 'snapshot', locator: JSON.stringify([row.table_name, row.pk]),
+        revisionSql: "json_array(kind,clock,hlc,op_id)", table: 'sync_snapshot_items',
+        where: 'snapshot_id = ? AND table_name = ? AND pk = ? AND kind = ?',
+        parameters: [header.id, row.table_name, row.pk, row.kind], payload: 'coalesce(source_payload_json,payload_json)',
+        metadata: "json_object('snapshot_id',snapshot_id,'table_name',table_name,'pk',pk,'kind',kind,'clock',clock,'hlc',hlc,'op_id',op_id,'server_deleted_at',server_deleted_at)" };
+}
+async function buildSnapshotPage(header: SnapshotHeaderRow, rows: SnapshotItemRow[], pageSize: number,
+    availableRows: number, historyIncarnation: string, after?: SnapshotPageToken['after'], userId?: string): Promise<SnapshotResponse> {
+    if (!Number.isSafeInteger(header.high_watermark) || header.high_watermark < 0) throw new Error('Untrustworthy snapshot watermark');
+    const items: SnapshotItem[] = [];
+    const unavailable: NonNullable<SnapshotResponse['unavailable']> = [];
+    let scanned = 0;
+    let itemBytes = 0;
+    let token: string | null = null;
+    let previous = after ? [after.tableName, after.pk, after.kind] : undefined;
+    for (const row of rows.slice(0, pageSize)) {
+        assertCoverageKey(row.table_name, row.pk, row.pk_hex, row.table_hex);
+        const key = [row.table_name, row.pk, row.kind];
+        if (!['row', 'tombstone'].includes(row.kind) || previous &&
+            (compareSyncTuple(previous, key) >= 0 || compareSyncTuple(previous.slice(0,2),key.slice(0,2)) === 0)) {
+            throw new Error('Untrustworthy snapshot ordering');
+        }
+        let item: SnapshotItem | undefined;
+        let reason = row.metadata_bytes! > SYNC_METADATA_BYTES ? 'metadata_oversized' : row.payload_bytes! > MAX_SYNC_PAYLOAD_BYTES ? 'payload_oversized' : 'invalid_record';
+        if (reason === 'invalid_record') {
+            try {
+                const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
+                const candidate = row.kind === 'row'
+                    ? { kind: 'row' as const, tableName: row.table_name, pk: row.pk, payload: JSON.parse(row.payload_json ?? 'null'), revision }
+                    : { kind: 'tombstone' as const, tableName: row.table_name, pk: row.pk, revision, serverDeletedAt: row.server_deleted_at };
+                if (SnapshotItemSchema.safeParse(candidate).success && Number.isSafeInteger(row.clock) &&
+                    (row.kind === 'row' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc) : ALLOWED_SYNC_TABLES.includes(row.table_name))) item = candidate as SnapshotItem;
+            } catch { reason = 'invalid_json'; }
+        }
+        const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.kind,
+            snapshotId: header.id, highWatermark: header.high_watermark, evidenceRef: '', reason };
+        const next = encodeSnapshotPageToken({ version: 1, snapshotId: header.id, historyIncarnation,
+            after: { tableName: row.table_name, pk: row.pk, kind: row.kind } });
+        const visible = row.table_name !== 'notifications' || row.kind === 'tombstone' || !!row.notification_owner && row.notification_owner === userId;
+        let bytes = visible ? jsonBytes(item ?? {...marker,evidenceRef:'x'.repeat(36)}) + ((item ? items.length : unavailable.length) ? 1 : 0) : 0;
+        const envelopeBytes = jsonBytes({historyIncarnation,workspaceId:header.workspace_id,snapshotId:header.id,highWatermark:header.high_watermark,
+            items:[],unavailable:[],nextPageToken:next});
+        if (item && envelopeBytes + bytes > MAX_SYNC_PAGE_BYTES) {
+            item = undefined; reason = marker.reason = 'record_oversized';
+            bytes = visible ? jsonBytes({...marker,evidenceRef:'x'.repeat(36)}) + (unavailable.length ? 1 : 0) : 0;
+        }
+        if (envelopeBytes + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) {
+            if (!scanned) throw new Error('Sync identity exceeds page byte budget');
+            break;
+        }
+        if (item && visible) items.push(item);
+        else if (!item) {
+            marker.evidenceRef = await retainSqlEvidence(snapshotEvidence(header,row,historyIncarnation), reason);
+            if (visible) unavailable.push(marker);
+        }
+        itemBytes += bytes;
+        scanned++; token = next; previous = key;
+    }
+    const [retained] = await syncRows<{expires_at:number}>('SELECT expires_at FROM sync_snapshots WHERE id = ?',header.id);
+    if (!retained || retained.expires_at <= nowEpoch()) throw createError({statusCode:410,statusMessage:'Snapshot expired or unavailable'});
+    return SnapshotResponseSchema.parse({ historyIncarnation, workspaceId: header.workspace_id, snapshotId: header.id,
+        highWatermark: header.high_watermark, items, ...(unavailable.length ? { unavailable } : {}),
+        nextPageToken: availableRows > scanned ? token : null });
 }
 
 type HookEmission = {
@@ -252,6 +328,16 @@ export async function pruneExpiredSyncSnapshots(): Promise<void> {
 }
 
 
+// Keep head + 1 representable for the empty-log retention boundary.
+function safeVersionEnd(base: number, count: number): number {
+    const end = base + count;
+    if (!Number.isSafeInteger(base) || base < 0 || !Number.isSafeInteger(end) || end < 0
+        || (count > 0 && end >= Number.MAX_SAFE_INTEGER)) {
+        throw Object.assign(new Error('Sync server version exhausted or invalid'), { code: 'VALIDATION_ERROR' });
+    }
+    return end;
+}
+
 function backgroundHistoryOpId(
     admission: Pick<ChatGenerationAdmissionEnvelope, 'workspaceId' | 'generationId'>,
     stage: 'thread' | 'user' | 'assistant' | 'finalize'
@@ -284,25 +370,13 @@ function operationFingerprint(op: PendingOp): string {
     });
 }
 
-function changeLogFingerprint(row: {
-    table_name: string;
-    op: string;
-    pk: string;
-    payload_json: string | null;
-    clock: number;
-    hlc: string;
-    device_id: string;
-}): string {
-    return stableJson({
-        tableName: row.table_name,
-        operation: row.op,
-        pk: row.pk,
-        payload: fingerprintPayload(row.table_name, row.op, row.payload_json ? JSON.parse(row.payload_json) : undefined),
-        clock: row.clock,
-        hlc: row.hlc,
-        deviceId: row.device_id,
-    });
+function prepareFinalOperation(op: PendingOp): PendingOp {
+    const payload = op.operation === 'put' && op.payload && typeof op.payload === 'object'
+        ? { ...(op.payload as Record<string, unknown>), clock: op.stamp.clock, hlc: op.stamp.hlc, op_id: op.stamp.opId }
+        : op.payload;
+    return { ...op, ...prepareSyncWrite({ ...op, payload }) };
 }
+
 
 function notificationPayloadUserId(payload: unknown): string | undefined {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -310,15 +384,6 @@ function notificationPayloadUserId(payload: unknown): string | undefined {
     }
     const userId = (payload as Record<string, unknown>).user_id;
     return typeof userId === 'string' && userId.trim().length > 0 ? userId : undefined;
-}
-
-function isNotificationVisibleToUser(
-    change: { tableName: string; payload?: unknown },
-    userId: string | undefined
-): boolean {
-    if (change.tableName !== 'notifications') return true;
-    if (!userId) return false;
-    return notificationPayloadUserId(change.payload) === userId;
 }
 
 function scopeNotificationWrite(
@@ -380,8 +445,10 @@ function workspaceItemCapabilityAssertion(op: PendingOp, workspaceId: string): D
     return {
         sql: `SELECT json_extract('{}', CASE WHEN EXISTS (
             SELECT 1 FROM (
-                SELECT data_json, ${decoded} AS metadata FROM "${SYNCED_TABLE_MAP[op.tableName]}"
-                WHERE workspace_id = ? AND id = ?
+                SELECT data_json, ${decoded} AS metadata FROM (
+                    SELECT CASE WHEN json_valid(data_json) AND length(cast(data_json AS blob)) <= ${MAX_SYNC_PAYLOAD_BYTES} THEN data_json ELSE '{}' END AS data_json
+                    FROM "${SYNCED_TABLE_MAP[op.tableName]}" WHERE workspace_id = ? AND id = ?
+                )
             ) WHERE ${semantics}
         ) THEN '${WORKSPACE_ITEM_UPDATE_REQUIRED}' ELSE '$' END)`,
         parameters: [workspaceId, op.pk],
@@ -410,7 +477,7 @@ function snapshotNotificationOwnerClause(
     if (tableName !== 'notifications') return { sql: '', params: [] };
     if (!userId) return { sql: ' AND 1 = 0', params: [] };
     return {
-        sql: ` AND json_extract(${jsonExpr}, '$.user_id') = ?`,
+        sql: ` AND ${notificationOwnerSql(jsonExpr)} = ?`,
         params: [userId],
     };
 }
@@ -525,6 +592,7 @@ function encodeSnapshotPageToken(token: SnapshotPageToken): string {
 
 function decodeSnapshotPageToken(value: string): SnapshotPageToken {
     try {
+        if (value.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) throw new Error('Token exceeds ceiling');
         const parsed = JSON.parse(
             Buffer.from(value, 'base64url').toString('utf8')
         ) as Partial<SnapshotPageToken>;
@@ -540,6 +608,7 @@ function decodeSnapshotPageToken(value: string): SnapshotPageToken {
         ) {
             throw new Error('Invalid token payload');
         }
+        assertCoverageKey(after.tableName,after.pk);
         return parsed as SnapshotPageToken;
     } catch {
         throw createError({
@@ -768,6 +837,7 @@ type MaterializedWinnerRow = {
     data_json: string;
     deleted: number;
     updated_at: number;
+    payload_bytes?: number;
 };
 
 type TombstoneWinnerRow = {
@@ -777,34 +847,116 @@ type TombstoneWinnerRow = {
     deleted_at: number;
 };
 
+class StoredRecordUnavailable extends Error {
+    constructor(readonly source: Omit<EvidenceSource, 'historyIncarnation'>, readonly reason: string, readonly revision?: {clock:number;hlc:string;opId:string}) {
+        super(reason);
+    }
+}
+function storedCanonicalSource(workspaceId: string, tableName: string, pk: string): Omit<EvidenceSource, 'historyIncarnation'> {
+    // tableName comes from the fixed synced-table allowlist.
+    return { workspaceId, source: 'canonical', locator: JSON.stringify([tableName, pk]),
+        table: SYNCED_TABLE_MAP[tableName]!, where: 'workspace_id=? AND id=?', parameters: [workspaceId, pk],
+        revisionSql: 'json_array(clock,hlc,op_id,deleted)', payload: 'data_json',
+        metadata: `json_object('table_name','${tableName}','pk',id,'clock',clock,'hlc',hlc,'op_id',op_id,'deleted',deleted)` };
+}
+const WINNER_COLUMNS = `${boundedSyncPayload('data_json')} AS data_json,
+    ${['clock','hlc','op_id','deleted','updated_at'].map(c => `${boundedSyncMetadata(c)} AS ${c}`).join(',')},
+    length(cast(data_json AS blob)) AS payload_bytes`;
+const TOMBSTONE_COLUMNS = ['clock','hlc','op_id','deleted_at'].map(c => `${boundedSyncMetadata(c)} AS ${c}`).join(',');
 function materializedWinner(
     row: MaterializedWinnerRow | undefined,
-    tombstone: TombstoneWinnerRow | undefined
+    tombstone: TombstoneWinnerRow | undefined,
+    workspaceId: string, tableName: string, pk: string
 ): PushWinner | undefined {
-    if (
-        tombstone &&
-        (!row || incomingWinsRevision(
-            { clock: tombstone.clock, hlc: tombstone.hlc, opId: tombstone.op_id },
-            row
-        ))
-    ) {
-        return {
-            kind: 'delete',
-            revision: { clock: tombstone.clock, hlc: tombstone.hlc, opId: tombstone.op_id },
-            serverDeletedAt: tombstone.deleted_at,
-        };
+    const source = storedCanonicalSource(workspaceId, tableName, pk);
+    const revisionValid = (value: MaterializedWinnerRow | TombstoneWinnerRow) =>
+        SnapshotItemSchema.safeParse({kind:'tombstone',tableName,pk,
+            revision:{clock:value.clock,hlc:value.hlc,opId:value.op_id},serverDeletedAt:0}).success && Number.isSafeInteger(value.clock);
+    if (row && (!revisionValid(row) || ![0,1].includes(row.deleted))) throw new StoredRecordUnavailable(source, 'invalid_stored_revision');
+    if (tombstone && (!revisionValid(tombstone) || !Number.isSafeInteger(tombstone.deleted_at) || tombstone.deleted_at < 0)) {
+        throw new StoredRecordUnavailable({workspaceId,source:'canonical',locator:JSON.stringify([tableName,pk,'tombstone']),
+            table:'tombstones',where:'workspace_id=? AND table_name=? AND pk=?',parameters:[workspaceId,tableName,pk],
+            revisionSql:'json_array(clock,hlc,op_id)',payload:'NULL',
+            metadata:"json_object('table_name',table_name,'pk',pk,'clock',clock,'hlc',hlc,'op_id',op_id,'deleted_at',deleted_at)"}, 'invalid_stored_revision');
+    }
+    if (tombstone && (!row || incomingWinsRevision({clock:tombstone.clock,hlc:tombstone.hlc,opId:tombstone.op_id},row))) {
+        return {kind:'delete',revision:{clock:tombstone.clock,hlc:tombstone.hlc,opId:tombstone.op_id},serverDeletedAt:tombstone.deleted_at};
     }
     if (!row) return undefined;
-    const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
-    return row.deleted
-        ? {
-              kind: 'delete',
-              revision,
-              serverDeletedAt: tombstone?.op_id === row.op_id
-                  ? tombstone.deleted_at
-                  : row.updated_at,
-          }
-        : { kind: 'put', payload: JSON.parse(row.data_json), revision };
+    const revision = {clock:row.clock,hlc:row.hlc,opId:row.op_id};
+    if (row.deleted) {
+        if (!Number.isSafeInteger(row.updated_at) || row.updated_at < 0) throw new StoredRecordUnavailable(source,'invalid_stored_revision');
+        return {kind:'delete',revision,serverDeletedAt:tombstone?.op_id===row.op_id?tombstone.deleted_at:row.updated_at};
+    }
+    if (row.payload_bytes! > MAX_SYNC_PAYLOAD_BYTES) throw new StoredRecordUnavailable(source, 'payload_oversized', revision);
+    let payload: unknown;
+    try { payload = JSON.parse(row.data_json); }
+    catch { throw new StoredRecordUnavailable(source, 'invalid_json', revision); }
+    if (!validReadPayload(tableName,pk,payload,row.clock,row.hlc)) throw new StoredRecordUnavailable(source,'invalid_stored_payload',revision);
+    return {kind:'put',payload:payload as Record<string,unknown>,revision};
+}
+
+const RECEIPT_COLUMNS = `${boundedSyncMetadata('id')} AS id,op_id,server_version,workspace_id,
+    ${['table_name','pk','op','clock','hlc','device_id'].map(c => `${boundedSyncMetadata(c)} AS ${c}`).join(',')},
+    ${boundedSyncPayload('payload_json')} AS payload_json,length(cast(payload_json AS blob)) AS payload_bytes,
+    ${boundedSyncMetadata('intent_fingerprint')} AS intent_fingerprint,length(cast(intent_fingerprint AS blob)) AS fingerprint_bytes`;
+type StoredReceipt = {id:string;op_id:string;workspace_id:string;server_version:number;payload_bytes:number;fingerprint_bytes:number;table_name:string;pk:string;op:string;payload_json:string|null;intent_fingerprint:string|null;clock:number;hlc:string;device_id:string};
+function storedReceiptSource(row: StoredReceipt): Omit<EvidenceSource,'historyIncarnation'> {
+    return {workspaceId:row.workspace_id,source:'pull',locator:row.id || row.op_id,
+        table:'change_log',where:'op_id=?',parameters:[row.op_id],revisionSql:'cast(server_version AS text)',payload:'payload_json',
+        metadata:"json_object('table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version,'intent_fingerprint',intent_fingerprint)"};
+}
+function receiptFingerprint(row: StoredReceipt): string {
+    const source = storedReceiptSource(row);
+    if (row.fingerprint_bytes > SYNC_METADATA_BYTES || row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES) throw new StoredRecordUnavailable(source,'stored_receipt_oversized');
+    // Receipts with persisted fingerprints need no payload normalization, but
+    // a corrupted stored payload still cannot be certified as a successful replay.
+    let payload: unknown;
+    try {
+        payload = row.payload_json != null ? JSON.parse(row.payload_json) : undefined;
+    } catch { throw new StoredRecordUnavailable(source,'invalid_json'); }
+    if (!Number.isSafeInteger(row.server_version) || row.server_version < 1 ||
+        !SyncChangeSchema.safeParse({tableName:row.table_name,pk:row.pk,op:row.op,
+            payload,
+            stamp:{clock:row.clock,hlc:row.hlc,opId:row.op_id,deviceId:row.device_id},serverVersion:row.server_version}).success) {
+        throw new StoredRecordUnavailable(source,'invalid_stored_receipt');
+    }
+    if (row.op === 'put' && !validReadPayload(row.table_name,row.pk,payload,row.clock,row.hlc)) throw new StoredRecordUnavailable(source,'invalid_stored_receipt');
+    return row.intent_fingerprint ?? stableJson({tableName:row.table_name,operation:row.op,pk:row.pk,
+        payload:fingerprintPayload(row.table_name,row.op,payload),clock:row.clock,hlc:row.hlc,deviceId:row.device_id});
+}
+function storedRecordCapability(capability: PushBatch['storedRecordCapability']): void {
+    if (capability !== 'stored-record-v1') throw createError({statusCode:426,statusMessage:'Update OR3 Chat to recover unavailable stored records',
+        data:{code:'OR3_SYNC_UPDATE_REQUIRED',requiredCapability:'stored-record-v1'}});
+}
+function rejectedIntent(op: PendingOp, source: EvidenceSource): D1SqlStatement {
+    const lookup = evidenceLookup(source);
+    return {sql:`INSERT OR IGNORE INTO sync_unavailable_records
+        (id,workspace_id,source,locator,revision,payload_json,metadata_json,reason,status,created_at)
+        SELECT ?,?,'push',?,json_array(?,?),?,json_object('historyIncarnation',?,'evidenceRef',id), 'stored_record_unavailable','unresolved',unixepoch()
+        FROM (${lookup.sql})`, parameters:[uid(),source.workspaceId,op.stamp.opId,source.historyIncarnation,operationFingerprint(op),JSON.stringify(op),source.historyIncarnation,...lookup.parameters!]};
+}
+function unavailableResult(op: PendingOp, error: StoredRecordUnavailable, evidenceRef: string): PushResult['results'][number] {
+    return {opId:op.stamp.opId,success:false,errorCode:'STORED_RECORD_UNAVAILABLE',error:error.reason,evidenceRef};
+}
+function retainPushFailureNative(op: PendingOp, error: StoredRecordUnavailable, input: PushBatch): PushResult['results'][number] {
+    storedRecordCapability(input.storedRecordCapability);
+    const source = {...error.source,historyIncarnation:input.historyIncarnation as string};
+    const raw = getRawDb();
+    for (const statement of [evidenceInsert(source,error.reason),rejectedIntent(op,source)]) raw.prepare(statement.sql).run(...statement.parameters!);
+    const lookup = evidenceLookup(source);
+    const row = raw.prepare(lookup.sql).get(...lookup.parameters!) as {id:string}|undefined;
+    if (!row) throw new Error('Push evidence source disappeared');
+    return unavailableResult(op,error,row.id);
+}
+async function retainPushFailureD1(op: PendingOp, error: StoredRecordUnavailable, historyIncarnation: string, capability: PushBatch['storedRecordCapability']): Promise<PushResult['results'][number]> {
+    storedRecordCapability(capability);
+    const source = {...error.source,historyIncarnation};
+    await historyBatch([historyAssertion(historyIncarnation),evidenceInsert(source,error.reason),rejectedIntent(op,source)],historyIncarnation);
+    const lookup = evidenceLookup(source);
+    const [row] = await d1All<{id:string}>(lookup.sql,...lookup.parameters!);
+    if (!row) throw new Error('Push evidence source disappeared');
+    return unavailableResult(op,error,row.id);
 }
 
 function currentWinnerNative(
@@ -816,14 +968,14 @@ function currentWinnerNative(
     const materializedTable = SYNCED_TABLE_MAP[tableName];
     if (!materializedTable) return undefined;
     const row = raw.prepare(
-        `SELECT data_json, deleted, clock, hlc, op_id, updated_at
+        `SELECT ${WINNER_COLUMNS}
          FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
     ).get(pk, workspaceId) as MaterializedWinnerRow | undefined;
     const tombstone = raw.prepare(
-        `SELECT clock, hlc, op_id, deleted_at FROM tombstones
+        `SELECT ${TOMBSTONE_COLUMNS} FROM tombstones
          WHERE workspace_id = ? AND table_name = ? AND pk = ?`
     ).get(workspaceId, tableName, pk) as TombstoneWinnerRow | undefined;
-    return materializedWinner(row, tombstone);
+    return materializedWinner(row, tombstone, workspaceId, tableName, pk);
 }
 
 async function currentWinnerD1(
@@ -835,32 +987,32 @@ async function currentWinnerD1(
     const materializedTable = SYNCED_TABLE_MAP[tableName];
     if (!materializedTable) return undefined;
     const [row] = await d1All<MaterializedWinnerRow>(
-        `SELECT data_json, deleted, clock, hlc, op_id, updated_at
+        `SELECT ${WINNER_COLUMNS}
          FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
         pk,
         workspaceId
     );
-    if (tableName === 'notifications' && row && notificationPayloadUserId(JSON.parse(row.data_json)) !== userId) {
-        return undefined;
-    }
+
     const [tombstone] = await d1All<TombstoneWinnerRow>(
-        `SELECT clock, hlc, op_id, deleted_at FROM tombstones
+        `SELECT ${TOMBSTONE_COLUMNS} FROM tombstones
          WHERE workspace_id = ? AND table_name = ? AND pk = ?`,
         workspaceId,
         tableName,
         pk
     );
-    return materializedWinner(row, tombstone);
+    const winner = materializedWinner(row,tombstone,workspaceId,tableName,pk);
+    if (tableName === 'notifications' && winner?.kind === 'put' && notificationPayloadUserId(winner.payload) !== userId) return undefined;
+    return winner;
 }
 
 export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     id = 'sqlite';
     private versionWatchers = new Map<string, {
-        listeners: Map<(version: number) => void, (error: unknown) => void>;
-        version?: number; timer?: ReturnType<typeof setTimeout>; running: boolean;
+        listeners: Map<(position: {historyIncarnation:string;version:number}) => void, (error: unknown) => void>;
+        position?: {historyIncarnation:string;version:number}; timer?: ReturnType<typeof setTimeout>; running: boolean;
     }>();
 
-    async watchVersion(event: H3Event, scope: { workspaceId: string }, onVersion: (version: number) => void,
+    async watchVersion(event: H3Event, scope: { workspaceId: string }, onVersion: (position: {historyIncarnation:string;version:number}) => void,
         onError: (error: unknown) => void): Promise<() => void> {
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
         let watcher = this.versionWatchers.get(scope.workspaceId);
@@ -870,17 +1022,25 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         const current = watcher;
         current.listeners.set(onVersion, onError);
-        if (current.version !== undefined) onVersion(current.version);
+        if (current.position) onVersion(current.position);
         const poll = async () => {
             if (current.running || this.versionWatchers.get(scope.workspaceId) !== current) return;
             current.running = true;
             try {
-                const row = await getSqliteDb().selectFrom('server_version_counter').select('value')
-                    .where('workspace_id', '=', scope.workspaceId).executeTakeFirst();
-                const version = row?.value ?? 0;
-                if (current.version !== version) {
-                    current.version = version;
-                    for (const notify of [...current.listeners.keys()]) notify(version);
+                const [row] = await syncRows<{historyIncarnation:string;version:number}>(`SELECT incarnation AS historyIncarnation,
+                    coalesce((SELECT value FROM server_version_counter WHERE workspace_id=?),0) AS version FROM sync_history WHERE id=1`,scope.workspaceId);
+                if (!row || !validHistoryIncarnation(row.historyIncarnation)) throw new Error('Invalid sync history singleton');
+                if (current.position && current.position.historyIncarnation !== row.historyIncarnation) {
+                    // Never keep a stream from the replaced database alive.
+                    for (const fail of [...current.listeners.values()]) fail(createError({statusCode:409,
+                        data:{code:'OR3_SYNC_HISTORY_CHANGED',historyIncarnation:row.historyIncarnation,requiresSnapshot:true}}));
+                    current.listeners.clear();
+                    this.versionWatchers.delete(scope.workspaceId);
+                    return;
+                }
+                if (current.position?.version !== row.version) {
+                    current.position = row;
+                    for (const notify of [...current.listeners.keys()]) notify(row);
                 }
             } catch (error) {
                 for (const fail of [...current.listeners.values()]) fail(error);
@@ -914,12 +1074,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         return isD1Driver()
             ? ({
                   snapshotBootstrap: 'snapshot-v1',
+                  unavailableRecords: 'v1',
                   historyRetention: 'snapshot-v1',
                   retainedStorageMetadata: 'v1',
                   atomicUploadQuota: 'retained-v1',
               } as const)
             : ({
+                  historyIncarnation: 'v1',
                   snapshotBootstrap: 'snapshot-v1',
+                  unavailableRecords: 'v1',
                   historyRetention: 'snapshot-v1',
                   ...(this.storageGenerationCoordinator ? { externalStorageGenerations: 'v1' as const } : {}),
                   backgroundGenerationHistory: 'v1',
@@ -930,6 +1093,26 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   retainedStorageMetadata: 'v1',
                   atomicUploadQuota: 'retained-v1',
               } as const);
+    }
+
+    async getHistoryIncarnation(event: H3Event, scope: {workspaceId:string}): Promise<string> {
+        await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
+        return readHistoryIncarnation();
+    }
+
+    private async checkHistory(event: H3Event, input: {scope:{workspaceId:string};historyIncarnation?:unknown;historyIncarnationCapability?:unknown}, discovery = false): Promise<string> {
+        await assertWorkspaceScopeAuthorized(event,input.scope.workspaceId);
+        const expected = input.historyIncarnation;
+        // An old host strips the new fields before reaching the provider.
+        // Keep the existing update boundary instead of an opaque 400.
+        if (expected === undefined && input.historyIncarnationCapability !== 'incarnation-v1') {
+            throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat for history recovery',
+                data: { code: 'OR3_SYNC_UPDATE_REQUIRED', requiredCapability: 'incarnation-v1' } });
+        }
+        validateExpectedHistory(expected);
+        const current = await readHistoryIncarnation();
+        if (!discovery && expected !== current) historyChanged(current);
+        return current;
     }
 
     private get db() {
@@ -950,7 +1133,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             type StoredRow = { id: string; data_json: string; clock: number; deleted: number };
             const parse = (row: StoredRow): CanonicalHistoryRecord => {
                 const payload = JSON.parse(row.data_json) as CanonicalHistoryRecord;
-                if (payload.id !== row.id) throw new Error('Canonical history identity mismatch');
+                if (row.deleted !== 1 && payload.id !== row.id) throw new Error('Canonical history identity mismatch');
                 return { ...payload, id: row.id, clock: row.clock, deleted: row.deleted === 1 };
             };
             if (query.kind === 'thread') {
@@ -962,6 +1145,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 if (!thread) return { status: 'ok' as const, project_ownership: 'resolved' as const,
                     revision: String(threadRevision?.value ?? 0), thread };
                 const ownership = resolveCanonicalProjectOwnership(raw, actor.workspaceId, query.thread_id, thread.project_id);
+                if (ownership.status === 'unresolved') return { status: 'scope_incomplete' as const, revision: String(threadRevision?.value ?? 0) };
                 return { status: 'ok' as const, project_ownership: ownership.status,
                     revision: String(threadRevision?.value ?? 0), thread: { ...thread, project_id: ownership.projectId } };
             }
@@ -1086,26 +1270,27 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 materialized: 's_threads' | 's_messages';
                 record: Record<string, unknown> & { id: string; clock: number; hlc?: string };
             }>;
+            const prepared = records.map(entry => {
+                const opId = backgroundHistoryOpId(admission, entry.table === 'threads' ? 'thread' : entry.record.id === admission.messageId ? 'assistant' : 'user');
+                const hlc = entry.record.hlc ?? `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                const normalized = normalizeWirePayloadForTable(entry.table, entry.record) as Record<string, unknown>;
+                const payload: Record<string, unknown> = { ...sanitizePayloadForSync(entry.table, normalized, 'put'), hlc, op_id: opId };
+                if (entry.table === 'messages' && !payload.order_key) payload.order_key = hlc;
+                return prepareSyncWrite({ tableName: entry.table, pk: entry.record.id, operation: 'put', payload,
+                    stamp: { clock: entry.record.clock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
+            });
             const counter = raw
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
             const baseVersion = counter?.value ?? 0;
-            const finalVersion = baseVersion + records.length;
+            const finalVersion = safeVersionEnd(baseVersion, records.length);
             raw.prepare(
                 `INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
                  ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`
             ).run(admission.workspaceId, finalVersion);
             const now = nowEpoch();
             records.forEach((entry, index) => {
-                const opId = backgroundHistoryOpId(
-                    admission,
-                    entry.table === 'threads'
-                        ? 'thread'
-                        : entry.record.id === admission.messageId
-                          ? 'assistant'
-                          : 'user'
-                );
-                const hlc = entry.record.hlc ?? `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                const { stamp: { opId, hlc }, payload } = prepared[index]!;
                 const tombstone = raw.prepare(
                     `SELECT clock, hlc, op_id FROM tombstones
                      WHERE workspace_id = ? AND table_name = ? AND pk = ?`
@@ -1120,19 +1305,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 )) {
                     throw Object.assign(new Error('Background history record was superseded'), { code: 'SUPERSEDED' });
                 }
-                const sanitized = sanitizePayloadForSync(
-                    entry.table,
-                    entry.record,
-                    'put'
-                );
-                if (!sanitized) {
-                    throw Object.assign(new Error('Invalid background history payload'), { code: 'VALIDATION_ERROR' });
-                }
-                const payload = { ...sanitized, hlc, op_id: opId };
                 const payloadJson = JSON.stringify(payload);
-                if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
-                    throw Object.assign(new Error('Invalid background history payload size'), { code: 'VALIDATION_ERROR' });
-                }
                 const version = baseVersion + index + 1;
                 raw.prepare(
                     `INSERT INTO change_log
@@ -1292,7 +1465,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ).run(uid(), admission.workspaceId, admission.generationId, fingerprint, superseded, now);
                 return { status: 'superseded' as const, reason: superseded };
             }
-            const nextClock = row!.clock + 1;
+            const nextClock = nextSyncClock(row!.clock);
             const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
             const opId = backgroundHistoryOpId(admission, 'finalize');
             const terminalState = input.snapshot.status === 'complete'
@@ -1321,14 +1494,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     error: input.snapshot.error ?? null,
                 },
             };
-            const payloadJson = JSON.stringify(payload);
-            if (new TextEncoder().encode(payloadJson).byteLength > MAX_SYNC_PAYLOAD_BYTES) {
-                throw Object.assign(new Error('Invalid background history payload size'), { code: 'VALIDATION_ERROR' });
-            }
+            const finalPayload = normalizeWirePayloadForTable('messages', payload) as Record<string, unknown>;
+            if (!finalPayload.order_key) finalPayload.order_key = hlc;
+            const prepared = prepareSyncWrite({ tableName: 'messages', pk: admission.messageId, operation: 'put', payload: finalPayload,
+                stamp: { clock: nextClock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
+            const payloadJson = JSON.stringify(prepared.payload);
             const counter = raw
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
-            const serverVersion = (counter?.value ?? 0) + 1;
+            const serverVersion = safeVersionEnd(counter?.value ?? 0, 1);
             raw.prepare(
                 `INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
                  ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`
@@ -1420,20 +1594,22 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 } else newRows.push(row);
             }
             if (!newRows.length) return;
+            const prepared = newRows.map(row => {
+                const opId = digestUuid(createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex'));
+                const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
+                return prepareSyncWrite({ tableName: 'kv', pk: row.id, operation: 'put',
+                    payload: { ...sanitizePayloadForSync('kv', row, 'put'), hlc, op_id: opId },
+                    stamp: { clock: row.clock, hlc, opId, deviceId: backgroundHistoryDeviceId(admission.generationId) } });
+            });
             const counter = raw.prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(admission.workspaceId) as { value: number } | undefined;
             const baseVersion = counter?.value ?? 0;
             raw.prepare(`INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)
-                ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, baseVersion + newRows.length);
+                ON CONFLICT(workspace_id) DO UPDATE SET value = excluded.value`).run(admission.workspaceId, safeVersionEnd(baseVersion, newRows.length));
             const now = nowEpoch();
             newRows.forEach((row, index) => {
-                const opId = digestUuid(createHash('sha256').update(JSON.stringify([admission.workspaceId, admission.generationId, row.id])).digest('hex'));
-                const hlc = `${Date.now().toString(36).padStart(9, '0')}:000:background`;
-                const sanitized = sanitizePayloadForSync('kv', row, 'put');
-                if (!sanitized) throw Object.assign(new Error('Invalid tool result payload'), { code: 'VALIDATION_ERROR' });
-                const payloadJson = JSON.stringify({ ...sanitized, hlc, op_id: opId });
-                if (new TextEncoder().encode(payloadJson).length > MAX_SYNC_PAYLOAD_BYTES)
-                    throw Object.assign(new Error('Invalid tool result payload size'), { code: 'VALIDATION_ERROR' });
+                const { stamp: { opId, hlc }, payload } = prepared[index]!;
+                const payloadJson = JSON.stringify(payload);
                 raw.prepare(`INSERT INTO s_kv (id, workspace_id, data_json, clock, hlc, device_id, op_id, deleted, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`).run(row.id, admission.workspaceId, payloadJson, row.clock, hlc,
                         backgroundHistoryDeviceId(admission.generationId), opId, now, now);
@@ -1808,13 +1984,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         };
     }
 
-    async push(event: H3Event, input: PushBatch): Promise<PushResult> {
+    async push(event: H3Event, input: PushBatch, repair?: RepairGuard): Promise<PushResult> {
         const { scope, ops } = input;
         const workspaceId = scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
 
+        const historyIncarnation = await this.checkHistory(event, input);
         if (!ops.length) {
-            return { results: [], serverVersion: 0 };
+            return { results: [], serverVersion: 0, historyIncarnation };
         }
 
         const userId = resolveSessionUserId(event);
@@ -1870,7 +2047,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 }
                 continue;
             }
-            uniqueOps.push(scoped as PendingOp);
+            uniqueOps.push({ ...(scoped as PendingOp) });
             indicesByOpId.set(group.op.stamp.opId, group.indices);
         }
 
@@ -1883,6 +2060,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 indicesByOpId,
                 userId,
                 workspaceItemCapability: input.workspaceItemCapability,
+                storedRecordCapability: input.storedRecordCapability,
+                historyIncarnation,
+                repair,
             });
         }
 
@@ -1895,75 +2075,69 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const hookEmissions: HookEmission[] = [];
 
         const runTx = raw.transaction(() => {
+            const current = raw.prepare('SELECT incarnation FROM sync_history WHERE id=1').get() as {incarnation:string} | undefined;
+            if (current?.incarnation !== historyIncarnation) {
+                if (!validHistoryIncarnation(current?.incarnation)) throw new Error('Invalid sync history singleton');
+                historyChanged(current.incarnation);
+            }
+            if (repair) {
+                const assertion = repairAssertion(repair);
+                raw.prepare(assertion.sql).get(...assertion.parameters ?? []);
+            }
+            const existingOps = new Map<string, StoredReceipt & {fingerprint:string}>();
+            const failedBeforeAlloc = new Set<string>();
+            for (const op of uniqueOps) {
+                try {
+                    const receipt = raw.prepare(`SELECT ${RECEIPT_COLUMNS} FROM change_log WHERE op_id=?`).get(op.stamp.opId) as StoredReceipt|undefined;
+                    if (receipt) {
+                        const fingerprint = receipt.workspace_id === workspaceId ? receiptFingerprint(receipt) : '';
+                        existingOps.set(op.stamp.opId,{...receipt,fingerprint});
+                        if (receipt.workspace_id !== workspaceId) continue;
+                    }
+                    if (receipt && existingOps.get(op.stamp.opId)!.fingerprint !== operationFingerprint(op)) continue;
+                    if (!repair && !currentWinnerNative(raw,workspaceId,op.tableName,op.pk) && receipt) throw new StoredRecordUnavailable(storedReceiptSource(receipt),'stored_winner_missing');
+                } catch (error) {
+                    if (!(error instanceof StoredRecordUnavailable)) throw error;
+                    if (error.revision && op.tableName !== 'notifications' && incomingWinsRevision(op.stamp,error.revision)) {
+                        const statement = evidenceInsert({...error.source,historyIncarnation},error.reason);
+                        raw.prepare(statement.sql).run(...statement.parameters!);
+                        continue;
+                    }
+                    uniqueResults.push(retainPushFailureNative(op,error,input)); failedBeforeAlloc.add(op.stamp.opId);
+                }
+            }
             // Admission observes canonical state under the same write lock as LWW.
             if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
                 for (const op of uniqueOps) {
+                    if (failedBeforeAlloc.has(op.stamp.opId)) continue;
                     const table = SYNCED_TABLE_MAP[op.tableName];
                     if (!table || !['posts', 'projects'].includes(op.tableName)) continue;
-                    const canonical = raw.prepare('SELECT data_json FROM ' + table + ' WHERE id = ? AND workspace_id = ?')
+                    const canonical = raw.prepare(`SELECT CASE WHEN json_valid(data_json) THEN ${boundedSyncPayload('data_json')} END AS data_json FROM ${table} WHERE id = ? AND workspace_id = ?`)
                         .get(op.pk, workspaceId) as { data_json: string } | undefined;
                     if (hasWorkspaceItemSemantics(op.tableName, op.payload)
-                        || hasWorkspaceItemSemantics(op.tableName, canonical ? JSON.parse(canonical.data_json) : undefined)) {
+                        || hasWorkspaceItemSemantics(op.tableName, canonical?.data_json ? JSON.parse(canonical.data_json) : undefined)) {
                         throw workspaceItemUpdateRequired();
                     }
                 }
             }
-            // Check for existing op_ids (idempotency)
-            const opIds = uniqueOps.map((o) => o.stamp.opId);
-            const existingOps = new Map<string, {
-                server_version: number;
-                workspace_id: string;
-                fingerprint: string;
-                op_id: string;
-            }>();
-
-            // Query in chunks to avoid SQLite variable limits
-            const chunkSize = 500;
-            for (let i = 0; i < opIds.length; i += chunkSize) {
-                const chunk = opIds.slice(i, i + chunkSize);
-                const placeholders = chunk.map(() => '?').join(',');
-                const rows = raw
-                    .prepare(
-                        `SELECT op_id, server_version, workspace_id, table_name, pk, op,
-                                payload_json, clock, hlc, device_id
-                         FROM change_log WHERE op_id IN (${placeholders})`
-                    )
-                    .all(...chunk) as Array<{
-                        op_id: string;
-                        server_version: number;
-                        workspace_id: string;
-                        table_name: string;
-                        pk: string;
-                        op: string;
-                        payload_json: string | null;
-                        clock: number;
-                        hlc: string;
-                        device_id: string;
-                    }>;
-
-                for (const row of rows) {
-                    existingOps.set(row.op_id, {
-                        server_version: row.server_version,
-                        workspace_id: row.workspace_id,
-                        fingerprint: changeLogFingerprint(row),
-                        op_id: row.op_id,
-                    });
-                }
-            }
-
-            const failedBeforeAlloc = new Set<string>();
             for (const op of uniqueOps) {
+                if (failedBeforeAlloc.has(op.stamp.opId)) continue;
                 if (op.tableName !== 'notifications') continue;
                 const materializedTable = SYNCED_TABLE_MAP[op.tableName];
                 if (!materializedTable) continue;
                 const owned = raw
                     .prepare(
-                        `SELECT data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+                        `SELECT ${notificationOwnerSql('data_json')} AS owner FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
                     )
-                    .get(op.pk, workspaceId) as { data_json: string } | undefined;
-                const owner = owned
-                    ? notificationPayloadUserId(JSON.parse(owned.data_json))
-                    : undefined;
+                    .get(op.pk, workspaceId) as { owner: string | null } | undefined;
+                const owner = owned?.owner;
+                if (owned && !owner) {
+                    uniqueResults.push(retainPushFailureNative(op, new StoredRecordUnavailable(
+                        storedCanonicalSource(workspaceId, op.tableName, op.pk), 'notification_owner_unavailable'
+                    ), input));
+                    failedBeforeAlloc.add(op.stamp.opId);
+                    continue;
+                }
                 if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                     failedBeforeAlloc.add(op.stamp.opId);
                     uniqueResults.push({
@@ -1972,6 +2146,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         error: 'Forbidden: notification owner mismatch',
                         errorCode: 'UNAUTHORIZED',
                     });
+                }
+            }
+
+            const intentFingerprints = new Map(uniqueOps.map(op => [op.stamp.opId, operationFingerprint(op)]));
+            for (const op of uniqueOps) {
+                if (existingOps.has(op.stamp.opId) || failedBeforeAlloc.has(op.stamp.opId)) continue;
+                try { Object.assign(op, prepareFinalOperation(op)); }
+                catch (error) {
+                    failedBeforeAlloc.add(op.stamp.opId);
+                    uniqueResults.push({ opId: op.stamp.opId, success: false, error: (error as Error).message,
+                        errorCode: 'VALIDATION_ERROR' });
                 }
             }
 
@@ -1989,6 +2174,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(workspaceId) as { value: number } | undefined;
 
+            safeVersionEnd(counterRow?.value ?? 0, uniqueNewOpIds.size);
             if (counterRow) {
                 baseVersion = counterRow.value;
                 raw.prepare(
@@ -1996,7 +2182,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 ).run(baseVersion + uniqueNewOpIds.size, workspaceId);
             } else {
                 baseVersion = 0;
-                raw.prepare(
+                if (uniqueNewOpIds.size) raw.prepare(
                     'INSERT INTO server_version_counter (workspace_id, value) VALUES (?, ?)'
                 ).run(workspaceId, uniqueNewOpIds.size);
             }
@@ -2030,7 +2216,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 if (existingLog !== undefined) {
                     if (
                         existingLog.workspace_id !== workspaceId ||
-                        existingLog.fingerprint !== operationFingerprint(op)
+                        existingLog.fingerprint !== intentFingerprints.get(opId)
                     ) {
                         uniqueResults.push({
                             opId,
@@ -2081,26 +2267,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
                 const pkValue = op.pk;
 
-                if (op.tableName === 'notifications' && op.operation === 'delete') {
-                    const owned = raw
-                        .prepare(
-                            `SELECT data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
-                        )
-                        .get(pkValue, workspaceId) as { data_json: string } | undefined;
-                    const owner = owned
-                        ? notificationPayloadUserId(JSON.parse(owned.data_json))
-                        : undefined;
-                    if (!owned || owner !== userId) {
-                        uniqueResults.push({
-                            opId,
-                            success: false,
-                            error: 'Forbidden: notification owner mismatch',
-                            errorCode: 'UNAUTHORIZED',
-                        });
-                        continue;
-                    }
-                }
-
                 // Write change_log
                 const payloadJson =
                     op.payload != null ? JSON.stringify(op.payload) : null;
@@ -2120,6 +2286,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     now
                 );
 
+                raw.prepare('UPDATE change_log SET intent_fingerprint = ? WHERE op_id = ?')
+                    .run(intentFingerprints.get(opId), opId);
+
                 const incomingRev = {
                     clock: op.stamp.clock,
                     hlc: op.stamp.hlc,
@@ -2130,10 +2299,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 if (op.operation === 'put') {
                     const existing = raw
                         .prepare(
-                            `SELECT clock, hlc, op_id, data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+                            `SELECT clock, hlc, op_id, deleted, ${boundedSyncPayload('data_json')} AS data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
                         )
                         .get(pkValue, workspaceId) as
-                        | { clock: number; hlc: string; op_id: string; data_json: string }
+                        | { clock: number; hlc: string; op_id: string; data_json: string; deleted: number }
                         | undefined;
                     const tombstone = !existing
                         ? raw.prepare(
@@ -2183,7 +2352,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         );
                         applied = true;
                     } else {
-                        winnerPayload = JSON.parse(existing.data_json);
+                        winnerPayload = existing.deleted ? undefined : JSON.parse(existing.data_json);
                     }
 
                     const emission = resolveHookEmission({
@@ -2210,10 +2379,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 } else if (op.operation === 'delete') {
                     const existing = raw
                         .prepare(
-                            `SELECT clock, hlc, op_id, data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+                            `SELECT clock, hlc, op_id, deleted, ${boundedSyncPayload('data_json')} AS data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
                         )
                         .get(pkValue, workspaceId) as
-                        | { clock: number; hlc: string; op_id: string; data_json: string }
+                        | { clock: number; hlc: string; op_id: string; data_json: string; deleted: number }
                         | undefined;
                     let applied = false;
 
@@ -2290,12 +2459,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         applied,
                         ...(applied || !existing
                             ? {}
-                            : { payload: JSON.parse(existing.data_json) }),
+                            : { payload: existing.deleted ? undefined : JSON.parse(existing.data_json) }),
                         ...(applied ? {} : {
                             winner: currentWinnerNative(raw, workspaceId, op.tableName, pkValue),
                         }),
                     });
                 }
+            }
+            if (repair) {
+                if (!uniqueResults[0]?.success || uniqueResults[0]?.applied === false) throw new Error('Repair did not win');
+                const resolution = repairResolution(repair,uniqueOps[0]!.stamp.opId);
+                raw.prepare(resolution.sql).run(...resolution.parameters ?? []);
             }
         });
 
@@ -2317,6 +2491,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 (result): result is PushResult['results'][number] => Boolean(result)
             ),
             serverVersion: finalServerVersion,
+            historyIncarnation,
         };
     }
 
@@ -2324,22 +2499,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const db = this.db;
         const { scope, cursor, limit, tables } = input;
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
+        const historyIncarnation = await this.checkHistory(event, input, true);
         const fetchLimit = resolvePullLimit(limit);
-
-        let query = db
-            .selectFrom('change_log')
-            .where('workspace_id', '=', scope.workspaceId)
-            .where('server_version', '>', cursor)
-            .orderBy('server_version', 'asc');
-
-        if (tables?.length) {
-            query = query.where('table_name', 'in', tables);
-        }
-
-        const sizes = await query.select(sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes'))
-            .limit(fetchLimit + 1).execute();
-        const selected = boundedPayloadRowCount(sizes, fetchLimit);
-        const rows = selected ? await query.selectAll().limit(selected).execute() : [];
 
         const minLog = await db
             .selectFrom('change_log')
@@ -2353,34 +2514,133 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             .select('value')
             .where('workspace_id', '=', scope.workspaceId)
             .executeTakeFirst();
+        if (!Number.isSafeInteger(counter?.value ?? 0) || (counter?.value ?? 0) < 0 ||
+            minLog && (!Number.isSafeInteger(minLog.server_version) || minLog.server_version <= 0)) throw new Error('Untrustworthy sync retention version');
         const retention = computePullRetention({
             cursor,
             oldestLogVersion: minLog?.server_version ?? null,
             highWatermark: counter?.value ?? 0,
         });
-        const changes: SyncChange[] = [];
-        let itemBytes = 0;
-        let scanned = 0;
-        let nextCursor = cursor;
-        for (const row of rows.slice(0, fetchLimit)) {
-            const change: SyncChange = {
-                serverVersion: row.server_version, tableName: row.table_name, pk: row.pk,
-                op: row.op as 'put' | 'delete',
-                payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
-                stamp: { clock: row.clock, hlc: row.hlc, deviceId: row.device_id, opId: row.op_id },
-            };
-            if (isNotificationVisibleToUser(change, resolveSessionUserId(event))) {
-                const bytes = jsonBytes(change) + (changes.length ? 1 : 0);
-                // Account for the actual JSON envelope and a continuation flag.
-                const envelope = jsonBytes({ changes: [], nextCursor: row.server_version, hasMore: false, ...retention });
-                if (changes.length && envelope + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) break;
-                changes.push(change);
-                itemBytes += bytes;
-            }
-            scanned++;
-            nextCursor = row.server_version;
+        if (input.historyIncarnation !== historyIncarnation || retention.requiresSnapshot || cursor > (counter?.value ?? 0)) {
+            return { historyIncarnation, changes: [], unavailable: [], nextCursor: cursor, hasMore: false, ...retention, requiresSnapshot: true };
         }
-        return { changes, nextCursor, hasMore: sizes.length > scanned, ...retention };
+
+        let query = db
+            .selectFrom('change_log')
+            .where('workspace_id', '=', scope.workspaceId)
+            .where('server_version', '>', cursor)
+            .orderBy('server_version', 'asc');
+
+        if (tables?.length) {
+            query = query.where('table_name', 'in', tables);
+        }
+
+        const sizes = await query.select(['server_version',sql<number>`coalesce(length(cast(payload_json as blob)), 0)`.as('payload_bytes'),sql<number>`${sql.raw(PULL_METADATA_BYTES)}`.as('metadata_bytes')])
+            .limit(fetchLimit + 1).execute();
+        // Validate the lookahead too: a duplicate at the boundary would otherwise
+        // disappear behind nextCursor on the following request.
+        let previousVersion = cursor;
+        for (const row of sizes) {
+            if (!Number.isSafeInteger(row.server_version) || row.server_version <= previousVersion || row.server_version > (counter?.value ?? 0)) {
+                throw new Error('Untrustworthy sync server version');
+            }
+            previousVersion = row.server_version;
+        }
+        const selected = boundedPayloadRowCount(sizes, fetchLimit);
+        const rows = selected ? await query.select(['server_version',sql<number>`${sql.raw(boundedSyncMetadata('clock',PULL_METADATA_BYTES))}`.as('clock'),
+            ...['id','table_name','pk','op'].map(column => sql<string>`${sql.raw(boundedSyncMetadata(column))}`.as(column as 'id' | 'table_name' | 'pk' | 'op')),
+            ...['hlc','device_id','op_id'].map(column => sql<string>`${sql.raw(boundedSyncMetadata(column,PULL_METADATA_BYTES))}`.as(column as 'hlc' | 'device_id' | 'op_id')),
+            sql<number>`${sql.raw(PULL_METADATA_BYTES)}`.as('metadata_bytes'),
+            sql<string | null>`${sql.raw(boundedSyncPayload('payload_json'))}`.as('payload_json'),
+            sql<number>`coalesce(length(cast(payload_json AS blob)),0)`.as('payload_bytes'),
+            sql<string>`${sql.raw(`hex(cast(${boundedSyncMetadata('pk')} AS blob))`)}`.as('pk_hex'), sql<string>`${sql.raw(`hex(cast(${boundedSyncMetadata('table_name')} AS blob))`)}`.as('table_hex'),
+            sql<string | null>`${sql.raw(`CASE WHEN table_name = 'notifications' THEN ${notificationOwnerSql('payload_json')} END`)}`.as('notification_owner'),
+        ]).limit(selected).execute() : [];
+
+        const changes: SyncChange[] = [];
+        const unavailable: NonNullable<PullResponse['unavailable']> = [];
+        let scanned = 0;
+        let itemBytes = 0;
+        let nextCursor = cursor;
+        for (const row of rows) {
+            if (!Number.isSafeInteger(row.server_version) || row.server_version <= nextCursor || row.server_version > (counter?.value ?? 0)) {
+                throw new Error('Untrustworthy sync server version');
+            }
+            assertCoverageKey(row.table_name, row.pk, row.pk_hex, row.table_hex);
+            if (row.op !== 'put' && row.op !== 'delete') throw new Error('Untrustworthy sync operation kind');
+            const visible = row.table_name !== 'notifications' || !!row.notification_owner && row.notification_owner === resolveSessionUserId(event);
+            let change: SyncChange | undefined;
+            let reason = row.metadata_bytes > SYNC_METADATA_BYTES ? 'metadata_oversized' : row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES ? 'payload_oversized' : 'invalid_record';
+            if (reason === 'invalid_record') {
+                try {
+                    const candidate = { serverVersion: row.server_version, tableName: row.table_name, pk: row.pk, op: row.op as 'put' | 'delete',
+                        payload: row.payload_json ? JSON.parse(row.payload_json) : undefined,
+                        stamp: { clock: row.clock, hlc: row.hlc, deviceId: row.device_id, opId: row.op_id } };
+                    if (SyncChangeSchema.safeParse(candidate).success && Number.isSafeInteger(row.clock) &&
+                        (row.op === 'put' ? validReadPayload(row.table_name,row.pk,candidate.payload,row.clock,row.hlc) : ALLOWED_SYNC_TABLES.includes(row.table_name))) change = candidate;
+                } catch { reason = 'invalid_json'; }
+            }
+            const marker = { tableName: row.table_name, pk: row.pk, originalKind: row.op as 'put' | 'delete',
+                serverVersion: row.server_version, evidenceRef: '', reason };
+            const bytes = visible ? jsonBytes(change ?? {...marker,evidenceRef:'x'.repeat(36)}) + ((change ? changes.length : unavailable.length) ? 1 : 0) : 0;
+            const envelopeBytes = jsonBytes({historyIncarnation,changes:[],unavailable:[],nextCursor:row.server_version,hasMore:false,...retention});
+            if (envelopeBytes + itemBytes + bytes > MAX_SYNC_PAGE_BYTES) {
+                if (!scanned) throw new Error('Sync identity exceeds page byte budget');
+                break;
+            }
+            if (!change) {
+                marker.evidenceRef = await retainSqlEvidence({ historyIncarnation, workspaceId: scope.workspaceId, source: 'pull',
+                    locator: row.id, revisionSql: "cast(server_version AS text)", table: 'change_log', where: 'workspace_id = ? AND id = ? AND server_version = ?',
+                    parameters: [scope.workspaceId, row.id, row.server_version], payload: 'payload_json',
+                    metadata: "json_object('id',id,'table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version,'created_at',created_at)" }, reason);
+                if (visible) unavailable.push(marker);
+            } else if (visible) changes.push(change);
+            itemBytes += bytes;
+            scanned++; nextCursor = row.server_version;
+        }
+        return PullResponseSchema.parse({ historyIncarnation, changes, ...(unavailable.length ? { unavailable } : {}),
+            nextCursor, hasMore: sizes.length > scanned, ...retention });
+    }
+
+    async retainUnavailableRecord(event: H3Event, input: { scope: {workspaceId:string}; source:'pull'|'snapshot'; historyIncarnation?:string; record:unknown; marker:Omit<PullUnavailableRecord,'evidenceRef'> | Omit<SnapshotUnavailableRecord,'evidenceRef'> }): Promise<{ evidenceRef: string }> {
+        await assertWorkspaceScopeAuthorized(event,input.scope.workspaceId);
+        const historyIncarnation = await this.checkHistory(event,input);
+        const marker = input.marker;
+        assertCoverageKey(marker.tableName,marker.pk);
+        let source: EvidenceSource;
+        let record: unknown;
+        if (input.source === 'pull' && 'serverVersion' in marker) {
+            const [row] = await syncRows<{id:string;table_name:string;pk:string;op:string;clock:number;hlc:string;device_id:string;op_id:string;payload_json:string|null;owner:string|null}>(
+                `SELECT id,table_name,pk,op,clock,hlc,device_id,op_id,${boundedSyncPayload('payload_json')} AS payload_json,
+                ${notificationOwnerSql('payload_json')} AS owner FROM change_log WHERE workspace_id = ? AND server_version = ?`,input.scope.workspaceId,marker.serverVersion);
+            if (!row || row.table_name !== marker.tableName || row.pk !== marker.pk || row.op !== marker.originalKind ||
+                row.table_name === 'notifications' && (!row.owner || row.owner !== resolveSessionUserId(event))) throw new Error('Evidence source identity or visibility mismatch');
+            record = {serverVersion:marker.serverVersion,tableName:row.table_name,pk:row.pk,op:row.op,
+                payload:row.payload_json ? JSON.parse(row.payload_json) : undefined,stamp:{clock:row.clock,hlc:row.hlc,deviceId:row.device_id,opId:row.op_id}};
+            source = {historyIncarnation,workspaceId:input.scope.workspaceId,source:'pull',locator:row.id,revisionSql:"cast(server_version AS text)",table:'change_log',
+                where:'workspace_id = ? AND id = ? AND server_version = ?',parameters:[input.scope.workspaceId,row.id,marker.serverVersion],payload:'payload_json',
+                metadata:"json_object('id',id,'table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version)"};
+        } else if (input.source === 'snapshot' && 'snapshotId' in marker) {
+            const [header] = await syncRows<SnapshotHeaderRow>('SELECT * FROM sync_snapshots WHERE workspace_id = ? AND id = ?',input.scope.workspaceId,marker.snapshotId);
+            if (!header || header.expires_at <= nowEpoch() || header.high_watermark !== marker.highWatermark) throw new Error('Evidence snapshot unavailable');
+            assertSnapshotOwner(header.id,resolveSessionUserId(event));
+            const [row] = await syncRows<SnapshotItemRow>(`SELECT table_name,pk,kind,${boundedSyncPayload('payload_json')} AS payload_json,clock,hlc,op_id,server_deleted_at
+                FROM sync_snapshot_items WHERE snapshot_id = ? AND table_name = ? AND pk = ? AND kind = ?`,header.id,marker.tableName,marker.pk,marker.originalKind);
+            if (!row) throw new Error('Evidence snapshot source unavailable');
+            const payload = row.payload_json ? JSON.parse(row.payload_json) : undefined;
+            if (row.table_name === 'notifications' && row.kind === 'row' && notificationPayloadUserId(payload) !== resolveSessionUserId(event)) throw new Error('Evidence notification visibility mismatch');
+            record = {kind:row.kind,tableName:row.table_name,pk:row.pk,revision:{clock:row.clock,hlc:row.hlc,opId:row.op_id},
+                ...(row.kind === 'row' ? {payload} : {serverDeletedAt:row.server_deleted_at})};
+            source = snapshotEvidence(header,row,historyIncarnation);
+        } else throw new Error('Evidence source mismatch');
+        if (stableJson(record) !== stableJson(input.record)) throw new Error('Evidence source record mismatch');
+        return { evidenceRef: await retainSqlEvidence(source,'reader_invalid') };
+    }
+
+    async maintainUnavailableRecords(event: H3Event, workspaceId: string, action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+        await assertWorkspaceScopeAuthorized(event,workspaceId);
+        return maintainEvidence(event,workspaceId,action,input,(event,op,guard) => this.push(event,
+            {scope:{workspaceId},ops:[op],historyIncarnation:guard.historyIncarnation,workspaceItemCapability:WORKSPACE_ITEM_CAPABILITY},guard),validReadPayload);
     }
 
     async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
@@ -2389,7 +2649,12 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     /** Archives retain full Trash metadata; normal sync still emits tombstones. */
     async backupSnapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
-        return this.captureSnapshot(event, input, true);
+        // Server exports discover their first history; every later page stays
+        // bound to that capture rather than adopting the current database.
+        const historyIncarnation = input.historyIncarnation === undefined
+            ? input.pageToken ? decodeSnapshotPageToken(input.pageToken).historyIncarnation ?? null : null
+            : input.historyIncarnation;
+        return this.captureSnapshot(event, { ...input, historyIncarnation }, true);
     }
 
     private async captureSnapshot(
@@ -2399,10 +2664,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     ): Promise<SnapshotResponse> {
         const workspaceId = input.scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
+        const historyIncarnation = await this.checkHistory(event,input,
+            input.historyIncarnation === null && !input.pageToken);
+        if (input.pageToken && decodeSnapshotPageToken(input.pageToken).historyIncarnation !== historyIncarnation) historyChanged(historyIncarnation);
         const pageSize = resolveSnapshotPageSize(input.pageSize);
         const snapshotUserId = resolveSessionUserId(event);
         if (isD1Driver()) {
-            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles);
+            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles, historyIncarnation);
         }
         const raw = getRawDb();
         const now = nowEpoch();
@@ -2411,7 +2679,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         let after: SnapshotPageToken['after'] | undefined;
 
         if (input.pageToken) {
-            if (input.pageToken.length > 4096) {
+            if (input.pageToken.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) {
                 throw createError({
                     statusCode: 400,
                     statusMessage: 'Invalid snapshot page token',
@@ -2494,6 +2762,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     expiresAt
                 );
 
+                if (tables.includes('notifications')) {
+                    const evidence = unknownNotificationEvidence(workspaceId);
+                    raw.prepare(evidence.sql).run(...evidence.parameters ?? []);
+                }
                 for (const tableName of tables) {
                     const materializedTable = SYNCED_TABLE_MAP[tableName];
                     if (!materializedTable) {
@@ -2533,11 +2805,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     raw.prepare(`
                         INSERT INTO sync_snapshot_items (
                             snapshot_id, table_name, pk, kind, payload_json,
-                            clock, hlc, op_id, server_deleted_at
+                            clock, hlc, op_id, server_deleted_at, source_payload_json
                         )
                         SELECT
                             ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
-                            ${retainedFiles && tableName === 'file_meta' ? "json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.updated_at', materialized.updated_at)" : 'NULL'},
+                            ${retainedFiles && tableName === 'file_meta' ? "CASE WHEN length(cast(materialized.data_json AS blob)) <= 262144 AND json_valid(materialized.data_json) THEN json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.op_id', materialized.op_id, '$.updated_at', materialized.updated_at) ELSE materialized.data_json END" : 'NULL'},
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc
@@ -2559,7 +2831,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                                 materialized.updated_at,
                                 materialized.created_at,
                                 0
-                            ))
+                            )),
+                            ${retainedFiles && tableName === 'file_meta' ? 'materialized.data_json' : 'NULL'}
                         FROM "${materializedTable}" AS materialized
                         WHERE materialized.workspace_id = ? AND materialized.deleted <> 0${deletedOwner.sql}
                     `).run(snapshotId, tableName, tableName, workspaceId, ...deletedOwner.params);
@@ -2608,20 +2881,26 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
 
         const selection = snapshotPageSelection(header.id, after);
-        const sizes = raw.prepare(`SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes ${selection.clause}`)
+        const sizes = raw.prepare(`SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes, ${SNAPSHOT_METADATA_BYTES} AS metadata_bytes ${selection.clause}`)
             .all(...selection.parameters, pageSize + 1) as PayloadSizeRow[];
         const selected = boundedPayloadRowCount(sizes, pageSize);
-        const rows = selected ? raw.prepare(`SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at ${selection.clause}`)
+        const rows = selected ? raw.prepare(`SELECT ${boundedSyncMetadata('table_name')} AS table_name, ${boundedSyncMetadata('pk')} AS pk, ${boundedSyncMetadata('kind')} AS kind,
+            ${boundedSyncPayload('payload_json')} AS payload_json, length(cast(payload_json AS blob)) AS payload_bytes,
+            ${SNAPSHOT_METADATA_BYTES} AS metadata_bytes,
+            hex(cast(${boundedSyncMetadata('pk')} AS blob)) AS pk_hex, hex(cast(${boundedSyncMetadata('table_name')} AS blob)) AS table_hex,
+            CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner,
+            ${boundedSyncMetadata('clock',SNAPSHOT_METADATA_BYTES)} AS clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, ${boundedSyncMetadata('server_deleted_at',SNAPSHOT_METADATA_BYTES)} AS server_deleted_at ${selection.clause}`)
             .all(...selection.parameters, selected) as SnapshotItemRow[] : [];
-        return buildSnapshotPage(header, rows, pageSize, sizes.length);
+        return buildSnapshotPage(header, rows, pageSize, sizes.length, historyIncarnation, after, snapshotUserId);
     }
 
     async updateCursor(
         event: H3Event,
-        input: { scope: { workspaceId: string }; deviceId: string; version: number }
+        input: { scope: { workspaceId: string }; deviceId: string; version: number; historyIncarnation?: string | null }
     ): Promise<void> {
         await assertWorkspaceScopeAuthorized(event, input.scope.workspaceId);
         const now = nowEpoch();
+        const historyIncarnation = await this.checkHistory(event,input);
         const deviceId = input.deviceId.trim();
         if (!deviceId || deviceId.length > 256) {
             throw createError({ statusCode: 400, statusMessage: 'Invalid device cursor' });
@@ -2635,10 +2914,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
         }
         if (isD1Driver()) {
-            return this.updateCursorInD1(input.scope.workspaceId, deviceId, input.version, ownerUserId, now);
+            return this.updateCursorInD1(input.scope.workspaceId, deviceId, input.version, ownerUserId, now, historyIncarnation);
         }
         const raw = getRawDb();
         const update = raw.transaction(() => {
+            const current = raw.prepare('SELECT incarnation FROM sync_history WHERE id=1').get() as {incarnation:string}|undefined;
+            if(current?.incarnation !== historyIncarnation) {
+                if(!validHistoryIncarnation(current?.incarnation)) throw new Error('Invalid sync history singleton');
+                historyChanged(current.incarnation);
+            }
             const counter = raw.prepare(
                 'SELECT value FROM server_version_counter WHERE workspace_id = ?'
             ).get(input.scope.workspaceId) as { value: number } | undefined;
@@ -2667,7 +2951,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                    updated_at = excluded.updated_at`
             ).run(uid(), input.scope.workspaceId, deviceId, ownerUserId, input.version, now);
         });
-        update();
+        update.immediate();
     }
 
     async gcTombstones(
@@ -2753,62 +3037,29 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         if (!canRunSyncHistoryGc()) return;
         const cutoff = nowEpoch() - input.retentionSeconds;
+        // Age need not increase with server version (wall clocks can move).
+        // The first recent row fences all later history, even if it is old.
+        const deletePrefix = `DELETE FROM change_log
+            WHERE workspace_id = ? AND server_version < COALESCE((
+                SELECT MIN(server_version) FROM change_log
+                WHERE workspace_id = ? AND created_at >= ?
+            ), 9223372036854775807)
+            AND server_version <= COALESCE((
+                SELECT MIN(last_seen_version) FROM device_cursors WHERE workspace_id = ?
+            ), 9223372036854775807)`;
+        const workspaceId = input.scope.workspaceId;
         if (isD1Driver()) {
             await d1Batch([
-                {
-                    sql: `DELETE FROM device_cursors
-                     WHERE workspace_id = ? AND updated_at < ?`,
-                    parameters: [input.scope.workspaceId, cutoff],
-                },
-                {
-                    sql: `DELETE FROM change_log
-                     WHERE workspace_id = ?
-                       AND created_at < ?
-                       AND (
-                           NOT EXISTS (
-                               SELECT 1 FROM device_cursors
-                               WHERE workspace_id = ?
-                           )
-                           OR server_version <= (
-                               SELECT MIN(last_seen_version)
-                               FROM device_cursors
-                               WHERE workspace_id = ?
-                           )
-                       )`,
-                    parameters: [
-                        input.scope.workspaceId,
-                        cutoff,
-                        input.scope.workspaceId,
-                        input.scope.workspaceId,
-                    ],
-                },
+                { sql: 'DELETE FROM device_cursors WHERE workspace_id = ? AND updated_at < ?', parameters: [workspaceId, cutoff] },
+                { sql: deletePrefix, parameters: [workspaceId, workspaceId, cutoff, workspaceId] },
             ]);
             return;
         }
         const raw = getRawDb();
         raw.transaction(() => {
-            // See gcTombstones: inactive devices are snapshot-bootstrapped, so
-            // they must not pin historical rows forever.
-            raw.prepare(
-                `DELETE FROM device_cursors
-                 WHERE workspace_id = ? AND updated_at < ?`
-            ).run(input.scope.workspaceId, cutoff);
-            const cursor = raw.prepare(
-                `SELECT MIN(last_seen_version) AS min_version
-                 FROM device_cursors WHERE workspace_id = ?`
-            ).get(input.scope.workspaceId) as { min_version: number | null };
-            if (cursor.min_version === null) {
-                raw.prepare(
-                    `DELETE FROM change_log
-                     WHERE workspace_id = ? AND created_at < ?`
-                ).run(input.scope.workspaceId, cutoff);
-            } else {
-                raw.prepare(
-                    `DELETE FROM change_log
-                     WHERE workspace_id = ? AND created_at < ? AND server_version <= ?`
-                ).run(input.scope.workspaceId, cutoff, cursor.min_version);
-            }
-        })();
+            raw.prepare('DELETE FROM device_cursors WHERE workspace_id = ? AND updated_at < ?').run(workspaceId, cutoff);
+            raw.prepare(deletePrefix).run(workspaceId, workspaceId, cutoff, workspaceId);
+        }).immediate();
     }
 
     private async reserveUploadIntentInD1(
@@ -2867,14 +3118,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         input: SnapshotRequest,
         pageSize: number,
         snapshotUserId: string | undefined,
-        retainedFiles: boolean
+        retainedFiles: boolean,
+        historyIncarnation: string
     ): Promise<SnapshotResponse> {
         const now = nowEpoch();
         let header: SnapshotHeaderRow;
         let after: SnapshotPageToken['after'] | undefined;
 
         if (input.pageToken) {
-            if (input.pageToken.length > 4096) {
+            if (input.pageToken.length > MAX_SYNC_SNAPSHOT_TOKEN_LENGTH) {
                 throw createError({ statusCode: 400, statusMessage: 'Invalid snapshot page token' });
             }
             const token = decodeSnapshotPageToken(input.pageToken);
@@ -2942,6 +3194,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     ],
                 },
             ];
+            if (tables.includes('notifications')) statements.push(unknownNotificationEvidence(workspaceId));
             for (const tableName of tables) {
                 const materializedTable = SYNCED_TABLE_MAP[tableName];
                 if (!materializedTable) {
@@ -2980,11 +3233,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     {
                         sql: `INSERT INTO sync_snapshot_items (
                             snapshot_id, table_name, pk, kind, payload_json,
-                            clock, hlc, op_id, server_deleted_at
+                            clock, hlc, op_id, server_deleted_at, source_payload_json
                         )
                         SELECT
                             ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
-                            ${retainedFiles && tableName === 'file_meta' ? "json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.updated_at', materialized.updated_at)" : 'NULL'},
+                            ${retainedFiles && tableName === 'file_meta' ? "CASE WHEN length(cast(materialized.data_json AS blob)) <= 262144 AND json_valid(materialized.data_json) THEN json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.op_id', materialized.op_id, '$.updated_at', materialized.updated_at) ELSE materialized.data_json END" : 'NULL'},
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc
@@ -3006,7 +3259,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                                 materialized.updated_at,
                                 materialized.created_at,
                                 0
-                            ))
+                            )),
+                            ${retainedFiles && tableName === 'file_meta' ? 'materialized.data_json' : 'NULL'}
                         FROM "${materializedTable}" AS materialized
                         WHERE materialized.workspace_id = ? AND materialized.deleted <> 0${deletedOwner.sql}`,
                         parameters: [
@@ -3056,12 +3310,17 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
         const selection = snapshotPageSelection(header.id, after);
         const sizes = await d1All<PayloadSizeRow>(
-            `SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes ${selection.clause}`,
+            `SELECT coalesce(length(cast(payload_json as blob)), 0) AS payload_bytes, ${SNAPSHOT_METADATA_BYTES} AS metadata_bytes ${selection.clause}`,
             ...selection.parameters, pageSize + 1
         );
         const selected = boundedPayloadRowCount(sizes, pageSize);
         const rows = selected ? await d1All<SnapshotItemRow>(
-            `SELECT table_name, pk, kind, payload_json, clock, hlc, op_id, server_deleted_at ${selection.clause}`,
+            `SELECT ${boundedSyncMetadata('table_name')} AS table_name, ${boundedSyncMetadata('pk')} AS pk, ${boundedSyncMetadata('kind')} AS kind,
+            ${boundedSyncPayload('payload_json')} AS payload_json, length(cast(payload_json AS blob)) AS payload_bytes,
+            ${SNAPSHOT_METADATA_BYTES} AS metadata_bytes,
+            hex(cast(${boundedSyncMetadata('pk')} AS blob)) AS pk_hex, hex(cast(${boundedSyncMetadata('table_name')} AS blob)) AS table_hex,
+            CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner,
+            ${boundedSyncMetadata('clock',SNAPSHOT_METADATA_BYTES)} AS clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, ${boundedSyncMetadata('server_deleted_at',SNAPSHOT_METADATA_BYTES)} AS server_deleted_at ${selection.clause}`,
             ...selection.parameters, selected
         ) : [];
         // Captures and maintenance can evict a snapshot between these awaited
@@ -3072,7 +3331,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (!retained || retained.expires_at <= nowEpoch()) {
             throw createError({ statusCode: 410, statusMessage: 'Snapshot expired or unavailable' });
         }
-        return buildSnapshotPage(header, rows, pageSize, sizes.length);
+        return buildSnapshotPage(header, rows, pageSize, sizes.length, historyIncarnation, after, snapshotUserId);
     }
 
     private async updateCursorInD1(
@@ -3080,7 +3339,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         deviceId: string,
         version: number,
         ownerUserId: string,
-        now: number
+        now: number,
+        historyIncarnation: string
     ): Promise<void> {
         const [counter] = await d1All<{ value: number }>(
             'SELECT value FROM server_version_counter WHERE workspace_id = ?',
@@ -3102,22 +3362,25 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (existing && version < existing.last_seen_version) {
             throw createError({ statusCode: 409, statusMessage: 'Device cursor cannot regress' });
         }
-        const result = await d1Run(
-            `INSERT INTO device_cursors (
+        const results = await d1Batch([
+            historyAssertion(historyIncarnation),
+            {sql:`SELECT json_extract('{}',CASE WHEN ? <= coalesce((SELECT value FROM server_version_counter WHERE workspace_id=?),0)
+                AND ? >= coalesce((SELECT last_seen_version FROM device_cursors WHERE workspace_id=? AND owner_user_id=? AND device_id=?),0)
+                THEN '$' ELSE 'OR3_SYNC_CURSOR_CHANGED' END)`,parameters:[version,workspaceId,version,workspaceId,ownerUserId,deviceId]},
+            {sql:`INSERT INTO device_cursors (
                 id, workspace_id, device_id, owner_user_id, last_seen_version, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(workspace_id, owner_user_id, device_id) DO UPDATE SET
                 last_seen_version = excluded.last_seen_version,
                 updated_at = excluded.updated_at
              WHERE excluded.last_seen_version >= device_cursors.last_seen_version`,
-            uid(),
-            workspaceId,
-            deviceId,
-            ownerUserId,
-            version,
-            now
-        );
-        if ((result.meta?.changes ?? 0) !== 1) {
+            parameters:[uid(),workspaceId,deviceId,ownerUserId,version,now]},
+        ]).catch(async error=>{
+            if(String(error).includes('OR3_SYNC_HISTORY_CHANGED')) historyChanged(await readHistoryIncarnation());
+            if(String(error).includes('OR3_SYNC_CURSOR_CHANGED')) throw createError({statusCode:409,statusMessage:'Device cursor changed concurrently'});
+            throw error;
+        });
+        if ((results[2]?.meta?.changes ?? 0) !== 1) {
             throw createError({ statusCode: 409, statusMessage: 'Device cursor changed concurrently' });
         }
     }
@@ -3130,46 +3393,37 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         indicesByOpId: Map<string, number[]>;
         userId: string | undefined;
         workspaceItemCapability: PushBatch['workspaceItemCapability'];
+        storedRecordCapability: PushBatch['storedRecordCapability'];
+        historyIncarnation: string;
+        repair?: RepairGuard;
     }): Promise<PushResult> {
-        const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId } = input;
-        const existingOps = new Map<string, {
-            server_version: number;
-            workspace_id: string;
-            fingerprint: string;
-        }>();
-        const opIds = uniqueOps.map((op) => op.stamp.opId);
-        for (let offset = 0; offset < opIds.length; offset += 500) {
-            const chunk = opIds.slice(offset, offset + 500);
-            if (chunk.length === 0) continue;
-            const placeholders = chunk.map(() => '?').join(',');
-            const rows = await d1All<{
-                op_id: string;
-                server_version: number;
-                workspace_id: string;
-                table_name: string;
-                pk: string;
-                op: string;
-                payload_json: string | null;
-                clock: number;
-                hlc: string;
-                device_id: string;
-            }>(
-                `SELECT op_id, server_version, workspace_id, table_name, pk, op,
-                        payload_json, clock, hlc, device_id
-                 FROM change_log WHERE op_id IN (${placeholders})`,
-                ...chunk
-            );
-            for (const row of rows) {
-                existingOps.set(row.op_id, {
-                    server_version: row.server_version,
-                    workspace_id: row.workspace_id,
-                    fingerprint: changeLogFingerprint(row),
-                });
-            }
-        }
-
+        const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId, historyIncarnation } = input;
+        const originalOps = new Map(uniqueOps.map(op => [op.stamp.opId,{...op}]));
+        const existingOps = new Map<string, StoredReceipt & {fingerprint:string}>();
         const rejected = new Set<string>();
         for (const op of uniqueOps) {
+            try {
+                const [receipt] = await d1All<StoredReceipt>(`SELECT ${RECEIPT_COLUMNS} FROM change_log WHERE op_id=?`,op.stamp.opId);
+                if (receipt) {
+                    const fingerprint = receipt.workspace_id === workspaceId ? receiptFingerprint(receipt) : '';
+                    existingOps.set(op.stamp.opId,{...receipt,fingerprint});
+                    if (receipt.workspace_id !== workspaceId) continue;
+                }
+                if (receipt && existingOps.get(op.stamp.opId)!.fingerprint !== operationFingerprint(op)) continue;
+                if (!input.repair && !await currentWinnerD1(workspaceId,op.tableName,op.pk,userId) && receipt && op.tableName !== 'notifications') throw new StoredRecordUnavailable(storedReceiptSource(receipt),'stored_winner_missing');
+            } catch (error) {
+                if (!(error instanceof StoredRecordUnavailable)) throw error;
+                if (error.revision && op.tableName !== 'notifications' && incomingWinsRevision(op.stamp,error.revision)) {
+                    await historyBatch([historyAssertion(historyIncarnation),evidenceInsert({...error.source,historyIncarnation},error.reason)],historyIncarnation);
+                    continue;
+                }
+                const result = await retainPushFailureD1(originalOps.get(op.stamp.opId)!,error,historyIncarnation,input.storedRecordCapability);
+                rejected.add(op.stamp.opId);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = result;
+            }
+        }
+        for (const op of uniqueOps) {
+            if (rejected.has(op.stamp.opId)) continue;
             const existing = existingOps.get(op.stamp.opId);
             if (!existing) continue;
             if (
@@ -3193,14 +3447,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (rejected.has(op.stamp.opId)) continue;
             const materializedTable = SYNCED_TABLE_MAP[op.tableName];
             if (!materializedTable) continue;
-            const [owned] = await d1All<{ data_json: string }>(
-                `SELECT data_json FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
+            const [owned] = await d1All<{ owner: string | null }>(
+                `SELECT ${notificationOwnerSql('data_json')} AS owner FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
                 op.pk,
                 workspaceId
             );
-            const owner = owned
-                ? notificationPayloadUserId(JSON.parse(owned.data_json))
-                : undefined;
+            const owner = owned?.owner;
+            if (owned && !owner) {
+                const result = await retainPushFailureD1(originalOps.get(op.stamp.opId)!,new StoredRecordUnavailable(storedCanonicalSource(workspaceId,op.tableName,op.pk),'notification_owner_unavailable'),historyIncarnation,input.storedRecordCapability);
+                rejected.add(op.stamp.opId);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = result;
+                continue;
+            }
             if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                 rejected.add(op.stamp.opId);
                 for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
@@ -3214,9 +3472,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             }
         }
 
-        const newOps = uniqueOps.filter(
-            (op) => !existingOps.has(op.stamp.opId) && !rejected.has(op.stamp.opId)
-        );
+        const intentFingerprints = new Map(uniqueOps.map(op => [op.stamp.opId, operationFingerprint(op)]));
+        const newOps = uniqueOps.filter(op => {
+            if (existingOps.has(op.stamp.opId) || rejected.has(op.stamp.opId)) return false;
+            try { Object.assign(op, prepareFinalOperation(op)); return true; }
+            catch (error) {
+                rejected.add(op.stamp.opId);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = {
+                    opId: op.stamp.opId, success: false, error: (error as Error).message, errorCode: 'VALIDATION_ERROR',
+                };
+                return false;
+            }
+        });
 
         const existingMaterializedKeys = new Set<string>();
         const opsByTable = new Map<string, PendingOp[]>();
@@ -3275,10 +3542,11 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
 
         const now = nowEpoch();
-        const statements: D1SqlStatement[] = [];
+        const statements: D1SqlStatement[] = [historyAssertion(historyIncarnation)];
+        if (input.repair) statements.push(repairAssertion(input.repair));
         if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
             for (const op of uniqueOps) {
-                if (!['posts', 'projects'].includes(op.tableName)) continue;
+                if (rejected.has(op.stamp.opId) || !['posts', 'projects'].includes(op.tableName)) continue;
                 if (hasWorkspaceItemSemantics(op.tableName, op.payload)) {
                     throw workspaceItemUpdateRequired();
                 }
@@ -3292,6 +3560,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 parameters: [workspaceId],
             });
         }
+        // Assert inside the atomic batch, so concurrent writers cannot exhaust
+        // the counter after a preflight check. Invalid JSON paths abort D1 batches.
+        if (newOps.length > 0) statements.push({
+            sql: `SELECT json_extract('{}', CASE WHEN typeof(value) = 'integer'
+                AND value >= 0 AND value <= ? THEN '$' ELSE 'OR3_SYNC_VERSION_EXHAUSTED' END)
+                FROM server_version_counter WHERE workspace_id = ?`,
+            parameters: [Number.MAX_SAFE_INTEGER - 1 - newOps.length, workspaceId],
+        });
         const materializedStatementIndex = new Map<string, number>();
         const materializedWasExisting = new Map<string, boolean>();
         const seenMaterializedKeys = new Set<string>();
@@ -3310,14 +3586,14 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             statements.push({
                 sql: `INSERT INTO change_log (
                     id, workspace_id, server_version, table_name, pk, op,
-                    payload_json, clock, hlc, device_id, op_id, created_at
+                    payload_json, clock, hlc, device_id, op_id, created_at, intent_fingerprint
                 ) SELECT
                     ?, ?,
                     (SELECT value + 1 FROM server_version_counter WHERE workspace_id = ?),
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 ${op.tableName === 'notifications' ? `WHERE NOT EXISTS (
                     SELECT 1 FROM s_notifications WHERE id = ? AND workspace_id = ?
-                    AND json_extract(data_json, '$.user_id') IS NOT ?
+                    AND ${notificationOwnerSql('data_json')} IS NOT ?
                 )` : ''}`,
                 parameters: [
                     uid(),
@@ -3332,6 +3608,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     op.stamp.deviceId,
                     op.stamp.opId,
                     now,
+                    intentFingerprints.get(op.stamp.opId),
                     ...(op.tableName === 'notifications' ? [op.pk, workspaceId, userId] : []),
                 ],
             });
@@ -3362,7 +3639,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         deleted = 0,
                         updated_at = excluded.updated_at
                     WHERE ${lwwExcludedWins(`"${materializedTable}"`)}
-                    ${op.tableName === 'notifications' ? `AND json_extract("${materializedTable}".data_json, '$.user_id') = json_extract(excluded.data_json, '$.user_id')` : ''}`,
+                    ${op.tableName === 'notifications' ? `AND ${notificationOwnerSql(`"${materializedTable}".data_json`)} = json_extract(excluded.data_json, '$.user_id')` : ''}`,
                     parameters: [
                         op.pk,
                         workspaceId,
@@ -3388,7 +3665,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op_id = excluded.op_id,
                         deleted = 1,
                         updated_at = excluded.updated_at
-                    WHERE ${lwwExcludedWins(`"${materializedTable}"`)}`,
+                    WHERE ${lwwExcludedWins(`"${materializedTable}"`)}
+                    ${op.tableName === 'notifications' ? 'AND EXISTS (SELECT 1 FROM change_log WHERE op_id=?)' : ''}`,
                     parameters: [
                         op.pk,
                         workspaceId,
@@ -3398,17 +3676,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op.stamp.opId,
                         now,
                         now,
+                        ...(op.tableName === 'notifications' ? [op.stamp.opId] : []),
                     ],
                 });
                 statements.push({
                     sql: `INSERT INTO tombstones (
                         id, workspace_id, table_name, pk, deleted_at, clock,
                         hlc, op_id, server_version, created_at
-                    ) VALUES (
+                    ) SELECT
                         ?, ?, ?, ?, ?, ?, ?, ?,
                         (SELECT value FROM server_version_counter WHERE workspace_id = ?),
                         ?
-                    )
+                    WHERE ${op.tableName === 'notifications' ? 'EXISTS (SELECT 1 FROM change_log WHERE op_id=?)' : '1'}
                     ON CONFLICT(workspace_id, table_name, pk) DO UPDATE SET
                         deleted_at = excluded.deleted_at,
                         clock = excluded.clock,
@@ -3427,6 +3706,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op.stamp.opId,
                         workspaceId,
                         now,
+                        ...(op.tableName === 'notifications' ? [op.stamp.opId] : []),
                     ],
                 });
             }
@@ -3441,9 +3721,13 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
         let batchResults: Awaited<ReturnType<typeof d1Batch>>;
         try {
-            batchResults = statements.length > 0 ? await d1Batch(statements) : [];
+            batchResults = statements.length > 0 ? await d1Batch(input.repair && newOps.length ? [...statements,repairResolution(input.repair,newOps[0]!.stamp.opId)] : statements) : [];
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            if (message.includes('OR3_SYNC_HISTORY_CHANGED')) historyChanged(await readHistoryIncarnation());
+            if (/JSON path/i.test(message) && message.includes('OR3_SYNC_VERSION_EXHAUSTED')) {
+                throw Object.assign(new Error('Sync server version exhausted or invalid'), { code: 'VALIDATION_ERROR' });
+            }
             if (/JSON path/i.test(message) && message.includes(WORKSPACE_ITEM_UPDATE_REQUIRED)) {
                 throw workspaceItemUpdateRequired();
             }
@@ -3465,6 +3749,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             );
             finalServerVersion = counter?.value ?? 0;
         }
+        const opIds = uniqueOps.filter(op => !rejected.has(op.stamp.opId)).map(op => op.stamp.opId);
         const resolvedOps = new Map<string, number>();
         for (let offset = 0; offset < opIds.length; offset += 500) {
             const chunk = opIds.slice(offset, offset + 500);
@@ -3480,81 +3765,75 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const emissions: HookEmission[] = [];
         for (const op of uniqueOps) {
             if (rejected.has(op.stamp.opId)) continue;
-            if (op.tableName === 'notifications') {
-                const [owned] = await d1All<{ data_json: string }>(
-                    'SELECT data_json FROM s_notifications WHERE id = ? AND workspace_id = ?', op.pk, workspaceId
-                );
-                if (owned && notificationPayloadUserId(JSON.parse(owned.data_json)) !== userId) {
+            try {
+                const winner = await currentWinnerD1(workspaceId,op.tableName,op.pk,userId);
+                if (op.tableName === 'notifications') {
+                    const [owned] = await d1All<{ owner: string | null }>(
+                        `SELECT ${notificationOwnerSql('data_json')} AS owner FROM s_notifications WHERE id = ? AND workspace_id = ?`, op.pk, workspaceId
+                    );
+                    if (owned && !owned.owner) throw new StoredRecordUnavailable(storedCanonicalSource(workspaceId,op.tableName,op.pk),'notification_owner_unavailable');
+                    if (owned && owned.owner !== userId) {
+                        for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
+                            resultSlots[index] = { opId: op.stamp.opId, success: false, error: 'Forbidden: notification owner mismatch', errorCode: 'UNAUTHORIZED' };
+                        }
+                        continue;
+                    }
+                }
+                const existing = existingOps.get(op.stamp.opId);
+                if (existing) {
+                    if (!winner) throw new StoredRecordUnavailable(storedReceiptSource(existing),'stored_winner_missing');
+                    const applied = winner?.revision.opId === op.stamp.opId;
+                    const result: PushResult['results'][number] = {
+                        opId: op.stamp.opId,
+                        success: true,
+                        serverVersion: existing.server_version,
+                        replayed: true,
+                        applied,
+                        ...(applied ? {} : { winner }),
+                    };
                     for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
-                        resultSlots[index] = { opId: op.stamp.opId, success: false, error: 'Forbidden: notification owner mismatch', errorCode: 'UNAUTHORIZED' };
+                        resultSlots[index] = result;
                     }
                     continue;
                 }
-            }
-            const existing = existingOps.get(op.stamp.opId);
-            if (existing) {
-                const winner = await currentWinnerD1(workspaceId, op.tableName, op.pk, userId);
-                const applied = winner?.revision.opId === op.stamp.opId;
+                const serverVersion = resolvedOps.get(op.stamp.opId);
+                if (serverVersion === undefined) {
+                    throw new Error(`D1 failed to resolve sync operation ${op.stamp.opId}.`);
+                }
+                const skipApply = skipMaterialize.has(op.stamp.opId);
+                const materializedResult = batchResults[materializedStatementIndex.get(op.stamp.opId) ?? -1];
+                const applied = !skipApply && (materializedResult?.meta?.changes ?? 0) > 0;
+                const winnerPayload = winner?.kind === 'put' ? winner.payload : undefined;
                 const result: PushResult['results'][number] = {
                     opId: op.stamp.opId,
                     success: true,
-                    serverVersion: existing.server_version,
-                    replayed: true,
+                    serverVersion,
                     applied,
-                    ...(applied ? {} : { winner }),
+                    ...(applied ? {} : { payload: winnerPayload }),
+                    ...(applied ? {} : {
+                        winner,
+                    }),
                 };
                 for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
                     resultSlots[index] = result;
                 }
-                continue;
-            }
-            const serverVersion = resolvedOps.get(op.stamp.opId);
-            if (serverVersion === undefined) {
-                throw new Error(`D1 failed to resolve sync operation ${op.stamp.opId}.`);
-            }
-            const skipApply = skipMaterialize.has(op.stamp.opId);
-            const materializedResult = batchResults[materializedStatementIndex.get(op.stamp.opId) ?? -1];
-            const applied = !skipApply && (materializedResult?.meta?.changes ?? 0) > 0;
-            let winnerPayload: unknown;
-            if (!applied && !skipApply) {
-                const materializedTable = SYNCED_TABLE_MAP[op.tableName];
-                if (materializedTable) {
-                    const [winner] = await d1All<{ data_json: string }>(
-                        `SELECT data_json FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
-                        op.pk,
-                        workspaceId
-                    );
-                    if (winner?.data_json) {
-                        const payload = JSON.parse(winner.data_json);
-                        if (op.tableName !== 'notifications' || notificationPayloadUserId(payload) === userId) winnerPayload = payload;
-                    }
-                }
-            }
-            const result: PushResult['results'][number] = {
-                opId: op.stamp.opId,
-                success: true,
-                serverVersion,
-                applied,
-                ...(applied ? {} : { payload: winnerPayload }),
-                ...(applied ? {} : {
-                    winner: await currentWinnerD1(workspaceId, op.tableName, op.pk, userId),
-                }),
-            };
-            for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
-                resultSlots[index] = result;
-            }
 
-            if (applied) {
-                const emission = resolveHookEmission({
-                    op,
-                    workspaceId,
-                    now,
-                    userId,
-                    wasExisting:
-                        materializedWasExisting.get(op.stamp.opId) ?? false,
-                    applied: true,
-                });
-                if (emission) emissions.push(emission);
+                if (applied) {
+                    const emission = resolveHookEmission({
+                        op,
+                        workspaceId,
+                        now,
+                        userId,
+                        wasExisting:
+                            materializedWasExisting.get(op.stamp.opId) ?? false,
+                        applied: true,
+                    });
+                    if (emission) emissions.push(emission);
+                }
+            } catch (error) {
+                if (!(error instanceof StoredRecordUnavailable)) throw error;
+                const result = await retainPushFailureD1(originalOps.get(op.stamp.opId)!,error,historyIncarnation,input.storedRecordCapability);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = result;
             }
         }
 
@@ -3566,6 +3845,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 (result): result is PushResult['results'][number] => Boolean(result)
             ),
             serverVersion: finalServerVersion,
+            historyIncarnation,
         };
     }
 
@@ -3601,6 +3881,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     }
 }
 
-export function createSqliteSyncGatewayAdapter(): SyncGatewayAdapter {
+export function createSqliteSyncGatewayAdapter(): SqliteSyncGatewayAdapter {
     return new SqliteSyncGatewayAdapter();
 }

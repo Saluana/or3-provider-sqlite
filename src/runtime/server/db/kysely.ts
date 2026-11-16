@@ -4,7 +4,7 @@
  * The default remains better-sqlite3. Bun and Turso expose the same
  * synchronous SQLite shape, while Cloudflare D1 uses its native async binding.
  */
-import { Kysely, SqliteDialect } from 'kysely';
+import { Kysely, SqliteAdapter, SqliteDialect } from 'kysely';
 import { D1Dialect, type D1Database } from './d1-dialect';
 import type { Or3SqliteDb } from './schema';
 
@@ -511,6 +511,16 @@ function isD1Database(value: unknown): value is D1Database {
     return isRecord(value) && typeof value.prepare === 'function';
 }
 
+// Native SQLite supports transactional DDL. Kysely defaults this to false;
+// enabling it also commits migration ledger entries with the schema changes.
+class NativeSqliteDialect extends SqliteDialect {
+    override createAdapter(): SqliteAdapter {
+        return new class extends SqliteAdapter {
+            override get supportsTransactionalDdl() { return true; }
+        }();
+    }
+}
+
 async function initialize(options?: SqliteDbOptions): Promise<Kysely<Or3SqliteDb>> {
     const driver = resolveDriver(options);
     selectedDriver = driver;
@@ -533,7 +543,7 @@ async function initialize(options?: SqliteDbOptions): Promise<Kysely<Or3SqliteDb
 
     if (driver !== 'turso') applyLocalPragmas(rawDb, options);
     instance = new Kysely<Or3SqliteDb>({
-        dialect: new SqliteDialect({ database: new KyselyDatabaseAdapter(rawDb) }),
+        dialect: new NativeSqliteDialect({ database: new KyselyDatabaseAdapter(rawDb) }),
     });
     return instance;
 }

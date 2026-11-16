@@ -1,0 +1,708 @@
+import { TitleSourceSchema } from '../titles/title';
+import { WORKSPACE_ITEM_CAPABILITY } from "../posts/workspace-item-capability";
+/**
+ * Zod Schemas for Sync Types
+ *
+ * Validation schemas for runtime type checking of sync operations.
+ * These can be used on both client and server for validation.
+ */
+import { z } from 'zod';
+import { toServerFormat } from './field-mappings';
+import { FILE_KIND_CAPABILITY } from '../files/file-capability';
+
+export const MAX_SYNC_PUSH_BATCH_OPS = 100;
+export const MAX_SYNC_PUSH_BATCH_BYTES = 2 * 1024 * 1024;
+const MAX_SYNC_IDENTIFIER_LENGTH = 256;
+const MAX_SYNC_TABLE_FILTERS = 50;
+
+/** Bounds include JSON escaping of every currently admitted 1,024-unit key. */
+export const MAX_SYNC_SNAPSHOT_TOKEN_LENGTH = 65_536;
+export const MAX_SYNC_SNAPSHOT_REQUEST_BYTES = 128 * 1024;
+export const MAX_SYNC_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+/** UTF-8 BINARY ordering, component by component; never flatten with delimiters. */
+export function compareSyncTuple(a: readonly string[], b: readonly string[]): number {
+    const encoder = new TextEncoder();
+    for (let i = 0; i < Math.min(a.length, b.length); i++) {
+        const left = encoder.encode(a[i]!);
+        const right = encoder.encode(b[i]!);
+        for (let j = 0; j < Math.min(left.length, right.length); j++) {
+            if (left[j] !== right[j]) return left[j]! - right[j]!;
+        }
+        if (left.length !== right.length) return left.length - right.length;
+    }
+    return a.length - b.length;
+}
+
+
+/** Identifiers must survive a UTF-8 storage round trip without replacement. */
+export function isLosslessSyncIdentifier(value: string): boolean {
+    for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(++i);
+            if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+        } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+    }
+    return true;
+}
+
+export const SyncRecordIdentifierSchema = z.string().min(1).refine(isLosslessSyncIdentifier, 'Identifier is not lossless UTF-8');
+export const UNAVAILABLE_RECORD_CAPABILITY = 'unavailable-v1' as const;
+const unavailableIdentity = {
+    tableName: SyncRecordIdentifierSchema,
+    pk: SyncRecordIdentifierSchema,
+    evidenceRef: z.string().min(1).max(512),
+    reason: z.string().min(1).max(256),
+};
+export const PullUnavailableRecordSchema = z.object({
+    ...unavailableIdentity,
+    originalKind: z.enum(['put', 'delete']),
+    serverVersion: z.number().int().positive(),
+});
+export const SnapshotUnavailableRecordSchema = z.object({
+    ...unavailableIdentity,
+    originalKind: z.enum(['row', 'tombstone']),
+    snapshotId: z.string().min(1),
+    highWatermark: z.number().int().nonnegative(),
+});
+
+export function syncJsonByteLength(value: unknown): number {
+    try {
+        return new TextEncoder().encode(JSON.stringify(value)).length;
+    } catch {
+        return Number.MAX_SAFE_INTEGER;
+    }
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function toSnakeCaseKey(key: string): string {
+    return key.replace(/[A-Z]/g, (match) => `_${match.toLowerCase()}`);
+}
+
+function normalizeRecordToSnakeCase(
+    input: Record<string, unknown>
+): Record<string, unknown> {
+    const normalized: Record<string, unknown> = { ...input };
+    for (const [key, value] of Object.entries(input)) {
+        const snakeKey = toSnakeCaseKey(key);
+        if (snakeKey === key) continue;
+        if (!(snakeKey in normalized)) {
+            normalized[snakeKey] = value;
+        }
+        delete normalized[key];
+    }
+    return normalized;
+}
+
+export function normalizeWirePayloadForTable(
+    tableName: string,
+    payload: unknown
+): unknown {
+    if (!isPlainRecord(payload)) return payload;
+    const normalized = normalizeRecordToSnakeCase(payload);
+    return toServerFormat(tableName, normalized);
+}
+
+function createTablePayloadSchema<T extends z.ZodRawShape>(
+    tableName: string,
+    shape: T
+): z.ZodType<z.infer<z.ZodObject<T>>> {
+    return z.preprocess(
+        (input) => normalizeWirePayloadForTable(tableName, input),
+        z.object(shape).passthrough()
+    ) as z.ZodType<z.infer<z.ZodObject<T>>>;
+}
+
+// ============================================================
+// CORE SCHEMAS
+// ============================================================
+
+export const SyncScopeSchema = z.object({
+    workspaceId: z.string().trim().min(1).max(MAX_SYNC_IDENTIFIER_LENGTH).refine(isLosslessSyncIdentifier),
+    projectId: z.string().trim().min(1).max(MAX_SYNC_IDENTIFIER_LENGTH).refine(isLosslessSyncIdentifier).optional(),
+});
+
+export const ChangeStampSchema = z.object({
+    deviceId: z.string().trim().min(1).max(MAX_SYNC_IDENTIFIER_LENGTH),
+    opId: z.string().uuid(),
+    hlc: z.string().min(1).max(512),
+    clock: z.number().int().nonnegative(),
+});
+
+export const PendingOpSchema = z.object({
+    id: z.string().min(1).max(MAX_SYNC_IDENTIFIER_LENGTH),
+    tableName: z.string().min(1).max(128),
+    operation: z.enum(['put', 'delete']),
+    pk: z.string().min(1).max(1024),
+    payload: z.unknown().optional(),
+    stamp: ChangeStampSchema,
+    createdAt: z.number(),
+    attempts: z.number().int().nonnegative(),
+    nextAttemptAt: z.number().int().nonnegative().optional(),
+    // Local-only scheduling projection (`nextAttemptAt ?? 0`). Accepted so
+    // persisted rows validate; stripped before wire-size and provider input.
+    readyAt: z.number().optional(),
+    claimId: z.string().optional(),
+    claimExpiresAt: z.number().int().nonnegative().optional(),
+    status: z.enum([
+        'pending',
+        'in_flight',
+        'retry_wait',
+        'failed_retryable',
+        'failed_permanent',
+        'applied',
+        'discarded',
+        // Legacy persisted states, migrated lazily by the outbox manager.
+        'syncing',
+        'failed',
+    ]),
+    lastError: z.string().optional(),
+    lastErrorCode: z.enum([
+        'STORED_RECORD_UNAVAILABLE',
+        'VALIDATION_ERROR',
+        'UNAUTHORIZED',
+        'CONFLICT',
+        'NOT_FOUND',
+        'RATE_LIMITED',
+        'OVERSIZED',
+        'NETWORK_ERROR',
+        'SERVER_ERROR',
+        'UNKNOWN',
+    ]).optional(),
+    failureKind: z.enum(['retry_exhausted', 'permanent']).optional(),
+    failedAt: z.number().int().nonnegative().optional(),
+    discardedAt: z.number().int().nonnegative().optional(),
+    discardReason: z.string().optional(),
+});
+
+export const SyncChangeSchema = z.object({
+    serverVersion: z.number().int().positive(),
+    tableName: SyncRecordIdentifierSchema,
+    pk: SyncRecordIdentifierSchema,
+    op: z.enum(['put', 'delete']),
+    payload: z.unknown().optional(),
+    stamp: ChangeStampSchema,
+});
+
+/**
+ * Reusable change-list schema for provider packages.
+ *
+ * Providers must import this pre-composed schema instead of wrapping
+ * `SyncChangeSchema` with their own Zod instance. Composing schemas from two
+ * installed Zod minors creates incompatible private `_zod` types.
+ */
+export const SyncChangesSchema = z.array(SyncChangeSchema);
+
+// ============================================================
+// TABLE PAYLOAD SCHEMAS
+// ============================================================
+
+/**
+ * Validation schemas for incoming server payloads
+ * These use passthrough() to allow additional fields while validating required ones
+ */
+
+export const ThreadPayloadSchema = createTablePayloadSchema('threads', {
+        title_source: TitleSourceSchema.optional(),
+        branch_mode: z.enum(['reference', 'copy', 'compacted']).nullable().optional(),
+        root_thread_id: z.string().nullable().optional(),
+        summary_message_id: z.string().nullable().optional(),
+        fork_reason: z.enum(['manual', 'retry', 'compaction']).optional(),
+        id: z.string(),
+        title: z.string().nullable().optional(),
+        status: z.string(),
+        deleted: z.boolean(),
+        pinned: z.boolean(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+    });
+
+export const MessagePayloadSchema = createTablePayloadSchema('messages', {
+        id: z.string(),
+        thread_id: z.string(),
+        role: z.string(),
+        index: z.number(),
+        order_key: z.string(),
+        deleted: z.boolean(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+        hlc: z.string().optional(),
+    });
+
+export const ProjectPayloadSchema = createTablePayloadSchema('projects', {
+        id: z.string(),
+        name: z.string(),
+        deleted: z.boolean(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+    });
+
+export const PostPayloadSchema = createTablePayloadSchema('posts', {
+        title_source: TitleSourceSchema.optional(),
+        id: z.string(),
+        title: z.string(),
+        content: z.string(),
+        post_type: z.string(), // Wire schema uses snake_case
+        deleted: z.boolean(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+    });
+
+export const FileMetaPayloadSchema = createTablePayloadSchema('file_meta', {
+        hash: z.string(),
+        kind: z.string().optional(),
+        mime_type: z.string().optional(),
+        size_bytes: z.number().optional(),
+        deleted: z.boolean(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+    });
+
+export const KvPayloadSchema = createTablePayloadSchema('kv', {
+        id: z.string(),
+        name: z.string(),
+        value: z.unknown().optional().nullable(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+    });
+
+export const NotificationPayloadSchema = createTablePayloadSchema(
+    'notifications',
+    {
+        id: z.string(),
+        user_id: z.string(),
+        thread_id: z.string().optional(),
+        document_id: z.string().optional(),
+        type: z.string(),
+        title: z.string(),
+        body: z.string().optional(),
+        actions: z.array(z.unknown()).optional(),
+        read_at: z.number().optional(),
+        deleted: z.boolean(),
+        deleted_at: z.number().optional(),
+        created_at: z.number(),
+        updated_at: z.number(),
+        clock: z.number(),
+    }
+);
+
+/**
+ * Map of table names to their payload schemas
+ */
+export const TABLE_PAYLOAD_SCHEMAS: Record<string, z.ZodSchema> = {
+    threads: ThreadPayloadSchema,
+    messages: MessagePayloadSchema,
+    projects: ProjectPayloadSchema,
+    posts: PostPayloadSchema,
+    file_meta: FileMetaPayloadSchema,
+    kv: KvPayloadSchema,
+    notifications: NotificationPayloadSchema,
+};
+
+// ============================================================
+// REQUEST/RESPONSE SCHEMAS
+// ============================================================
+
+export const HISTORY_INCARNATION_CAPABILITY = 'incarnation-v1' as const;
+export const HistoryIncarnationSchema = z.string().min(1).max(128).regex(/^[\x21-\x7e]+$/);
+export const HistoryRequestFields = {
+    historyIncarnation: HistoryIncarnationSchema.nullable().optional(),
+    historyIncarnationCapability: z.literal(HISTORY_INCARNATION_CAPABILITY).optional(),
+};
+
+export const PullRequestSchema = z.object({
+    ...HistoryRequestFields,
+    scope: SyncScopeSchema,
+    cursor: z.number().int().nonnegative(),
+    limit: z.number().int().positive().max(1000),
+    tables: z
+        .array(z.string().trim().min(1).max(128))
+        .max(MAX_SYNC_TABLE_FILTERS)
+        .optional(),
+    fileKindCapability: z.literal(FILE_KIND_CAPABILITY).optional(),
+    workspaceItemCapability: z.literal(WORKSPACE_ITEM_CAPABILITY).optional(),
+    unavailableRecordCapability: z.literal(UNAVAILABLE_RECORD_CAPABILITY).optional(),
+});
+
+export const PullResponseSchema = z
+    .object({
+        historyIncarnation: HistoryIncarnationSchema.optional(),
+        changes: SyncChangesSchema.max(1000),
+        unavailable: z.array(PullUnavailableRecordSchema).max(1000).optional(),
+        nextCursor: z.number().int().nonnegative(),
+        hasMore: z.boolean(),
+        oldestRetainedVersion: z.number().int().nonnegative(),
+        requiresSnapshot: z.boolean(),
+    })
+    .superRefine((response, ctx) => {
+        if (response.changes.length + (response.unavailable?.length ?? 0) > 1000 || syncJsonByteLength(response) > MAX_SYNC_RESPONSE_BYTES) {
+            ctx.addIssue({ code: 'custom', message: 'Pull combined page budget exceeded' });
+        }
+        const versions = new Set(response.changes.map(change => change.serverVersion));
+        let previousUnavailableVersion = 0;
+        for (const marker of response.unavailable ?? []) {
+            if (versions.has(marker.serverVersion) || marker.serverVersion <= previousUnavailableVersion || marker.serverVersion > response.nextCursor) {
+                ctx.addIssue({ code: 'custom', message: 'Unavailable pull coverage is invalid' });
+            }
+            versions.add(marker.serverVersion);
+            previousUnavailableVersion = marker.serverVersion;
+        }
+        let previousVersion = 0;
+        const opIds = new Set<string>();
+        for (const [index, change] of response.changes.entries()) {
+            if (change.serverVersion <= previousVersion) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['changes', index, 'serverVersion'],
+                    message: 'Pull changes must be strictly ordered by serverVersion',
+                });
+            }
+            if (change.serverVersion > response.nextCursor) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['changes', index, 'serverVersion'],
+                    message: 'Pull change exceeds nextCursor',
+                });
+            }
+            if (opIds.has(change.stamp.opId)) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['changes', index, 'stamp', 'opId'],
+                    message: 'Pull response contains a duplicate opId',
+                });
+            }
+            previousVersion = change.serverVersion;
+            opIds.add(change.stamp.opId);
+        }
+    });
+
+export const SnapshotRequestSchema = z.object({
+    ...HistoryRequestFields,
+    scope: SyncScopeSchema,
+    pageSize: z.number().int().positive().max(1000),
+    pageToken: z.string().min(1).max(MAX_SYNC_SNAPSHOT_TOKEN_LENGTH).optional(),
+    tables: z
+        .array(z.string().trim().min(1).max(128))
+        .max(MAX_SYNC_TABLE_FILTERS)
+        .optional(),
+    fileKindCapability: z.literal(FILE_KIND_CAPABILITY).optional(),
+    workspaceItemCapability: z.literal(WORKSPACE_ITEM_CAPABILITY).optional(),
+    unavailableRecordCapability: z.literal(UNAVAILABLE_RECORD_CAPABILITY).optional(),
+});
+
+export const SnapshotRevisionSchema = z.object({
+    clock: z.number().int().nonnegative(),
+    hlc: z.string().min(1),
+    opId: z.string().min(1),
+});
+
+export const SnapshotItemSchema = z.discriminatedUnion('kind', [
+    z.object({
+        kind: z.literal('row'),
+        tableName: SyncRecordIdentifierSchema,
+        pk: SyncRecordIdentifierSchema,
+        payload: z.unknown(),
+        revision: SnapshotRevisionSchema,
+    }),
+    z.object({
+        kind: z.literal('tombstone'),
+        tableName: SyncRecordIdentifierSchema,
+        pk: SyncRecordIdentifierSchema,
+        revision: SnapshotRevisionSchema,
+        serverDeletedAt: z.number().int().nonnegative(),
+    }),
+]);
+
+export const SnapshotResponseSchema = z
+    .object({
+        historyIncarnation: HistoryIncarnationSchema.optional(),
+        workspaceId: z.string().min(1),
+        snapshotId: z.string().min(1),
+        highWatermark: z.number().int().nonnegative(),
+        items: z.array(SnapshotItemSchema).max(1000),
+        unavailable: z.array(SnapshotUnavailableRecordSchema).max(1000).optional(),
+        nextPageToken: z.string().min(1).max(MAX_SYNC_SNAPSHOT_TOKEN_LENGTH).nullable(),
+    })
+    .superRefine((response, ctx) => {
+        if (response.items.length + (response.unavailable?.length ?? 0) > 1000 || syncJsonByteLength(response) > MAX_SYNC_RESPONSE_BYTES) {
+            ctx.addIssue({ code: 'custom', message: 'Snapshot combined page budget exceeded' });
+        }
+        let previousMarkerKey: string[] | null = null;
+        for (const marker of response.unavailable ?? []) {
+            const key = [marker.tableName, marker.pk, marker.originalKind];
+            if (marker.snapshotId !== response.snapshotId || marker.highWatermark !== response.highWatermark ||
+                (previousMarkerKey && compareSyncTuple(key, previousMarkerKey) <= 0)) {
+                ctx.addIssue({ code: 'custom', message: 'Unavailable snapshot coverage is invalid' });
+            }
+            previousMarkerKey = key;
+        }
+        let previousKey: string[] | null = null;
+        const logicalKeys = new Set<string>();
+        for (const marker of response.unavailable ?? []) {
+            const logicalKey = JSON.stringify([marker.tableName, marker.pk]);
+            if (logicalKeys.has(logicalKey)) ctx.addIssue({ code: 'custom', message: 'Duplicate unavailable key' });
+            logicalKeys.add(logicalKey);
+        }
+        for (const [index, item] of response.items.entries()) {
+            const logicalKey = JSON.stringify([item.tableName, item.pk]);
+            const orderedKey = [item.tableName, item.pk, item.kind];
+            if (previousKey !== null && compareSyncTuple(orderedKey, previousKey) <= 0) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['items', index],
+                    message: 'Snapshot items must be strictly ordered',
+                });
+            }
+            if (logicalKeys.has(logicalKey)) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['items', index],
+                    message:
+                        'Snapshot contains duplicate or contradictory entries for one record',
+                });
+            }
+            previousKey = orderedKey;
+            logicalKeys.add(logicalKey);
+        }
+    });
+
+export const PushBatchSchema = z
+    .object({
+        ...HistoryRequestFields,
+        storedRecordCapability: z.literal('stored-record-v1').optional(),
+        scope: SyncScopeSchema,
+        ops: z.array(PendingOpSchema).max(MAX_SYNC_PUSH_BATCH_OPS),
+        fileKindCapability: z.literal(FILE_KIND_CAPABILITY).optional(),
+    workspaceItemCapability: z.literal(WORKSPACE_ITEM_CAPABILITY).optional(),
+    })
+    .superRefine((batch, ctx) => {
+        if (syncJsonByteLength(batch) > MAX_SYNC_PUSH_BATCH_BYTES) {
+            ctx.addIssue({
+                code: 'custom',
+                path: ['ops'],
+                message: `Push batch exceeds ${MAX_SYNC_PUSH_BATCH_BYTES} bytes`,
+            });
+        }
+        const opIds = new Set<string>();
+        for (const [index, op] of batch.ops.entries()) {
+            if (opIds.has(op.stamp.opId)) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['ops', index, 'stamp', 'opId'],
+                    message: 'Push batch contains a duplicate opId',
+                });
+            }
+            opIds.add(op.stamp.opId);
+        }
+    });
+
+export const PushWinnerSchema = z.discriminatedUnion('kind', [
+    z.object({
+        kind: z.literal('put'),
+        payload: z.record(z.string(), z.unknown()),
+        revision: z.object({ clock: z.number().int().nonnegative(), hlc: z.string().min(1), opId: z.string().min(1) }),
+    }),
+    z.object({
+        kind: z.literal('delete'),
+        revision: z.object({ clock: z.number().int().nonnegative(), hlc: z.string().min(1), opId: z.string().min(1) }),
+        serverDeletedAt: z.number().nonnegative().optional(),
+    }),
+]);
+
+export const PushResultItemSchema = z.object({
+    evidenceRef: z.string().min(1).max(128).optional(),
+    opId: z.string().min(1),
+    success: z.boolean(),
+    serverVersion: z.number().int().positive().optional(),
+    error: z.string().optional(),
+    tableName: z.string().optional(),
+    operation: z.enum(['put', 'delete']).optional(),
+    payload: z.unknown().optional(),
+    wasExisting: z.boolean().optional(),
+    applied: z.boolean().optional(),
+    replayed: z.boolean().optional(),
+    winner: PushWinnerSchema.optional(),
+    errorCode: z
+        .enum([
+            'STORED_RECORD_UNAVAILABLE',
+            'VALIDATION_ERROR',
+            'UNAUTHORIZED',
+            'CONFLICT',
+            'NOT_FOUND',
+            'RATE_LIMITED',
+            'OVERSIZED',
+            'NETWORK_ERROR',
+            'SERVER_ERROR',
+            'UNKNOWN',
+        ])
+        .optional(),
+}).superRefine((result, ctx) => {
+    if (result.errorCode === 'STORED_RECORD_UNAVAILABLE' &&
+        (result.success || !result.evidenceRef || !result.error || result.error.length > 160 ||
+            result.replayed !== undefined || result.payload !== undefined || result.winner !== undefined ||
+            result.serverVersion !== undefined || result.applied !== undefined)) {
+        ctx.addIssue({ code: 'custom', message: 'Invalid stored-record hold' });
+    }
+    if (result.replayed && !result.success) {
+        ctx.addIssue({
+            code: 'custom',
+            path: ['replayed'],
+            message: 'A replayed operation must be successful',
+        });
+    }
+    if (result.replayed && result.applied === false && !result.winner) {
+        ctx.addIssue({
+            code: 'custom',
+            path: ['winner'],
+            message: 'A superseded replay requires the current winner',
+        });
+    }
+});
+
+export const PushResultSchema = z
+    .object({
+        historyIncarnation: HistoryIncarnationSchema.optional(),
+        results: z.array(PushResultItemSchema).max(MAX_SYNC_PUSH_BATCH_OPS),
+        serverVersion: z.number().int().nonnegative(),
+    })
+    .superRefine((response, ctx) => {
+        const opIds = new Set<string>();
+        for (const [index, result] of response.results.entries()) {
+            if (opIds.has(result.opId)) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['results', index, 'opId'],
+                    message: 'Push response contains a duplicate opId',
+                });
+            }
+            if (
+                result.serverVersion !== undefined &&
+                result.serverVersion > response.serverVersion
+            ) {
+                ctx.addIssue({
+                    code: 'custom',
+                    path: ['results', index, 'serverVersion'],
+                    message: 'Push result serverVersion exceeds response serverVersion',
+                });
+            }
+            opIds.add(result.opId);
+        }
+    });
+
+export function getPullResponseContractError(
+    request: z.infer<typeof PullRequestSchema>,
+    response: z.infer<typeof PullResponseSchema>
+): string | null {
+    if (response.requiresSnapshot) {
+        return null;
+    }
+    if (response.changes.length + (response.unavailable?.length ?? 0) > request.limit) return 'Pull combined page exceeds requested limit';
+    if (response.nextCursor < request.cursor) {
+        return 'Pull response cursor regressed';
+    }
+    if (response.hasMore && response.nextCursor <= request.cursor) {
+        return 'Pull response hasMore did not advance the cursor';
+    }
+    if (
+        [...response.changes, ...(response.unavailable ?? [])].some(
+            (change) => change.serverVersion <= request.cursor
+        )
+    ) {
+        return 'Pull response contains a change at or before the requested cursor';
+    }
+    return null;
+}
+
+export function getSnapshotResponseContractError(
+    request: z.infer<typeof SnapshotRequestSchema>,
+    response: z.infer<typeof SnapshotResponseSchema>
+): string | null {
+    if (response.workspaceId !== request.scope.workspaceId) {
+        return 'Snapshot response workspace does not match the request';
+    }
+    if (response.items.length + (response.unavailable?.length ?? 0) > request.pageSize) {
+        return 'Snapshot response exceeds the requested page size';
+    }
+    return null;
+}
+
+export function getPushResultContractError(
+    batch: z.infer<typeof PushBatchSchema>,
+    response: z.infer<typeof PushResultSchema>
+): string | null {
+    const expected = new Set(batch.ops.map((op) => op.stamp.opId));
+    const actual = new Set(response.results.map((result) => result.opId));
+    if (actual.size !== expected.size) {
+        return 'Push response does not contain exactly one result per operation';
+    }
+    for (const opId of expected) {
+        if (!actual.has(opId)) {
+            return `Push response is missing result for operation ${opId}`;
+        }
+    }
+    return null;
+}
+
+// ============================================================
+// LOCAL STATE SCHEMAS
+// ============================================================
+
+export const TombstoneSchema = z.object({
+    id: z.string(),
+    tableName: SyncRecordIdentifierSchema,
+    pk: SyncRecordIdentifierSchema,
+    deletedAt: z.number(),
+    clock: z.number().int().nonnegative(),
+    hlc: z.string().min(1).optional(),
+    opId: z.string().min(1).optional(),
+    serverVersion: z.number().int().nonnegative().optional(),
+    serverDeletedAt: z.number().nonnegative().optional(),
+    syncedAt: z.number().optional(),
+});
+
+export const SyncStateSchema = z.object({
+    id: z.string(),
+    cursor: z.number().int().nonnegative(),
+    lastSyncAt: z.number(),
+    deviceId: z.string(),
+});
+
+export const SyncRunSchema = z.object({
+    id: z.string(),
+    startedAt: z.number(),
+    completedAt: z.number().optional(),
+    pushedCount: z.number().int().nonnegative(),
+    pulledCount: z.number().int().nonnegative(),
+    conflictCount: z.number().int().nonnegative(),
+    errorCount: z.number().int().nonnegative(),
+    status: z.enum(['running', 'completed', 'failed']),
+    error: z.string().optional(),
+});
+
+// ============================================================
+// TYPE EXPORTS (inferred from schemas)
+// ============================================================
+
+export type SyncScopeZ = z.infer<typeof SyncScopeSchema>;
+export type ChangeStampZ = z.infer<typeof ChangeStampSchema>;
+export type PendingOpZ = z.infer<typeof PendingOpSchema>;
+export type SyncChangeZ = z.infer<typeof SyncChangeSchema>;
+export type PullRequestZ = z.infer<typeof PullRequestSchema>;
+export type PullResponseZ = z.infer<typeof PullResponseSchema>;
+export type SnapshotRequestZ = z.infer<typeof SnapshotRequestSchema>;
+export type SnapshotResponseZ = z.infer<typeof SnapshotResponseSchema>;
+export type PushBatchZ = z.infer<typeof PushBatchSchema>;
+export type PushResultZ = z.infer<typeof PushResultSchema>;
+export type TombstoneZ = z.infer<typeof TombstoneSchema>;
+export type SyncStateZ = z.infer<typeof SyncStateSchema>;
+export type SyncRunZ = z.infer<typeof SyncRunSchema>;

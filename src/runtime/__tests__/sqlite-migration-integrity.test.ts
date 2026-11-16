@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { sql, type Kysely } from 'kysely';
+import type { H3Event } from 'h3';
+import { sql, Migrator, type Migration, type Kysely } from 'kysely';
 import {
     _resetForTest,
     destroySqliteDb,
@@ -27,7 +28,203 @@ afterEach(async () => {
 });
 
 describe('SQLite migration integrity boundaries', () => {
-    it('resumes a migration interrupted after preserving malformed execution bytes', async () => {
+    const historicalProvider = {
+        async getMigrations(): Promise<Record<string, Migration>> {
+            const files = await readdir(new URL('../server/db/migrations/', import.meta.url));
+            return Object.fromEntries(await Promise.all(files.filter(file => file.endsWith('.ts')).map(async file =>
+                [file.slice(0, -3), await import(`../server/db/migrations/${file.slice(0, -3)}.ts`) as Migration])));
+        },
+    };
+    async function migrateThrough(db: Kysely<unknown>, name: string) {
+        const result = await new Migrator({ db, provider: historicalProvider }).migrateTo(name);
+        if (result.error) throw result.error;
+    }
+
+    it.each([
+        ['005_admin_stores', "ALTER TABLE s_threads ADD COLUMN op_id TEXT NOT NULL DEFAULT ''"],
+        ['006_sync_snapshots', 'ALTER TABLE device_cursors ADD COLUMN owner_user_id TEXT'],
+        ['018_background_admission_cancels', "ALTER TABLE background_jobs ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''"],
+        ['020_background_generation_receipts', 'ALTER TABLE background_jobs ADD COLUMN usage_json TEXT'],
+    ])('resumes a historical additive migration after %s', async (base, partial) => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, base!);
+        getRawDb().exec(partial!);
+        await expect(runMigrations(db)).resolves.toBeUndefined();
+        await expect(runMigrations(db)).resolves.toBeUndefined();
+    });
+
+    it.each(['native', 'd1'])('resumes completed historical 006 DDL without its ledger on %s', async driver => {
+        const d1 = driver === 'd1' ? createD1TestDatabase() : undefined;
+        try {
+            const db = await initializeSqliteDb(d1 ? { driver: 'd1', d1Database: d1.database } : { path: ':memory:' });
+            await migrateThrough(db as unknown as Kysely<unknown>, '006_sync_snapshots');
+            await sql`INSERT INTO s_threads (id, workspace_id, data_json) VALUES ('preserved', 'ws', '{"id":"preserved"}')`.execute(db);
+            await sql`DELETE FROM kysely_migration WHERE name = '006_sync_snapshots'`.execute(db);
+            await expect(runMigrations(db)).resolves.toBeUndefined();
+            expect((await sql<{ id: string }>`SELECT id FROM s_threads`.execute(db)).rows).toEqual([{ id: 'preserved' }]);
+            await expect(runMigrations(db)).resolves.toBeUndefined();
+        } finally {
+            await destroySqliteDb();
+            d1?.close();
+        }
+    });
+
+    it('refuses an incompatible historical additive column without rewriting it', async () => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, '018_background_admission_cancels');
+        getRawDb().exec('ALTER TABLE background_jobs ADD COLUMN reasoning INTEGER');
+        await expect(runMigrations(db)).rejects.toThrow('Incompatible migration column: background_jobs.reasoning');
+        expect((await sql<{ name: string; type: string }>`PRAGMA table_info(background_jobs)`.execute(db)).rows.find(column => column.name === 'reasoning')).toMatchObject({ type: 'INTEGER' });
+        expect((await sql`SELECT name FROM kysely_migration WHERE name >= '019_background_generation_history'`.execute(db)).rows).toEqual([]);
+    });
+
+    it.each(['native', 'd1'])('starts a published pre-034/032 schema with malformed incident bytes on %s', async driver => {
+        const d1 = driver === 'd1' ? createD1TestDatabase() : undefined;
+        try {
+            const db = await initializeSqliteDb(d1 ? {driver:'d1',d1Database:d1.database} : {path:':memory:'});
+            await migrateThrough(db as unknown as Kysely<unknown>, '032_sync_observations');
+            expect((await sql`PRAGMA table_info(change_log)`.execute(db)).rows).not.toContainEqual(expect.objectContaining({name:'intent_fingerprint'}));
+            const oldId = 'background-tool:' + 'a'.repeat(64);
+            await sql`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
+                VALUES ('incident','ws',1,'kv','bad','put','{',1,'legacy:1','test',${oldId},1)`.execute(db);
+            await sql`INSERT INTO s_kv (id,workspace_id,data_json,clock,hlc,op_id) VALUES ('bad','ws','{',1,'legacy:1',${oldId})`.execute(db);
+            await sql`INSERT INTO server_version_counter VALUES ('ws',1)`.execute(db);
+            await runMigrations(db);
+            const repairedId = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
+            expect((await sql`SELECT op_id,payload_json FROM change_log`.execute(db)).rows).toEqual([{op_id:repairedId,payload_json:'{'}]);
+            expect((await sql`SELECT op_id,data_json FROM s_kv`.execute(db)).rows).toEqual([{op_id:repairedId,data_json:'{'}]);
+            expect((await sql`SELECT name FROM kysely_migration WHERE name > '032_sync_observations' ORDER BY name`.execute(db)).rows).toEqual([
+                {name:'033_tool_result_operation_ids'},{name:'034_sync_intent_fingerprint'},{name:'035_sync_unavailable_records'},{name:'036_sync_history_incarnation'}]);
+            const {SqliteSyncGatewayAdapter} = await import('../server/sync/sqlite-sync-gateway-adapter');
+            const {readHistoryIncarnation} = await import('../server/sync/history-incarnation');
+            const page = await new SqliteSyncGatewayAdapter().pull({} as H3Event,{scope:{workspaceId:'ws'},cursor:0,limit:10,historyIncarnation:await readHistoryIncarnation()});
+            expect(page).toMatchObject({changes:[],nextCursor:1,unavailable:[{evidenceRef:expect.any(String)}]});
+            expect((await sql`SELECT payload_json FROM sync_unavailable_records`.execute(db)).rows).toEqual([{payload_json:'{'}]);
+            // The ledger owns no-rerun; do not delete or forge an entry.
+            await sql`UPDATE s_kv SET op_id=${oldId}`.execute(db);
+            await runMigrations(db);
+            expect((await sql`SELECT op_id FROM s_kv`.execute(db)).rows).toEqual([{op_id:oldId}]);
+        } finally { await destroySqliteDb(); d1?.close(); }
+    });
+
+    it('repairs legacy tool IDs with indexed updates across growing tables and never reruns completed 033', async () => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, '032_sync_observations');
+        const raw = getRawDb();
+        raw.exec("INSERT INTO sync_snapshots VALUES ('snapshot', 'ws', 1, '[]', 1, 9999999999)");
+        const kv = raw.prepare('INSERT INTO s_kv (id, workspace_id, data_json, op_id) VALUES (?, ?, ?, ?)');
+        const items = raw.prepare("INSERT INTO sync_snapshot_items (snapshot_id, table_name, pk, kind, payload_json, clock, hlc, op_id) VALUES ('snapshot', 'kv', ?, 'row', ?, 1, 'hlc', ?)");
+        const tombstones = raw.prepare("INSERT INTO tombstones (id, workspace_id, table_name, pk, deleted_at, clock, server_version, op_id) VALUES (?, 'ws', 'kv', ?, 1, 1, 1, ?)");
+        raw.transaction(() => {
+            for (let n = 0; n < 1100; n++) {
+                const id = `key-${n}`;
+                const opId = n < 600 ? `background-tool:${n.toString(16).padStart(4, '0').repeat(16)}` : `valid-${n}`;
+                const payload = JSON.stringify({ id, op_id: opId });
+                kv.run(id, 'ws', payload, opId);
+                items.run(id, payload, opId);
+                tombstones.run(id, id, opId);
+            }
+        })();
+        const plans = new Map<string, string[]>();
+        const prepare = raw.prepare.bind(raw);
+        const spy = vi.spyOn(raw, 'prepare').mockImplementation(query => {
+            const statement = prepare(query);
+            if (/^UPDATE "?(s_kv|sync_snapshot_items|tombstones)"? SET/i.test(query)) {
+                const run = statement.run.bind(statement);
+                vi.spyOn(statement, 'run').mockImplementation((...parameters) => {
+                    const plan = prepare(`EXPLAIN QUERY PLAN ${query}`).all(...parameters) as { detail: string }[];
+                    const table = /^UPDATE "?(s_kv|sync_snapshot_items|tombstones)"?/i.exec(query)![1]!;
+                    plans.set(table, [...(plans.get(table) ?? []), ...plan.map(row => row.detail)]);
+                    return run(...parameters);
+                });
+            }
+            return statement;
+        });
+        await migrateThrough(db as unknown as Kysely<unknown>, '035_sync_unavailable_records');
+        spy.mockRestore();
+        for (const table of ['s_kv', 'sync_snapshot_items', 'tombstones']) {
+            expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE op_id LIKE 'background-tool:%'`).get()).toEqual({ count: 0 });
+            expect(raw.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE op_id LIKE 'valid-%'`).get()).toEqual({ count: 500 });
+        }
+        expect(raw.prepare("SELECT op_id, data_json FROM s_kv WHERE id = 'key-0'").get()).toEqual({
+            op_id: '00000000-0000-4000-8000-000000000000',
+            data_json: '{"id":"key-0","op_id":"00000000-0000-4000-8000-000000000000"}',
+        });
+        for (const table of ['s_kv', 'sync_snapshot_items', 'tombstones']) {
+            expect(plans.get(table)?.length).toBeGreaterThan(0);
+            expect(plans.get(table)!.every(plan => /SEARCH .* USING .*INDEX/.test(plan))).toBe(true);
+        }
+        expect(raw.prepare("SELECT op_id FROM s_kv WHERE id = 'key-1'").get()).toEqual({
+            op_id: '00010001-0001-4001-8001-000100010001',
+        });
+        const late = 'background-tool:' + 'a'.repeat(64);
+        kv.run('late', 'ws', '{"id":"late"}', late);
+        await runMigrations(db);
+        expect(raw.prepare("SELECT op_id FROM s_kv WHERE id = 'late'").get()).toEqual({ op_id: late });
+    });
+
+    it('resumes a D1 033 repair with its temporary index already durable', async () => {
+        const d1 = createD1TestDatabase();
+        try {
+            const db = await initializeSqliteDb({ driver: 'd1', d1Database: d1.database });
+            await migrateThrough(db as unknown as Kysely<unknown>, '032_sync_observations');
+            // D1 can stop after index creation; resume and remove that index.
+            await sql`CREATE INDEX or3_033_s_kv_op_id ON s_kv (op_id)`.execute(db);
+            const oldId = 'background-tool:' + '1'.repeat(64);
+            await sql`INSERT INTO s_kv (id, workspace_id, data_json, op_id, clock)
+                VALUES ('repair', 'ws', ${JSON.stringify({ id: 'repair', op_id: oldId })}, ${oldId}, 7)`.execute(db);
+            await expect(runMigrations(db)).resolves.toBeUndefined();
+            expect((await sql`SELECT op_id, clock FROM s_kv WHERE id = 'repair'`.execute(db)).rows)
+                .toEqual([{ op_id: '11111111-1111-4111-9111-111111111111', clock: 7 }]);
+            expect((await sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'or3_033_%'`.execute(db)).rows).toEqual([]);
+            await expect(runMigrations(db)).resolves.toBeUndefined();
+        } finally {
+            await destroySqliteDb();
+            d1.close();
+        }
+    });
+
+    it('rolls back a destructive rebuild and its ledger before restarting', async () => {
+        const db = await initializeSqliteDb({ path: ':memory:' });
+        await migrateThrough(db as unknown as Kysely<unknown>, '002_sync_tables');
+        const raw = getRawDb();
+        raw.exec(`INSERT INTO s_threads (id, workspace_id, data_json) VALUES ('original', 'ws', '{"id":"original"}')`);
+        const prepare = raw.prepare.bind(raw);
+        const spy = vi.spyOn(raw, 'prepare').mockImplementation(query => {
+            const statement = prepare(query);
+            if (query === 'DROP TABLE "s_threads"') {
+                const run = statement.run.bind(statement);
+                vi.spyOn(statement, 'run').mockImplementation((...parameters) => {
+                    run(...parameters);
+                    throw new Error('injected rebuild interruption');
+                });
+            }
+            return statement;
+        });
+        await expect(runMigrations(db)).rejects.toThrow('injected rebuild interruption');
+        spy.mockRestore();
+        expect(raw.prepare('SELECT id, data_json FROM s_threads').all()).toEqual([{ id: 'original', data_json: '{"id":"original"}' }]);
+        expect(raw.prepare("SELECT name FROM kysely_migration WHERE name > '002_sync_tables'").all()).toEqual([]);
+        await expect(runMigrations(db)).resolves.toBeUndefined();
+        expect(raw.prepare('SELECT id FROM s_threads').all()).toEqual([{ id: 'original' }]);
+    });
+
+    it.each(['native', 'd1'])('preserves a historical interrupted rebuild for explicit recovery on %s', async driver => {
+        const d1 = driver === 'd1' ? createD1TestDatabase() : undefined;
+        try {
+            const db = await initializeSqliteDb(d1 ? { driver: 'd1', d1Database: d1.database } : { path: ':memory:' });
+            await migrateThrough(db as unknown as Kysely<unknown>, '002_sync_tables');
+            await sql`INSERT INTO s_threads (id, workspace_id, data_json) VALUES ('preserved', 'ws', '{}')`.execute(db);
+            await sql`ALTER TABLE s_threads RENAME TO s_threads__new`.execute(db);
+            await expect(runMigrations(db)).rejects.toThrow(/recover.*s_threads__new/i);
+            expect((await sql`SELECT id FROM s_threads__new`.execute(db)).rows).toEqual([{ id: 'preserved' }]);
+        } finally {
+            await destroySqliteDb();
+            d1?.close();
+        }
+    });
+
+    it('atomically preserves original execution bytes across native migration interruptions', async () => {
         const db = await initializeSqliteDb({ path: ':memory:' });
         await runMigrations(db);
         await rollbackObservations(db as unknown as Kysely<unknown>);
@@ -47,16 +244,14 @@ describe('SQLite migration integrity boundaries', () => {
         await expect(runMigrations(db)).rejects.toThrow('injected migration interruption');
         expect(raw.prepare("SELECT execution_json, lease_owner FROM background_jobs WHERE id = 'interrupted'").get())
             .toEqual({ execution_json: malformed, lease_owner: 'worker' });
-        expect(raw.prepare("SELECT execution_json FROM background_job_execution_quarantine WHERE job_id = 'interrupted'").get())
-            .toEqual({ execution_json: malformed });
+        expect(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'background_job_execution_quarantine'").all()).toEqual([]);
         raw.exec('DROP TRIGGER interrupt_delegation_migration');
         // Also interrupt after the replacement and several index creations.
         raw.exec('CREATE TABLE background_jobs_delegation_invalid_due (id INTEGER)');
         await expect(runMigrations(db)).rejects.toThrow(/background_jobs_delegation_invalid_due/);
-        expect(raw.prepare("SELECT execution_json, lease_owner, delegation_wait_active FROM background_jobs WHERE id = 'interrupted'").get())
-            .toEqual({ execution_json: '{"version":1,"delegationQuarantinedAt":0}', lease_owner: null, delegation_wait_active: 1 });
-        expect(raw.prepare("SELECT execution_json FROM background_job_execution_quarantine WHERE job_id = 'interrupted'").get())
-            .toEqual({ execution_json: malformed });
+        expect(raw.prepare("SELECT execution_json, lease_owner FROM background_jobs WHERE id = 'interrupted'").get())
+            .toEqual({ execution_json: malformed, lease_owner: 'worker' });
+        expect(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'background_job_execution_quarantine'").all()).toEqual([]);
         raw.exec('DROP TABLE background_jobs_delegation_invalid_due');
 
         await expect(runMigrations(db)).resolves.toBeUndefined();
@@ -196,7 +391,7 @@ describe('SQLite migration integrity boundaries', () => {
             expect(getRawDb().prepare("SELECT execution_json FROM background_jobs WHERE id = 'preserved'").get())
                 .toEqual({ execution_json: '{"version":1}' });
             expect(getRawDb().prepare("SELECT name FROM kysely_migration WHERE name > '029_delegation_wait' ORDER BY name").all())
-                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }, { name: '033_tool_result_operation_ids' }]);
+                .toEqual([{ name: '030_storage_generations' }, { name: '031_storage_generation_uploads' }, { name: '032_sync_observations' }, { name: '033_tool_result_operation_ids' }, { name: '034_sync_intent_fingerprint' }, { name: '035_sync_unavailable_records' }, { name: '036_sync_history_incarnation' }]);
         } finally {
             vi.restoreAllMocks();
             await destroySqliteDb();

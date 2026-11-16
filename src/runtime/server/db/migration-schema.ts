@@ -27,3 +27,22 @@ export async function ensureMigrationSchema(
     }
     await sql.raw(statement).execute(db);
 }
+
+/** Historical additive steps may already be durable without a ledger entry. */
+export async function ensureMigrationTextColumn(
+    db: Kysely<unknown>, table: string, name: string, required = false,
+): Promise<void> {
+    const columns = (await sql<{ name: string; type: string; notnull: number; dflt_value: string | null; pk: number }>`
+        PRAGMA table_info(${sql.id(table)})
+    `.execute(db)).rows;
+    if (!columns.length) throw new Error(`Missing migration table: ${table}`);
+    const column = columns.find(column => column.name === name);
+    if (column) {
+        if (column.type.toUpperCase() !== 'TEXT' || column.notnull !== Number(required)
+            || column.dflt_value !== (required ? "''" : null) || column.pk !== 0) {
+            throw new Error(`Incompatible migration column: ${table}.${name}`);
+        }
+        return;
+    }
+    await sql`ALTER TABLE ${sql.id(table)} ADD COLUMN ${sql.id(name)} ${sql.raw(required ? "TEXT NOT NULL DEFAULT ''" : 'TEXT')}`.execute(db);
+}

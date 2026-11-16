@@ -1,3 +1,4 @@
+import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import type {
     BackgroundJob,
     BackgroundJobExecution,
@@ -20,7 +21,7 @@ import { readRequestUsage } from '~~/shared/chat/compaction';
 import { DelegationActivitySchema, DelegationDispatchSchema, DelegationWaitSchema, type DelegationDispatch, type DelegationWait } from '~~/shared/chat/delegation-checkpoint';
 import { delegationAdmissionFingerprint, delegationChildIdentities } from '~~/shared/chat/delegation-identities';
 import { toolCallFingerprint } from '~~/shared/chat/tool-ledger';
-import { parseChatGenerationAdmissionEnvelope } from '~~/shared/chat/background-history';
+import { parseChatGenerationAdmissionEnvelope, backgroundHistoryDeviceId } from '~~/shared/chat/background-history';
 import { matchesToolResultStorage } from '~~/shared/chat/tool-result-artifact';
 import { normalizeError, serializeError } from '~~/shared/errors';
 import { randomUUID } from 'node:crypto';
@@ -385,6 +386,17 @@ export class SqliteBackgroundJobProvider implements BackgroundJobProvider {
         const id = randomUUID();
         const config = getJobConfig();
         const execution = params.execution;
+        if (execution && 'history' in execution && execution.history) {
+            const history = parseChatGenerationAdmissionEnvelope(execution.history);
+            for (const [tableName,row] of [['threads',history.thread],['messages',history.userMessage],['messages',history.assistantMessage]] as const) {
+                if (!row) continue;
+                nextSyncClock(row.clock);
+                const opId = '00000000-0000-4000-8000-000000000000';
+                const hlc = typeof row.hlc === 'string' ? row.hlc : 'background';
+                prepareSyncWrite({tableName,pk:row.id,operation:'put',payload:{...row,...(tableName === 'messages' && !row.order_key ? {order_key:hlc} : {}),hlc,op_id:opId},
+                    stamp:{clock:row.clock,hlc,opId,deviceId:backgroundHistoryDeviceId(history.generationId)}});
+            }
+        }
         if (execution && 'delegationWait' in execution) {
             throw new Error('Delegation waits must be parked through the fenced transition');
         }

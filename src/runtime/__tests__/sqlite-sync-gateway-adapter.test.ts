@@ -1,3 +1,5 @@
+import { readHistoryIncarnation } from '../server/sync/history-incarnation';
+import { validSyncPayload } from '../../../test/support/sync-payload';
 /**
  * Unit tests for SqliteSyncGatewayAdapter.
  *
@@ -61,7 +63,7 @@ function makeOp(overrides: Partial<PendingOp> & { tableName: string; pk: string 
         tableName: overrides.tableName,
         operation: overrides.operation ?? 'put',
         pk: overrides.pk,
-        payload: overrides.payload ?? { id: overrides.pk, title: 'test' },
+        payload: validSyncPayload(overrides.tableName, overrides.pk, overrides.payload ?? { id: overrides.pk, title: 'test' }),
         stamp: {
             deviceId: overrides.stamp?.deviceId ?? DEVICE_A,
             opId: overrides.stamp?.opId ?? randomUUID(),
@@ -128,22 +130,66 @@ describe('SqliteSyncGatewayAdapter', () => {
         raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
         raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
         const actor = { userId: 'owner', workspaceId: WORKSPACE_ID };
-        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',payload:{id:'legacy'}})]));
+        await adapter.push(stubEvent, { ...makeBatch([makeOp({tableName:'threads',pk:'legacy',payload:{id:'legacy'}})]), historyIncarnation: await readHistoryIncarnation() });
         const read = () => adapter.readChatHistory(actor, {kind:'thread',thread_id:'legacy'});
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
-        await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'projects', pk: 'extensions', payload: { id: 'extensions', data: [
+        await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...makeBatch([makeOp({ tableName: 'projects', pk: 'extensions', payload: { id: 'extensions', data: [
             { id: 'legacy', kind: 'plugin-resource' }, { id: 'legacy', kind: 'doc' }, { id: 'legacy', kind: 'file' },
             { id: 'legacy', kind: null }, { id: 123, kind: 'chat' }, [], null,
         ] } })]), workspaceItemCapability: 'v1' });
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:null}});
         for (const id of ['one', 'two']) {
-            await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? data : JSON.stringify([{id:'legacy'}])}})]));
+            await adapter.push(stubEvent, { ...makeBatch([makeOp({tableName:'projects',pk:id,payload:{id,name:id,data:id === 'one' ? data : JSON.stringify([{id:'legacy'}])}})]), historyIncarnation: await readHistoryIncarnation() });
             expect(await read()).toMatchObject(id === 'one' ? {project_ownership:'resolved',thread:{project_id:'one'}} : {project_ownership:'conflict'});
         }
-        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'projects',pk:'chosen',payload:{id:'chosen',name:'Chosen',data:[]}})]));
-        await adapter.push(stubEvent, makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]));
+        await adapter.push(stubEvent, { ...makeBatch([makeOp({tableName:'projects',pk:'chosen',payload:{id:'chosen',name:'Chosen',data:[]}})]), historyIncarnation: await readHistoryIncarnation() });
+        await adapter.push(stubEvent, { ...makeBatch([makeOp({tableName:'threads',pk:'legacy',stamp:{deviceId:DEVICE_A,opId:randomUUID(),clock:3,hlc:'2026-10-05T00:00:00.000Z-0000'},payload:{id:'legacy',project_id:'chosen'}})]), historyIncarnation: await readHistoryIncarnation() });
         expect(await read()).toMatchObject({project_ownership:'resolved',thread:{project_id:'chosen'}});
     });
+    it.each(['not-json', {}, null, 'oversized', 'wrong-identity'])('reports unresolved legacy ownership for malformed project data %j without failing independent reads', async data => {
+        const raw = getRawDb();
+        raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
+        raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+        const actor = { userId: 'owner', workspaceId: WORKSPACE_ID };
+        await adapter.push(stubEvent, { ...makeBatch([
+            makeOp({ tableName: 'projects', pk: 'broken', payload: { id: 'broken', data: [] } }),
+            makeOp({ tableName: 'projects', pk: 'chosen', payload: { id: 'chosen', data: [] } }),
+            makeOp({ tableName: 'threads', pk: 'legacy', payload: { id: 'legacy' } }),
+            makeOp({ tableName: 'threads', pk: 'explicit', payload: { id: 'explicit', project_id: 'chosen' } }),
+        ]), historyIncarnation: await readHistoryIncarnation() });
+        raw.prepare("UPDATE s_projects SET data_json = ? WHERE id = 'broken'").run(data === null ? '{broken' : JSON.stringify({ id: data === 'wrong-identity' ? 'other' : 'broken',
+            data: data === 'oversized' || data === 'wrong-identity' ? [] : data,
+            ...(data === 'oversized' ? { padding: 'x'.repeat(262144) } : {}),
+        }));
+        await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'legacy' }))
+            .resolves.toMatchObject({ status: 'scope_incomplete' });
+        await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'explicit' }))
+            .resolves.toMatchObject({ status: 'ok', project_ownership: 'resolved', thread: { project_id: 'chosen' } });
+        await expect(adapter.readChatHistory(actor, { kind: 'thread', thread_id: 'missing' }))
+            .resolves.toMatchObject({ status: 'ok', thread: undefined });
+        await expect(adapter.readChatHistory(actor, { kind: 'messages', message_ids: ['independent'] }))
+            .resolves.toMatchObject({ status: 'ok', messages: [] });
+    });
+
+    it('reads a delete-before-put placeholder beside a live canonical sibling', async () => {
+        const raw = getRawDb();
+        raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Messages', 'owner');
+        raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
+        await adapter.push(stubEvent, { ...makeBatch([
+            makeOp({ tableName: 'messages', pk: 'absent', operation: 'delete', payload: undefined }),
+            makeOp({ tableName: 'messages', pk: 'live', payload: { id: 'live', thread_id: 'thread', index: 0 } }),
+        ]), historyIncarnation: await readHistoryIncarnation() });
+        const result = await adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'messages', message_ids: ['absent', 'live'] });
+        expect(result.status).toBe('ok');
+        expect(result.messages).toEqual(expect.arrayContaining([
+            expect.objectContaining({ id: 'absent', deleted: true, clock: 1 }),
+            expect.objectContaining({ id: 'live', deleted: false }),
+        ]));
+        raw.prepare("UPDATE s_messages SET data_json = ? WHERE id = 'live'").run('{"id":"contradiction"}');
+        await expect(adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'messages', message_ids: ['live'] }))
+            .rejects.toThrow('Canonical history identity mismatch');
+    });
+
     // A deleted/missing owner releases the chat even if LWW preserved its old
     // pointer. A same-ID project in another workspace cannot retain ownership,
     // and legacy membership must not override an explicit released pointer.
@@ -152,14 +198,14 @@ describe('SqliteSyncGatewayAdapter', () => {
             const raw = getRawDb();
             raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Projects', 'owner');
             raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)').run('owner-member', WORKSPACE_ID, 'owner', 'owner');
-            await adapter.push(stubEvent, makeBatch([
+            await adapter.push(stubEvent, { ...makeBatch([
                 makeOp({ tableName: 'threads', pk: 'released-chat', payload: { id: 'released-chat', project_id: 'old-owner' } }),
                 makeOp({ tableName: 'projects', pk: 'stale-folder', payload: { id: 'stale-folder', data: ['released-chat'] } }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             if (state !== 'missing') {
                 const scope = { workspaceId: state === 'foreign' ? 'another-workspace' : WORKSPACE_ID };
-                await adapter.push(stubEvent, { scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', payload: { id: 'old-owner', data: [] } })] });
-                if (state === 'deleted') await adapter.push(stubEvent, { scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', operation: 'delete',
+                await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', payload: { id: 'old-owner', data: [] } })] });
+                if (state === 'deleted') await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope, ops: [makeOp({ tableName: 'projects', pk: 'old-owner', operation: 'delete',
                     stamp: { deviceId: DEVICE_A, opId: randomUUID(), clock: 2, hlc: '2026-10-05T00:00:00.000Z-0000' } })] });
             }
             expect(await adapter.readChatHistory({ userId: 'owner', workspaceId: WORKSPACE_ID }, { kind: 'thread', thread_id: 'released-chat' }))
@@ -196,12 +242,12 @@ describe('SqliteSyncGatewayAdapter', () => {
                 const summary = await validateCompactionSummary(capture, JSON.stringify({ summary_markdown: '## Objective\nRoundtrip.\n## Important Details\nPreserve files.\n## Work State\nPending.\n## Next Move\nContinue.\n## Relevant Files\nNone.',
                     landmarks: [{ message_id: 'roundtrip-0', kind: 'decision', summary: 'Preserve exact source context' }] }), { targetTokens: 4096, countText: async (text) => Math.ceil(text.length / 4) });
                 const child = await createCompactedFork({ capture, summary });
-                const pushed = await adapter.push(stubEvent, { scope: { workspaceId: workspace }, ops: await local.pending_ops.toArray() });
+                const pushed = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: workspace }, ops: await local.pending_ops.toArray() });
                 expect(pushed.results.every((result) => result.success)).toBe(true);
                 const actor = { userId: 'roundtrip-user', workspaceId: workspace };
                 expect((await adapter.readChatHistory(actor, { kind: 'thread', thread_id: child.thread.id })).thread).toMatchObject({ branch_mode: 'compacted', summary_message_id: child.summary.id, parent_thread_id: 'roundtrip-root' });
                 const event = makeSessionEvent(actor.userId, workspace);
-                const pulled = await adapter.pull(event, { scope: { workspaceId: workspace }, cursor: 0, limit: 100 });
+                const pulled = await adapter.pull(event, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: workspace }, cursor: 0, limit: 100 });
                 const resolver = new ConflictResolver(second);
                 const summaryChanges = pulled.changes.filter((change) => change.pk === child.summary.id);
                 const partial = await resolver.applyChanges(pulled.changes.filter((change) => change.pk !== child.summary.id));
@@ -213,16 +259,16 @@ describe('SqliteSyncGatewayAdapter', () => {
                 const measured = attachRequestUsage(prefix, { prompt_tokens: 300, completion_tokens: 20 }, { requestId: 'roundtrip-request', iteration: 1, measuredAt: 1000 });
                 expect(measured).toBeTruthy();
                 const admission: ChatGenerationAdmissionEnvelope = { version: 1, kind: 'new-turn', admissionId: 'roundtrip-admission', generationId: 'roundtrip-generation', workspaceId: workspace, threadId: child.thread.id, messageId: 'roundtrip-answer',
-                    thread: { ...child.thread, clock: 2 }, userMessage: { id: 'roundtrip-user-message', clock: 1, thread_id: child.thread.id, role: 'user', index: 1, created_at: 2, updated_at: 2, pending: false, deleted: false, data: { content: 'Continue summary' } },
-                    assistantMessage: { id: 'roundtrip-answer', clock: 1, thread_id: child.thread.id, role: 'assistant', index: 2, created_at: 2, updated_at: 2, pending: true, deleted: false, stream_id: 'roundtrip-generation', data: { content: '', generation_id: 'roundtrip-generation', generation_state: 'streaming', custom_metadata: { keep: true } } } };
+                    thread: { ...child.thread, clock: 2 }, userMessage: validSyncPayload("messages", 'roundtrip-user-message', { id: 'roundtrip-user-message', clock: 1, thread_id: child.thread.id, role: 'user', index: 1, created_at: 2, updated_at: 2, pending: false, deleted: false, data: { content: 'Continue summary' } }),
+                    assistantMessage: validSyncPayload("messages", 'roundtrip-answer', { id: 'roundtrip-answer', clock: 1, thread_id: child.thread.id, role: 'assistant', index: 2, created_at: 2, updated_at: 2, pending: true, deleted: false, stream_id: 'roundtrip-generation', data: { content: '', generation_id: 'roundtrip-generation', generation_state: 'streaming', custom_metadata: { keep: true } } }) };
                 await adapter.admitChatGeneration(actor, admission);
                 await adapter.finalizeChatGeneration(actor, { admission, snapshot: { status: 'complete', content: 'Continued from summary', reasoning: '', completedAt: 1001, usage: measured } });
-                const completed = await adapter.pull(event, { scope: { workspaceId: workspace }, cursor: pulled.nextCursor, limit: 100 });
+                const completed = await adapter.pull(event, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: workspace }, cursor: pulled.nextCursor, limit: 100 });
                 expect((await resolver.applyChanges(completed.changes)).skipped).toBe(0);
                 expect((await second.messages.get('roundtrip-answer'))?.data).toMatchObject({ usage: measured, custom_metadata: { keep: true } });
                 const secondName = second.name; second.close(); second = new Or3DB(secondName); await second.open();
                 const pages: SnapshotResponse[] = []; let pageToken: string | undefined;
-                do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); pages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
+                do { const page = await adapter.snapshot(event, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: workspace }, pageSize: 2, pageToken }); pages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
                 await applySnapshotChain(second, pages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
                 expect((await resolveThreadProjection(child.thread.id, second)).messages.map((row) => row.id)).toEqual([child.summary.id, 'roundtrip-user-message', 'roundtrip-answer']);
                 expect((await second.messages.get('roundtrip-answer'))?.data).toMatchObject({ usage: measured });
@@ -231,7 +277,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 getRawDb().prepare('DELETE FROM s_threads WHERE workspace_id = ? AND id = ?').run(workspace, 'roundtrip-root');
                 expect((await adapter.readChatHistory(actor, { kind: 'messages', message_ids: ['roundtrip-0'] })).messages).toEqual([]);
                 const purgedPages: SnapshotResponse[] = []; pageToken = undefined;
-                do { const page = await adapter.snapshot(event, { scope: { workspaceId: workspace }, pageSize: 2, pageToken }); purgedPages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
+                do { const page = await adapter.snapshot(event, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: workspace }, pageSize: 2, pageToken }); purgedPages.push(page); pageToken = page.nextPageToken ?? undefined; } while (pageToken);
                 await applySnapshotChain(second, purgedPages, { workspaceId: workspace }, DEVICE_B, () => true, ['threads', 'messages']);
                 expect(await second.threads.get('roundtrip-root')).toBeUndefined(); expect(await second.messages.get('roundtrip-0')).toBeUndefined();
                 // Display retains the saved summary, but requests must refuse
@@ -262,7 +308,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                     ...Array.from({ length: 140 }, (_, index) => makeOp({ tableName: 'messages', pk: `canonical-${String(index).padStart(3, '0')}`,
                         payload: { id: `canonical-${String(index).padStart(3, '0')}`, thread_id: 'canonical-thread', index: Math.floor(index / 2),
                             ...(index % 2 ? { order_key: 'ordered' } : {}), role: 'assistant', clock: 1, data: { content: `evidence ${index}` } } }))];
-                await reader.push(stubEvent, makeBatch(rows));
+                const artifactHistory = await import('../../../dist/runtime/server/sync/history-incarnation.js');
+                await reader.push(stubEvent, { ...makeBatch(rows), historyIncarnation: await artifactHistory.readHistoryIncarnation() });
                 // Content history is independent from retained replication logs.
                 raw.exec('DELETE FROM change_log');
                 const before = await reader.readChatHistory(actor, { kind: 'thread', thread_id: 'canonical-thread' });
@@ -306,10 +353,10 @@ describe('SqliteSyncGatewayAdapter', () => {
             return {
                 version: 1, kind: 'new-turn', admissionId: 'usage-admission', generationId: 'usage-generation',
                 workspaceId: WORKSPACE_ID, threadId: 'usage-thread', messageId: 'usage-assistant',
-                thread: { id: 'usage-thread', clock: 1, title: 'Usage conversation' },
-                userMessage: { id: 'usage-user', thread_id: 'usage-thread', role: 'user', clock: 1, data: { content: 'question' } },
-                assistantMessage: { id: 'usage-assistant', thread_id: 'usage-thread', role: 'assistant', clock: 1,
-                    pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } },
+                thread: validSyncPayload("threads", 'usage-thread', { id: 'usage-thread', clock: 1, title: 'Usage conversation' }),
+                userMessage: validSyncPayload("messages", 'usage-user', { id: 'usage-user', thread_id: 'usage-thread', role: 'user', clock: 1, data: { content: 'question' } }),
+                assistantMessage: validSyncPayload("messages", 'usage-assistant', { id: 'usage-assistant', thread_id: 'usage-thread', role: 'assistant', clock: 1,
+                    pending: true, data: { content: '', generation_id: 'usage-generation', compaction: { version: 1, marker: 'retained' }, custom_metadata: { keep: true } } }),
             };
         }
         const snapshot = (status: CanonicalGenerationSnapshot['status'] = 'complete'): CanonicalGenerationSnapshot & TerminalGenerationSnapshot => ({
@@ -324,10 +371,10 @@ describe('SqliteSyncGatewayAdapter', () => {
             registerSyncGatewayAdapter({ id: 'sqlite', create: () => adapter });
         }
         async function readCanonical() {
-            const pulled = await adapter.pull(makeSessionEvent(actor.userId), {
+            const pulled = await adapter.pull(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100,
             });
-            const page = await adapter.snapshot(makeSessionEvent(actor.userId), {
+            const page = await adapter.snapshot(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, pageSize: 100,
             });
             const item = page.items.find((entry: SnapshotItem) => entry.kind === 'row' && entry.pk === 'usage-assistant');
@@ -351,6 +398,37 @@ describe('SqliteSyncGatewayAdapter', () => {
         afterEach(async () => {
             await destroySqliteDb();
             await rm(directory, { recursive: true, force: true });
+        });
+
+        it('rejects a reader-invalid finalized payload before any durable mutation', async () => {
+            const history = admission();
+            await adapter.admitChatGeneration(actor,history);
+            const raw = getRawDb();
+            raw.prepare("UPDATE s_messages SET data_json = json_set(data_json, '$.role', 42) WHERE id = ?").run(history.messageId);
+            const state = () => ['server_version_counter','change_log','s_messages','background_generation_receipts']
+                .map(table => raw.prepare(`SELECT * FROM ${table}`).all());
+            const before = state();
+            await expect(adapter.finalizeChatGeneration(actor,{admission:history,snapshot:snapshot()})).rejects.toMatchObject({code:'VALIDATION_ERROR'});
+            expect(state()).toEqual(before);
+        });
+
+        it.each(['clock', 'version'] as const)('rejects terminal %s exhaustion without changing durable state', async exhausted => {
+            const history = admission();
+            history.assistantMessage.clock = exhausted === 'clock' ? Number.MAX_SAFE_INTEGER - 1 : 1;
+            await adapter.admitChatGeneration(actor, history);
+            if (exhausted === 'clock') {
+                history.assistantMessage.clock = Number.MAX_SAFE_INTEGER;
+                getRawDb().prepare("UPDATE s_messages SET clock = ?, data_json = json_set(data_json, '$.clock', ?) WHERE id = ?")
+                    .run(Number.MAX_SAFE_INTEGER,Number.MAX_SAFE_INTEGER,history.messageId);
+            }
+            if (exhausted === 'version') setWorkspaceVersion(Number.MAX_SAFE_INTEGER);
+            const raw = getRawDb();
+            const state = () => ['server_version_counter', 'change_log', 's_messages', 'background_generation_receipts']
+                .map(table => raw.prepare(`SELECT * FROM ${table}`).all());
+            const before = state();
+            await expect(adapter.finalizeChatGeneration(actor, { admission: history, snapshot: snapshot() }))
+                .rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+            expect(state()).toEqual(before);
         });
 
         it('retains tool output atomically in canonical KV, replays after reopen and refuses deleted rows or revoked access', async () => {
@@ -381,12 +459,12 @@ describe('SqliteSyncGatewayAdapter', () => {
             expect(await adapter.readChatToolResult(actor, { admission: history, callId: 'call-1', reference })).toBe(content);
             await expect(adapter.readChatToolResult(actor, { admission: history, callId: 'other-call', reference })).rejects.toThrow();
             expect((getRawDb().prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?').get(WORKSPACE_ID) as { value: number }).value).toBe(version);
-            const pulled = await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: before, limit: 100 });
+            const pulled = await adapter.pull(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: before, limit: 100 });
             expect(pulled.changes.every(entry => z.uuid().safeParse(entry.stamp.opId).success)).toBe(true);
             const pulledKv = new Map(pulled.changes.filter(entry => entry.tableName === 'kv')
                 .map(entry => [entry.pk, entry.payload as { value: string; deleted?: boolean }]));
             expect(await readToolResultStorage(reference, async key => pulledKv.get(key))).toBe(content);
-            const page = await adapter.snapshot(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+            const page = await adapter.snapshot(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
             const kv = new Map(page.items.filter((entry): entry is Extract<SnapshotItem, { kind: 'row' }> => entry.kind === 'row' && entry.tableName === 'kv')
                 .map(entry => [entry.pk, entry.payload as { value: string; deleted?: boolean }]));
             expect(await readToolResultStorage(reference, async key => kv.get(key))).toBe(content);
@@ -417,12 +495,12 @@ describe('SqliteSyncGatewayAdapter', () => {
             const key = prepared.rows[0]!.id;
             raw.prepare("UPDATE change_log SET op_id = ?, payload_json = json_set(payload_json, '$.op_id', ?) WHERE pk = ?").run(oldId, oldId, key);
             raw.prepare("UPDATE s_kv SET op_id = ?, data_json = json_set(data_json, '$.op_id', ?) WHERE id = ?").run(oldId, oldId, key);
-            const captured = await adapter.snapshot(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+            const captured = await adapter.snapshot(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
             const version = captured.highWatermark;
-            raw.prepare("DELETE FROM kysely_migration WHERE name = '033_tool_result_operation_ids'").run();
+            raw.prepare("DELETE FROM kysely_migration WHERE name >= '033_tool_result_operation_ids'").run();
             await runMigrations(getSqliteDb());
             await reopen();
-            const pull = await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+            const pull = await adapter.pull(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
             expect(pull.changes.every(entry => z.uuid().safeParse(entry.stamp.opId).success)).toBe(true);
             expect(pull.nextCursor).toBe(version);
             const repaired = pull.changes.find(entry => entry.pk === key)!;
@@ -436,7 +514,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             }
             await adapter.retainChatToolResult(actor, { admission: history, callId: 'legacy', reference: prepared.result, rows: prepared.rows });
             expect(await adapter.readChatToolResult(actor, { admission: history, callId: 'legacy', reference: prepared.result })).toBe(content);
-            expect((await adapter.pull(makeSessionEvent(actor.userId), { scope: { workspaceId: WORKSPACE_ID }, cursor: version, limit: 100 })).changes).toEqual([]);
+            expect((await adapter.pull(makeSessionEvent(actor.userId), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: version, limit: 100 })).changes).toEqual([]);
         });
 
         it('emits created hooks once for admitted rows and does not create an existing thread', async () => {
@@ -536,13 +614,13 @@ describe('SqliteSyncGatewayAdapter', () => {
             const history = admission();
             await adapter.admitChatGeneration(actor, history);
             const current = await readCanonical();
-            await adapter.push(stubEvent, makeBatch([makeOp({
+            await adapter.push(stubEvent, { ...makeBatch([makeOp({
                 tableName: 'messages', pk: history.messageId, operation: reason === 'deleted' ? 'delete' : 'put',
                 payload: { ...current, clock: 5, data: { ...(current.data as object),
                     content: 'newer answer', generation_id: reason === 'newer_generation' ? 'other-generation' : history.generationId,
                     usage: { ...usage, prompt_tokens: 900, request_id: 'newer-request' },
                 } }, stamp: { clock: 5, hlc: 'zzzz-newer', deviceId: DEVICE_B, opId: randomUUID() },
-            })]));
+            })]), historyIncarnation: await readHistoryIncarnation() });
             expect(await adapter.finalizeChatGeneration(actor, { admission: history, snapshot: snapshot() }))
                 .toMatchObject({ status: 'superseded', reason });
             const row = getRawDb().prepare('SELECT data_json, deleted FROM s_messages WHERE workspace_id = ? AND id = ?')
@@ -564,21 +642,21 @@ describe('SqliteSyncGatewayAdapter', () => {
             [{ key: 'or3.workspace-item', value: { version: 1 } }],
             JSON.stringify([{ key: 'or3.workspace-item', value: { version: 1 } }]),
         ].map(meta => ({ tableName: 'posts', payload: { id: 'workspace-item', post_type: 'doc', meta }, omitted: { id: 'workspace-item' } })),
-        { tableName: 'posts', payload: { id: 'workspace-item', postType: 'or3:file' }, omitted: { id: 'workspace-item' } },
+        { tableName: 'posts', payload: { id: 'workspace-item', post_type: 'or3:file' }, omitted: { id: 'workspace-item' } },
         { tableName: 'projects', payload: { id: 'workspace-item', data: JSON.stringify([{ kind: 'file', id: 'saved' }]) }, omitted: { id: 'workspace-item', data: [] } },
     ].map(value => ({ ...value, runtime }))))('rejects old-writer omission transactionally for $tableName on $runtime', async ({ tableName, payload, omitted, runtime }) => {
         if (runtime === 'd1') await useD1TestDatabase();
         const first = makeOp({ tableName, pk: 'workspace-item', payload });
         const admitted = { ...makeBatch([first]), workspaceItemCapability: 'v1' as const };
-        const saved = await adapter.push(stubEvent, admitted);
+        const saved = await adapter.push(stubEvent, { ...admitted, historyIncarnation: await readHistoryIncarnation() });
         expect(saved.results[0]?.success).toBe(true);
-        const pull = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 10, workspaceItemCapability: 'v1' });
+        const pull = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 10, workspaceItemCapability: 'v1' });
         expect(pull.changes[0]?.payload).toMatchObject(payload);
-        const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 10, workspaceItemCapability: 'v1' });
+        const snapshot = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, pageSize: 10, workspaceItemCapability: 'v1' });
         expect(snapshot.items).toContainEqual(expect.objectContaining({ kind: 'row', tableName, pk: 'workspace-item', payload: expect.objectContaining(payload) }));
         const old = makeOp({ tableName, pk: 'workspace-item', payload: omitted,
             stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } });
-        await expect(adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'threads', pk: 'sibling' }), old]))).rejects.toMatchObject({ statusCode: 426 });
+        await expect(adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'threads', pk: 'sibling' }), old]), historyIncarnation: await readHistoryIncarnation() })).rejects.toMatchObject({ statusCode: 426 });
         const rows = async <T,>(query: string): Promise<T[]> => runtime === 'd1'
             ? (await d1TestDatabase!.database.prepare(query).all<T>()).results!
             : getRawDb().prepare(query).all() as T[];
@@ -595,7 +673,7 @@ describe('SqliteSyncGatewayAdapter', () => {
     it.each(['posts', 'projects'])('guards canonical %s capability changes inside the D1 batch', async tableName => {
         await useD1TestDatabase();
         const first = makeOp({ tableName, pk: 'capability-race', payload: { id: 'capability-race' } });
-        await adapter.push(stubEvent, makeBatch([first]));
+        await adapter.push(stubEvent, { ...makeBatch([first]), historyIncarnation: await readHistoryIncarnation() });
         const canonical = tableName === 'posts'
             ? { id: first.pk, post_type: 'or3:file', title: 'Saved file' }
             : { id: first.pk, data: [{ kind: 'file', id: 'saved-file' }] };
@@ -605,19 +683,19 @@ describe('SqliteSyncGatewayAdapter', () => {
         database.batch = async statements => {
             if (!raced) {
                 raced = true;
-                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName, pk: first.pk, payload: canonical,
+                await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...makeBatch([makeOp({ tableName, pk: first.pk, payload: canonical,
                     stamp: { ...first.stamp, opId: randomUUID(), clock: 2 } })]), workspaceItemCapability: 'v1' });
             }
             return batch(statements);
         };
-        await expect(adapter.push(stubEvent, makeBatch([
+        await expect(adapter.push(stubEvent, { ...makeBatch([
             makeOp({ tableName: 'threads', pk: 'must-rollback' }),
             makeOp({ tableName, pk: first.pk, payload: { id: first.pk, title: 'legacy overwrite' },
                 stamp: { ...first.stamp, opId: randomUUID(), clock: 3 } }),
-        ]))).rejects.toMatchObject({ statusCode: 426 });
+        ]), historyIncarnation: await readHistoryIncarnation() })).rejects.toMatchObject({ statusCode: 426 });
         expect(raced).toBe(true);
         expect((await database.prepare('SELECT data_json FROM s_' + tableName + ' WHERE id = ?').bind(first.pk).all<{ data_json: string }>()).results?.map(row => JSON.parse(row.data_json)))
-            .toEqual([canonical]);
+            .toEqual([expect.objectContaining(canonical)]);
         expect((await database.prepare('SELECT value FROM server_version_counter').all()).results).toEqual([{ value: 2 }]);
         expect((await database.prepare('SELECT count(*) AS total FROM change_log').all()).results).toEqual([{ total: 2 }]);
         expect((await database.prepare('SELECT id FROM s_threads').all()).results).toEqual([]);
@@ -640,7 +718,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                         clock: item.revision.clock,
                     },
                 }));
-                await adapter.push(stubEvent, makeBatch(ops));
+                await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
                 setWorkspaceVersion(highWatermark);
             },
             async bootstrap() {
@@ -648,7 +726,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 let pageToken: string | undefined;
                 let highWatermark = 0;
                 do {
-                    const page = await adapter.snapshot(stubEvent, {
+                    const page = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                         scope: { workspaceId: WORKSPACE_ID }, pageSize: 1, pageToken,
                     });
                     items.push(...page.items);
@@ -667,7 +745,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             const op1 = makeOp({ tableName: 'threads', pk: 't-1' });
             const op2 = makeOp({ tableName: 'threads', pk: 't-2' });
 
-            const result = await adapter.push(stubEvent, makeBatch([op1, op2]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([op1, op2]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(result.results.length).toBe(2);
             expect(result.results[0]!.success).toBe(true);
@@ -679,10 +757,10 @@ describe('SqliteSyncGatewayAdapter', () => {
 
         it('preserves contiguous versioning across batches', async () => {
             const op1 = makeOp({ tableName: 'threads', pk: 't-1' });
-            await adapter.push(stubEvent, makeBatch([op1]));
+            await adapter.push(stubEvent, { ...makeBatch([op1]), historyIncarnation: await readHistoryIncarnation() });
 
             const op2 = makeOp({ tableName: 'threads', pk: 't-2' });
-            const result = await adapter.push(stubEvent, makeBatch([op2]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([op2]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(result.results[0]!.serverVersion).toBe(2);
         });
@@ -690,8 +768,8 @@ describe('SqliteSyncGatewayAdapter', () => {
         it('is idempotent on duplicate op_id', async () => {
             const op = makeOp({ tableName: 'threads', pk: 't-1' });
 
-            const first = await adapter.push(stubEvent, makeBatch([op]));
-            const second = await adapter.push(stubEvent, makeBatch([op]));
+            const first = await adapter.push(stubEvent, { ...makeBatch([op]), historyIncarnation: await readHistoryIncarnation() });
+            const second = await adapter.push(stubEvent, { ...makeBatch([op]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(first.results[0]!.serverVersion).toBe(1);
             expect(second.results[0]!.success).toBe(true);
@@ -706,15 +784,15 @@ describe('SqliteSyncGatewayAdapter', () => {
                 payload: { id: 'replay-live', title: 'original' },
                 stamp: { clock: 1, hlc: '1000-a', deviceId: DEVICE_A, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([original]));
+            await adapter.push(stubEvent, { ...makeBatch([original]), historyIncarnation: await readHistoryIncarnation() });
             const newer = makeOp({
                 tableName: 'threads', pk: 'replay-live',
                 payload: { id: 'replay-live', title: 'newer' },
                 stamp: { clock: 2, hlc: '2000-b', deviceId: DEVICE_B, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([newer]));
+            await adapter.push(stubEvent, { ...makeBatch([newer]), historyIncarnation: await readHistoryIncarnation() });
 
-            const replay = await adapter.push(stubEvent, makeBatch([original]));
+            const replay = await adapter.push(stubEvent, { ...makeBatch([original]), historyIncarnation: await readHistoryIncarnation() });
             expect(replay.results[0]).toMatchObject({
                 success: true, replayed: true, applied: false, serverVersion: 1,
                 winner: {
@@ -731,14 +809,14 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads', pk: 'replay-deleted',
                 stamp: { clock: 1, hlc: '1000-a', deviceId: DEVICE_A, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([original]));
+            await adapter.push(stubEvent, { ...makeBatch([original]), historyIncarnation: await readHistoryIncarnation() });
             const deletion = makeOp({
                 tableName: 'threads', pk: 'replay-deleted', operation: 'delete',
                 stamp: { clock: 3, hlc: '3000-b', deviceId: DEVICE_B, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([deletion]));
+            await adapter.push(stubEvent, { ...makeBatch([deletion]), historyIncarnation: await readHistoryIncarnation() });
 
-            const replay = await adapter.push(stubEvent, makeBatch([original]));
+            const replay = await adapter.push(stubEvent, { ...makeBatch([original]), historyIncarnation: await readHistoryIncarnation() });
             expect(replay.results[0]).toMatchObject({
                 success: true, replayed: true, applied: false,
                 winner: { kind: 'delete', revision: {
@@ -749,7 +827,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads', pk: 'replay-deleted',
                 stamp: { clock: 2, hlc: '2000-c', deviceId: DEVICE_A, opId: randomUUID() },
             });
-            const staleResult = await adapter.push(stubEvent, makeBatch([stale]));
+            const staleResult = await adapter.push(stubEvent, { ...makeBatch([stale]), historyIncarnation: await readHistoryIncarnation() });
             expect(staleResult.results[0]).toMatchObject({
                 success: true, applied: false,
                 winner: { kind: 'delete', revision: {
@@ -762,7 +840,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             getRawDb().prepare(
                 'DELETE FROM tombstones WHERE workspace_id = ? AND table_name = ? AND pk = ?'
             ).run(WORKSPACE_ID, 'threads', 'replay-deleted');
-            const afterGc = await adapter.push(stubEvent, makeBatch([original]));
+            const afterGc = await adapter.push(stubEvent, { ...makeBatch([original]), historyIncarnation: await readHistoryIncarnation() });
             expect(afterGc.results[0]).toMatchObject({
                 success: true, replayed: true, applied: false,
                 winner: { kind: 'delete', revision: {
@@ -774,7 +852,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         it('rejects invalid table names', async () => {
             const op = makeOp({ tableName: 'evil_table' as string, pk: 'x-1' });
 
-            const result = await adapter.push(stubEvent, makeBatch([op]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([op]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(result.results[0]!.success).toBe(false);
             expect(result.results[0]!.errorCode).toBe('VALIDATION_ERROR');
@@ -782,12 +860,12 @@ describe('SqliteSyncGatewayAdapter', () => {
 
         it('handles mixed idempotent and new ops', async () => {
             const existingOp = makeOp({ tableName: 'threads', pk: 't-1' });
-            await adapter.push(stubEvent, makeBatch([existingOp]));
+            await adapter.push(stubEvent, { ...makeBatch([existingOp]), historyIncarnation: await readHistoryIncarnation() });
 
             const newOp = makeOp({ tableName: 'threads', pk: 't-2' });
             const result = await adapter.push(
                 stubEvent,
-                makeBatch([existingOp, newOp])
+                { ...makeBatch([existingOp, newOp]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             expect(result.results[0]!.serverVersion).toBe(1); // idempotent
@@ -818,7 +896,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 },
             });
 
-            const result = await adapter.push(stubEvent, makeBatch([first, second]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([first, second]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(result.results.length).toBe(2);
             expect(result.results[0]!.success).toBe(true);
@@ -853,7 +931,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 },
             });
 
-            const result = await adapter.push(stubEvent, makeBatch([first, second]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([first, second]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(result.results).toHaveLength(2);
             expect(result.results.every((entry) =>
@@ -888,7 +966,7 @@ describe('SqliteSyncGatewayAdapter', () => {
 
             const result = await adapter.push(
                 stubEvent,
-                makeBatch([invalidTable, keyMutation, workspaceMutation, valid])
+                { ...makeBatch([invalidTable, keyMutation, workspaceMutation, valid]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             expect(result.results[0]).toMatchObject({
@@ -935,7 +1013,7 @@ describe('SqliteSyncGatewayAdapter', () => {
 
             const result = await adapter.push(
                 stubEvent,
-                makeBatch([accepted, rejected])
+                { ...makeBatch([accepted, rejected]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             expect(result.results[0]).toMatchObject({ success: true });
@@ -964,8 +1042,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                 stamp: { clock: 2, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() },
             });
 
-            await adapter.push(stubEvent, makeBatch([op1]));
-            await adapter.push(stubEvent, makeBatch([op2]));
+            await adapter.push(stubEvent, { ...makeBatch([op1]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { ...makeBatch([op2]), historyIncarnation: await readHistoryIncarnation() });
 
             // Verify materialized table has the second write
             const raw = getRawDb();
@@ -991,8 +1069,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                 stamp: { clock: 1, hlc: '2025-01-01T00:00:00.000Z-0002', deviceId: DEVICE_B, opId: randomUUID() },
             });
 
-            await adapter.push(stubEvent, makeBatch([op1]));
-            await adapter.push(stubEvent, makeBatch([op2]));
+            await adapter.push(stubEvent, { ...makeBatch([op1]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { ...makeBatch([op2]), historyIncarnation: await readHistoryIncarnation() });
 
             const raw = getRawDb();
             const row = raw
@@ -1016,8 +1094,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                 stamp: { clock: 3, hlc: '2025-01-01T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() },
             });
 
-            await adapter.push(stubEvent, makeBatch([op1]));
-            await adapter.push(stubEvent, makeBatch([op2]));
+            await adapter.push(stubEvent, { ...makeBatch([op1]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { ...makeBatch([op2]), historyIncarnation: await readHistoryIncarnation() });
 
             const raw = getRawDb();
             const row = raw
@@ -1036,7 +1114,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 pk: 't-1',
                 payload: { id: 't-1', title: 'test' },
             });
-            await adapter.push(stubEvent, makeBatch([putOp]));
+            await adapter.push(stubEvent, { ...makeBatch([putOp]), historyIncarnation: await readHistoryIncarnation() });
 
             const beforeDelete = Math.floor(Date.now() / 1000);
             const delOp = makeOp({
@@ -1046,7 +1124,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 payload: { deleted_at: 1 },
                 stamp: { clock: 2, hlc: '2025-01-01T00:00:01.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([delOp]));
+            await adapter.push(stubEvent, { ...makeBatch([delOp]), historyIncarnation: await readHistoryIncarnation() });
 
             const authored = getRawDb().prepare(
                 'SELECT deleted_at FROM tombstones WHERE workspace_id = ? AND table_name = ? AND pk = ?'
@@ -1072,12 +1150,12 @@ describe('SqliteSyncGatewayAdapter', () => {
         it('keeps a single tombstone row per (workspace, table, pk)', async () => {
             await adapter.push(
                 stubEvent,
-                makeBatch([makeOp({ tableName: 'threads', pk: 't-repeat' })])
+                { ...makeBatch([makeOp({ tableName: 'threads', pk: 't-repeat' })]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             await adapter.push(
                 stubEvent,
-                makeBatch([
+                { ...makeBatch([
                     makeOp({
                         tableName: 'threads',
                         pk: 't-repeat',
@@ -1089,12 +1167,12 @@ describe('SqliteSyncGatewayAdapter', () => {
                             opId: randomUUID(),
                         },
                     }),
-                ])
+                ]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             await adapter.push(
                 stubEvent,
-                makeBatch([
+                { ...makeBatch([
                     makeOp({
                         tableName: 'threads',
                         pk: 't-repeat',
@@ -1106,7 +1184,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                             opId: randomUUID(),
                         },
                     }),
-                ])
+                ]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             const raw = getRawDb();
@@ -1132,11 +1210,11 @@ describe('SqliteSyncGatewayAdapter', () => {
             const opA = makeOp({ tableName: 'threads', pk: sharedPk });
             const opB = makeOp({ tableName: 'threads', pk: sharedPk });
 
-            const resultA = await adapter.push(stubEvent, {
+            const resultA = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: 'ws-A' },
                 ops: [opA],
             });
-            const resultB = await adapter.push(stubEvent, {
+            const resultB = await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: 'ws-B' },
                 ops: [opB],
             });
@@ -1161,7 +1239,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         it.each(['sqlite', 'd1'] as const)('makes progress past an oversized legacy row on %s', async runtime => {
             if (runtime === 'd1') await useD1TestDatabase();
             const ops = ['large-legacy', 'small-next'].map(pk => makeOp({ tableName: 'threads', pk }));
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
             const payload = { id: 'large-legacy', title: 'x'.repeat(1_100_000) };
             const update = async (query: string) => {
                 if (runtime === 'd1') await d1TestDatabase!.database.prepare(query).bind(JSON.stringify(payload), WORKSPACE_ID, 'large-legacy').run();
@@ -1169,25 +1247,21 @@ describe('SqliteSyncGatewayAdapter', () => {
             };
             await update('UPDATE change_log SET payload_json = ? WHERE workspace_id = ? AND pk = ?');
             await update('UPDATE s_threads SET data_json = ? WHERE workspace_id = ? AND id = ?');
-            const first = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
-            expect(first.changes).toHaveLength(1);
-            expect(first.changes[0]).toMatchObject({ pk: 'large-legacy', payload });
-            expect(first.hasMore).toBe(true);
-            const second = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: first.nextCursor, limit: 100 });
-            expect(second.changes.map(item => item.pk)).toEqual(['small-next']);
-            const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
-            expect(snapshot.items).toHaveLength(1);
-            expect(snapshot.items[0]).toMatchObject({ kind: 'row', pk: 'large-legacy', payload });
-            expect(snapshot.nextPageToken).toBeTruthy();
-            const next = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100, pageToken: snapshot.nextPageToken! });
-            expect(next.items.map(item => item.pk)).toEqual(['small-next']);
+            const first = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+            expect(first.changes.map(item => item.pk)).toEqual(['small-next']);
+            expect(first.unavailable).toEqual([expect.objectContaining({pk:'large-legacy',reason:'payload_oversized'})]);
+            expect(first.hasMore).toBe(false);
+            const snapshot = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+            expect(snapshot.items.map(item => item.pk)).toEqual(['small-next']);
+            expect(snapshot.unavailable).toEqual([expect.objectContaining({pk:'large-legacy',reason:'payload_oversized'})]);
+            expect(snapshot.nextPageToken).toBeNull();
         });
 
         it.each(['pull', 'snapshot'] as const)('bounds D1 response payloads read for a large %s page', async method => {
             await useD1TestDatabase();
             const ops = Array.from({ length: 8 }, (_, i) => makeOp({ tableName: 'threads', pk: `read-${i}`,
                 payload: { id: `read-${i}`, title: 'x'.repeat(200_000) } }));
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
             const database = d1TestDatabase!.database;
             const prepare = database.prepare.bind(database);
             let returnedBytes = 0;
@@ -1204,10 +1278,10 @@ describe('SqliteSyncGatewayAdapter', () => {
                 /^\s*select\b/i.test(query) ? observe(prepare(query)) : prepare(query));
             try {
                 if (method === 'pull') {
-                    const pull = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+                    const pull = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
                     expect(pull.hasMore).toBe(true);
                 } else {
-                    const snapshot = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
+                    const snapshot = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, pageSize: 100 });
                     expect(snapshot.nextPageToken).toBeTruthy();
                 }
                 expect(returnedBytes).toBeLessThan(1_100_000);
@@ -1220,7 +1294,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'threads', pk: `large-${i}`,
                 payload: { id: `large-${i}`, title: `${i}` + 'x'.repeat(200_000) },
             }));
-            const pushed = await adapter.push(stubEvent, makeBatch(ops));
+            const pushed = await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
             expect(pushed.results.every(result => result.success)).toBe(true);
             const changes: string[] = [];
             const changePayloads: unknown[] = [];
@@ -1228,7 +1302,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             let more = true;
             let pullPages = 0;
             while (more) {
-                const page = await adapter.pull(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 100 });
+                const page = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 100 });
                 expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1024 * 1024);
                 expect(page.nextCursor).toBeGreaterThan(cursor);
                 changes.push(...page.changes.map(change => change.pk));
@@ -1238,7 +1312,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 expect(++pullPages).toBeLessThan(10);
             }
             expect(changes).toEqual(ops.map(op => op.pk));
-            expect(changePayloads).toEqual(ops.map(op => op.payload));
+            expect(changePayloads).toMatchObject(ops.map(op => op.payload));
             expect(pullPages).toBeGreaterThan(1);
             const items: string[] = [];
             const itemPayloads: unknown[] = [];
@@ -1247,7 +1321,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             let watermark: number | undefined;
             let snapshotPages = 0;
             do {
-                const page = await adapter.snapshot(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, pageSize: 100, pageToken });
+                const page = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, pageSize: 100, pageToken });
                 expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(1024 * 1024);
                 snapshotId ??= page.snapshotId;
                 watermark ??= page.highWatermark;
@@ -1259,7 +1333,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 expect(++snapshotPages).toBeLessThan(10);
             } while (pageToken);
             expect(items).toEqual(ops.map(op => op.pk));
-            expect(itemPayloads).toEqual(ops.map(op => op.payload));
+            expect(itemPayloads).toMatchObject(ops.map(op => op.payload));
             expect(snapshotPages).toBeGreaterThan(1);
         });
     });
@@ -1270,26 +1344,63 @@ describe('SqliteSyncGatewayAdapter', () => {
         const bob = makeSessionEvent('user-bob');
         const large = (i: number) => makeOp({ tableName: 'threads', pk: `boundary-${i}`,
             payload: { id: `boundary-${i}`, title: 'x'.repeat(200_000) } });
-        await adapter.push(alice, makeBatch(Array.from({ length: 5 }, (_, i) => large(i))));
-        await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'private' })]));
-        await adapter.push(alice, makeBatch([large(5)]));
-        const first = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
+        await adapter.push(alice, { ...makeBatch(Array.from({ length: 5 }, (_, i) => large(i))), historyIncarnation: await readHistoryIncarnation() });
+        await adapter.push(bob, { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'private' })]), historyIncarnation: await readHistoryIncarnation() });
+        await adapter.push(alice, { ...makeBatch([large(5)]), historyIncarnation: await readHistoryIncarnation() });
+        const first = await adapter.pull(alice, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 100 });
         expect(first.changes).toHaveLength(5);
         expect(first.nextCursor).toBe(6);
         expect(first.hasMore).toBe(true);
-        const second = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: first.nextCursor, limit: 100 });
+        const second = await adapter.pull(alice, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: first.nextCursor, limit: 100 });
         expect(second.changes.map(change => change.pk)).toEqual(['boundary-5']);
         expect(second.nextCursor).toBe(7);
         expect(second.hasMore).toBe(false);
     });
 
     describe('pull', () => {
+        it.each(['native', 'd1'])('rejects unsafe version allocation atomically on %s', async driver => {
+            if (driver === 'd1') await useD1TestDatabase();
+            const db = getSqliteDb();
+            await sql`INSERT INTO server_version_counter (workspace_id, value) VALUES (${WORKSPACE_ID}, ${Number.MAX_SAFE_INTEGER - 2})`.execute(db);
+            const batch = makeBatch([1, 2].map(n => makeOp({ tableName: 'threads', pk: `overflow-${n}` })));
+            await expect(adapter.push(stubEvent, { ...batch, historyIncarnation: await readHistoryIncarnation() })).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+            expect((await db.selectFrom('server_version_counter').select('value').executeTakeFirst())?.value).toBe(Number.MAX_SAFE_INTEGER - 2);
+            expect(await db.selectFrom('change_log').selectAll().execute()).toEqual([]);
+            expect(await db.selectFrom('s_threads').selectAll().execute()).toEqual([]);
+            const lastSafe = await adapter.push(stubEvent, { ...makeBatch([batch.ops[0]!]), historyIncarnation: await readHistoryIncarnation() });
+            expect(lastSafe.serverVersion).toBe(Number.MAX_SAFE_INTEGER - 1);
+            await expect(adapter.push(stubEvent, { ...makeBatch([batch.ops[1]!]), historyIncarnation: await readHistoryIncarnation() })).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+            await sql`UPDATE change_log SET created_at = 0`.execute(db);
+            await adapter.gcChangeLog(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, retentionSeconds: 86400 });
+            for (const cursor of [Number.MAX_SAFE_INTEGER - 2, Number.MAX_SAFE_INTEGER - 1]) {
+                const pulled = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 });
+                expect(pulled).toMatchObject({ oldestRetainedVersion: Number.MAX_SAFE_INTEGER,
+                    requiresSnapshot: cursor < Number.MAX_SAFE_INTEGER - 1 });
+            }
+        });
+
+        it.each(['native', 'd1'].flatMap(driver => [0, 4].map(cursor => ({ driver, cursor }))))('signals recovery at cursor $cursor before decoding poisoned history on $driver', async ({ driver, cursor }) => {
+            if (driver === 'd1') await useD1TestDatabase();
+            await adapter.push(stubEvent, { ...makeBatch([1, 2, 3].map(n => makeOp({ tableName: 'threads', pk: `recovery-${n}` }))), historyIncarnation: await readHistoryIncarnation() });
+            const db = getSqliteDb();
+            await sql`DELETE FROM change_log WHERE server_version < 3`.execute(db);
+            await sql`UPDATE change_log SET payload_json = '{broken'`.execute(db);
+            await expect(adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor, limit: 10 }))
+                .resolves.toEqual({ historyIncarnation: await readHistoryIncarnation(), unavailable: [], changes: [], nextCursor: cursor, hasMore: false, oldestRetainedVersion: 3, requiresSnapshot: true });
+            // oldest - 1 is covered and must attempt to read the retained row.
+            await expect(adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 })).resolves.toMatchObject({changes:[],nextCursor:3,unavailable:[{serverVersion:3}]});
+            await sql`UPDATE change_log SET payload_json = ${JSON.stringify(validSyncPayload('threads','recovery-3',{clock:1}))}`.execute(db);
+            const covered = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 10 });
+            expect(covered.requiresSnapshot).toBe(false);
+            expect(covered.changes.map(change => change.serverVersion)).toEqual([3]);
+        });
+
         it('returns changes after cursor', async () => {
             const op1 = makeOp({ tableName: 'threads', pk: 't-1' });
             const op2 = makeOp({ tableName: 'threads', pk: 't-2' });
             const op3 = makeOp({ tableName: 'messages', pk: 'm-1' });
 
-            await adapter.push(stubEvent, makeBatch([op1, op2, op3]));
+            await adapter.push(stubEvent, { ...makeBatch([op1, op2, op3]), historyIncarnation: await readHistoryIncarnation() });
 
             const pullReq: PullRequest = {
                 scope: { workspaceId: WORKSPACE_ID },
@@ -1297,7 +1408,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 limit: 10,
             };
 
-            const result = await adapter.pull(stubEvent, pullReq);
+            const result = await adapter.pull(stubEvent, { ...pullReq, historyIncarnation: await readHistoryIncarnation() });
 
             expect(result.changes.length).toBe(2);
             expect(result.changes[0]!.serverVersion).toBe(2);
@@ -1311,9 +1422,9 @@ describe('SqliteSyncGatewayAdapter', () => {
             const ops = Array.from({ length: 5 }, (_, i) =>
                 makeOp({ tableName: 'threads', pk: `t-${i}` })
             );
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
 
-            const result = await adapter.pull(stubEvent, {
+            const result = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 3,
@@ -1328,14 +1439,14 @@ describe('SqliteSyncGatewayAdapter', () => {
             const ops = Array.from({ length: 3 }, (_, i) =>
                 makeOp({ tableName: 'threads', pk: `t-default-${i}` })
             );
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
 
-            const undefinedLimit = await adapter.pull(stubEvent, {
+            const undefinedLimit = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: undefined as unknown as number,
             });
-            const nanLimit = await adapter.pull(stubEvent, {
+            const nanLimit = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: Number.NaN,
@@ -1351,9 +1462,9 @@ describe('SqliteSyncGatewayAdapter', () => {
             const ops = Array.from({ length: 5 }, (_, i) =>
                 makeOp({ tableName: 'threads', pk: `t-min-${i}` })
             );
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
 
-            const result = await adapter.pull(stubEvent, {
+            const result = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 0,
@@ -1370,9 +1481,9 @@ describe('SqliteSyncGatewayAdapter', () => {
                 makeOp({ tableName: 'messages', pk: 'm-1' }),
                 makeOp({ tableName: 'threads', pk: 't-2' }),
             ];
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
 
-            const result = await adapter.pull(stubEvent, {
+            const result = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 10,
@@ -1384,7 +1495,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
 
         it('returns empty for no new changes', async () => {
-            const result = await adapter.pull(stubEvent, {
+            const result = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 10,
@@ -1401,15 +1512,15 @@ describe('SqliteSyncGatewayAdapter', () => {
                 pk: 't-1',
                 payload: { id: 't-1', title: 'Hello' },
             });
-            await adapter.push(stubEvent, makeBatch([op]));
+            await adapter.push(stubEvent, { ...makeBatch([op]), historyIncarnation: await readHistoryIncarnation() });
 
-            const result = await adapter.pull(stubEvent, {
+            const result = await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 10,
             });
 
-            expect(result.changes[0]!.payload).toEqual({ id: 't-1', title: 'Hello' });
+            expect(result.changes[0]!.payload).toMatchObject({ id: 't-1', title: 'Hello' });
             expect(result.changes[0]!.stamp.opId).toBe(op.stamp.opId);
         });
     });
@@ -1429,18 +1540,18 @@ describe('SqliteSyncGatewayAdapter', () => {
             } }));
             const deletion = makeOp({ tableName: 'file_meta', pk: hashes[1]!, operation: 'delete',
                 stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } });
-            await adapter.push(stubEvent, { scope, ops: [...ops, deletion], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
+            await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope, ops: [...ops, deletion], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
             const request = { scope, tables: ['file_meta'], pageSize: 1, fileKindCapability: 'v1' as const, workspaceItemCapability: 'v1' as const };
-            const normal = await adapter.snapshot(stubEvent, { ...request, pageSize: 10 });
+            const normal = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...request, pageSize: 10 });
             expect(normal.items).toContainEqual(expect.objectContaining({ kind: 'tombstone', pk: hashes[1] }));
-            const first = await adapter.backupSnapshot(stubEvent, request);
+            const first = await adapter.backupSnapshot(stubEvent, { ...request, historyIncarnation: await readHistoryIncarnation() });
             expect(first.nextPageToken).toBeTruthy();
-            await expect(adapter.snapshot(stubEvent, { ...request, pageToken: first.nextPageToken! })).rejects.toThrow(/mode/i);
-            const syncFirst = await adapter.snapshot(stubEvent, request);
-            await expect(adapter.backupSnapshot(stubEvent, { ...request, pageToken: syncFirst.nextPageToken! })).rejects.toThrow(/mode/i);
-            await adapter.push(stubEvent, { scope, ops: [makeOp({ ...ops[1]!, payload: { ...ops[1]!.payload as object, name: 'later.txt' },
+            await expect(adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: first.nextPageToken! })).rejects.toThrow(/mode/i);
+            const syncFirst = await adapter.snapshot(stubEvent, { ...request, historyIncarnation: await readHistoryIncarnation() });
+            await expect(adapter.backupSnapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: syncFirst.nextPageToken! })).rejects.toThrow(/mode/i);
+            await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope, ops: [makeOp({ ...ops[1]!, payload: { ...ops[1]!.payload as object, name: 'later.txt' },
                 stamp: { clock: 3, hlc: '2025-01-03T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })], fileKindCapability: 'v1', workspaceItemCapability: 'v1' });
-            const next = await adapter.backupSnapshot(stubEvent, { ...request, pageToken: first.nextPageToken! });
+            const next = await adapter.backupSnapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: first.nextPageToken! });
             expect(next.highWatermark).toBe(first.highWatermark);
             expect(next.nextPageToken).toBeNull();
             expect([...first.items, ...next.items]).toEqual([
@@ -1457,7 +1568,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             let pageToken = first.nextPageToken;
 
             while (pageToken) {
-                const page = await adapter.snapshot(stubEvent, {
+                const page = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                     scope: { workspaceId: WORKSPACE_ID },
                     pageSize: 2,
                     pageToken,
@@ -1476,7 +1587,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 pk: 'message-retained',
                 payload: { id: 'message-retained', body: 'still here', deleted: false },
             });
-            await adapter.push(stubEvent, makeBatch([unchanged]));
+            await adapter.push(stubEvent, { ...makeBatch([unchanged]), historyIncarnation: await readHistoryIncarnation() });
 
             const raw = getRawDb();
             raw.prepare('DELETE FROM change_log WHERE workspace_id = ?').run(WORKSPACE_ID);
@@ -1484,7 +1595,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 (raw.prepare('SELECT COUNT(*) AS count FROM change_log').get() as { count: number }).count
             ).toBe(0);
 
-            const page = await adapter.snapshot(stubEvent, {
+            const page = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 pageSize: 10,
             });
@@ -1518,10 +1629,10 @@ describe('SqliteSyncGatewayAdapter', () => {
 
             await adapter.push(
                 stubEvent,
-                makeBatch([threadB, message, project, threadA, deletion])
+                { ...makeBatch([threadB, message, project, threadA, deletion]), historyIncarnation: await readHistoryIncarnation() }
             );
 
-            const first = await adapter.snapshot(stubEvent, {
+            const first = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 pageSize: 2,
             });
@@ -1582,10 +1693,10 @@ describe('SqliteSyncGatewayAdapter', () => {
             });
             await adapter.push(
                 stubEvent,
-                makeBatch([originalThread, originalMessage, originalProject])
+                { ...makeBatch([originalThread, originalMessage, originalProject]), historyIncarnation: await readHistoryIncarnation() }
             );
 
-            const first = await adapter.snapshot(stubEvent, {
+            const first = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 pageSize: 1,
             });
@@ -1621,14 +1732,14 @@ describe('SqliteSyncGatewayAdapter', () => {
             });
             await adapter.push(
                 makeSessionEvent('user-snapshot'),
-                makeBatch([updateThread, newNotification, deleteProject])
+                { ...makeBatch([updateThread, newNotification, deleteProject]), historyIncarnation: await readHistoryIncarnation() }
             );
 
             const pages = [first];
             const items = [...first.items];
             let pageToken = first.nextPageToken;
             while (pageToken) {
-                const page = await adapter.snapshot(stubEvent, {
+                const page = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                     scope: { workspaceId: WORKSPACE_ID },
                     pageSize: 1,
                     pageToken,
@@ -1655,7 +1766,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 revision: { opId: originalThread.stamp.opId },
             });
 
-            const replay = await adapter.pull(makeSessionEvent('user-snapshot'), {
+            const replay = await adapter.pull(makeSessionEvent('user-snapshot'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: first.highWatermark,
                 limit: 10,
@@ -1679,16 +1790,16 @@ describe('SqliteSyncGatewayAdapter', () => {
                 tableName: 'file_meta', pk: hash,
                 payload: { hash, size_bytes: 321, storage_id: 'object-1', name: 'retained.png', mime_type: 'image/png', kind: 'image' },
             });
-            await adapter.push(stubEvent, makeBatch([
+            await adapter.push(stubEvent, { ...makeBatch([
                 metadata(hashes[0]!), metadata(hashes[2]!),
                 makeOp({ tableName: 'messages', pk: 'reference', payload: { id: 'reference', file_hashes: JSON.stringify([hashes[2]]) } }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             const deletion = (hash: string) => makeOp({
                 tableName: 'file_meta', pk: hash, operation: 'delete',
                 stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([deletion(hashes[0]!), deletion(hashes[1]!)]));
-            await adapter.push(stubEvent, { scope: { workspaceId: 'foreign' }, ops: [metadata(hashes[3]!), deletion(hashes[3]!)] });
+            await adapter.push(stubEvent, { ...makeBatch([deletion(hashes[0]!), deletion(hashes[1]!)]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: 'foreign' }, ops: [metadata(hashes[3]!), deletion(hashes[3]!)] });
             await getSqliteDb().deleteFrom('change_log').execute();
             await getSqliteDb().deleteFrom('tombstones').execute();
 
@@ -1711,9 +1822,10 @@ describe('SqliteSyncGatewayAdapter', () => {
         // stored value is malformed and would silently corrupt byte accounting.
         it.each([null, -1, '321', Number.MAX_SAFE_INTEGER + 1])('rejects malformed retained size %s', async (size) => {
             const hash = `sha256:${'a'.repeat(64)}`;
-            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: size } })]));
-            await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
-                stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+            await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: 1 } })]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'file_meta', pk: hash, operation: 'delete',
+                stamp: { clock: 2, hlc: '2025-01-01T00:00:02.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]), historyIncarnation: await readHistoryIncarnation() });
+            getRawDb().prepare("UPDATE s_file_meta SET data_json = json_set(data_json, '$.size_bytes', json(?))").run(JSON.stringify(size));
             await expect(adapter.queryCanonicalStorage(stubEvent, {
                 scope: { workspaceId: WORKSPACE_ID }, kind: 'retained_metadata',
             })).rejects.toThrow('Invalid canonical file size');
@@ -1751,8 +1863,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                     opId: randomUUID(),
                 },
             });
-            await adapter.push(stubEvent, makeBatch([put]));
-            await adapter.push(stubEvent, makeBatch([losingDelete]));
+            await adapter.push(stubEvent, { ...makeBatch([put]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { ...makeBatch([losingDelete]), historyIncarnation: await readHistoryIncarnation() });
             getRawDb().prepare('DELETE FROM change_log WHERE workspace_id = ?').run(WORKSPACE_ID);
 
             const page = await adapter.queryCanonicalStorage(stubEvent, {
@@ -1811,7 +1923,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     payload: { id: 'post-1', ...state, file_hashes: JSON.stringify(hashes.slice(2)), deleted: false },
                 }),
             ]);
-            await adapter.push(stubEvent, { ...batch, workspaceItemCapability: 'v1' });
+            await adapter.push(stubEvent, { historyIncarnation: await readHistoryIncarnation(), ...batch, workspaceItemCapability: 'v1' });
 
             const found: string[] = [];
             let cursor: string | undefined;
@@ -1867,9 +1979,9 @@ describe('SqliteSyncGatewayAdapter', () => {
             // Reservation expiry must not make a consumed original free either.
             it('keeps metadata-only sizes out of another writer\'s upload quota', async () => {
                 const hash = `sha256:${'d'.repeat(64)}`;
-                const result = await adapter.push(makeSessionEvent('writer-a'), makeBatch([makeOp({
+                const result = await adapter.push(makeSessionEvent('writer-a'), { ...makeBatch([makeOp({
                     tableName: 'file_meta', pk: hash, payload: { hash, size_bytes: 1_000_000, storage_id: 'unverified' },
-                })]));
+                })]), historyIncarnation: await readHistoryIncarnation() });
                 expect(result.results[0]).toMatchObject({ success: true });
                 await expect(adapter.reserveUploadIntent(makeSessionEvent('writer-b'), {
                     intentId: 'honest-upload', workspaceId: WORKSPACE_ID, hash: `sha256:${'e'.repeat(64)}`,
@@ -1899,10 +2011,10 @@ describe('SqliteSyncGatewayAdapter', () => {
                     expiresAt: now + 60, workspaceQuotaBytes: 100 };
                 await adapter.reserveUploadIntent(stubEvent, request);
                 await adapter.consumeUploadIntent(stubEvent, { ...request, storageId: 'retained-object' });
-                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
-                    payload: { hash: request.hash, size_bytes: 60, storage_id: 'retained-object' } })]));
-                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
-                    operation: 'delete', stamp: { deviceId: DEVICE_A, opId: randomUUID(), hlc: '2025-01-01T00:00:00.000Z-0001', clock: 2 } })]));
+                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    payload: { hash: request.hash, size_bytes: 60, storage_id: 'retained-object' } })]), historyIncarnation: await readHistoryIncarnation() });
+                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    operation: 'delete', stamp: { deviceId: DEVICE_A, opId: randomUUID(), hlc: '2025-01-01T00:00:00.000Z-0001', clock: 2 } })]), historyIncarnation: await readHistoryIncarnation() });
                 await getSqliteDb().updateTable('upload_intents').set({ expires_at: now - 1 }).where('id', '=', request.intentId).execute();
                 await expect(adapter.reserveUploadIntent(stubEvent, { ...request,
                     intentId: 'over-quota', hash: `sha256:${'f'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
@@ -1913,8 +2025,8 @@ describe('SqliteSyncGatewayAdapter', () => {
 
             it('reserves size increases above retained metadata and keeps duplicate holds charged', async () => {
                 const hash = `sha256:${'a'.repeat(64)}`;
-                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
-                    payload: { hash, size_bytes: 10, storage_id: 'legacy-original' } })]));
+                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'file_meta', pk: hash,
+                    payload: { hash, size_bytes: 10, storage_id: 'legacy-original' } })]), historyIncarnation: await readHistoryIncarnation() });
                 const now = Math.floor(Date.now() / 1000);
                 const request = { intentId: 'larger', workspaceId: WORKSPACE_ID, hash,
                     mimeType: 'image/png', sizeBytes: 60, expiresAt: now + 60, workspaceQuotaBytes: 50 };
@@ -1955,8 +2067,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                 });
                 expect((await pending()).items).toEqual([{ kind: 'reservation', reservationId: 'first', hash: 'a'.repeat(64), sizeBytes: 60, expiresAt: now + 60 }]);
                 await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'second', hash: `sha256:${'b'.repeat(64)}` })).rejects.toMatchObject({ statusCode: 413 });
-                await adapter.push(stubEvent, makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
-                    payload: { hash: request.hash, size_bytes: 60 } })]));
+                await adapter.push(stubEvent, { ...makeBatch([makeOp({ tableName: 'file_meta', pk: request.hash,
+                    payload: { hash: request.hash, size_bytes: 60 } })]), historyIncarnation: await readHistoryIncarnation() });
                 expect((await pending()).items).toEqual([]);
                 await expect(adapter.reserveUploadIntent(stubEvent, { ...request, intentId: 'third', hash: `sha256:${'c'.repeat(64)}`, sizeBytes: 40 })).resolves.toBeUndefined();
             });
@@ -2052,8 +2164,8 @@ describe('SqliteSyncGatewayAdapter', () => {
         const fail = vi.fn();
         let stopFirst: (() => void) | undefined, stopSecond: (() => void) | undefined;
         try {
-            stopFirst = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, version => first.push(version), fail);
-            stopSecond = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, version => second.push(version), fail);
+            stopFirst = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, position => first.push(position.version), fail);
+            stopSecond = await adapter.watchVersion!(stubEvent, { workspaceId: WORKSPACE_ID }, position => second.push(position.version), fail);
             await vi.advanceTimersByTimeAsync(0);
             expect(first).toEqual([0]);
             expect(second).toEqual([0]);
@@ -2082,7 +2194,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             } as unknown as H3Event;
 
             await expect(
-                adapter.pull(scopedEvent, {
+                adapter.pull(scopedEvent, { historyIncarnation: await readHistoryIncarnation(),
                     scope: { workspaceId: 'ws-other' },
                     cursor: 0,
                     limit: 10,
@@ -2100,8 +2212,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                 },
             } as unknown as H3Event;
 
-            await adapter.push(scopedEvent, makeBatch([makeOp({ tableName: 'threads', pk: 't-auth' })]));
-            const result = await adapter.pull(scopedEvent, {
+            await adapter.push(scopedEvent, { ...makeBatch([makeOp({ tableName: 'threads', pk: 't-auth' })]), historyIncarnation: await readHistoryIncarnation() });
+            const result = await adapter.pull(scopedEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 10,
@@ -2115,14 +2227,14 @@ describe('SqliteSyncGatewayAdapter', () => {
     describe('updateCursor', () => {
         it('requires an authenticated device owner', async () => {
             setWorkspaceVersion(1);
-            await expect(adapter.updateCursor(stubEvent, {
+            await expect(adapter.updateCursor(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 1,
             })).rejects.toMatchObject({ statusCode: 401 });
         });
 
         it('creates cursor on first call', async () => {
             setWorkspaceVersion(5);
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_A,
                 version: 5,
@@ -2140,13 +2252,13 @@ describe('SqliteSyncGatewayAdapter', () => {
 
         it('rejects a regressing cursor and preserves the prior value', async () => {
             setWorkspaceVersion(10);
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_A,
                 version: 10,
             });
 
-            await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
+            await expect(adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 5,
             })).rejects.toMatchObject({ statusCode: 409 });
 
@@ -2162,13 +2274,13 @@ describe('SqliteSyncGatewayAdapter', () => {
 
         it('tracks separate cursors per device', async () => {
             setWorkspaceVersion(10);
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_A,
                 version: 10,
             });
 
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_B,
                 version: 5,
@@ -2194,7 +2306,7 @@ describe('SqliteSyncGatewayAdapter', () => {
             'rejects malformed cursor version %s',
             async (version) => {
                 setWorkspaceVersion(10);
-                await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
+                await expect(adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                     scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version,
                 })).rejects.toMatchObject({ statusCode: 400 });
             }
@@ -2202,7 +2314,7 @@ describe('SqliteSyncGatewayAdapter', () => {
 
         it('rejects a cursor beyond the workspace maximum', async () => {
             setWorkspaceVersion(4);
-            await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
+            await expect(adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 5,
             })).rejects.toMatchObject({ statusCode: 400 });
         });
@@ -2212,8 +2324,8 @@ describe('SqliteSyncGatewayAdapter', () => {
             await getSqliteDb().insertInto('server_version_counter').values({ workspace_id: WORKSPACE_ID, value: 5 }).execute();
             await getSqliteDb().insertInto('device_cursors').values({ id: 'legacy', workspace_id: WORKSPACE_ID,
                 device_id: DEVICE_A, owner_user_id: null, last_seen_version: 0, updated_at: 1 }).execute();
-            await adapter.updateCursor(makeSessionEvent('user-b'), { scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 3 });
-            await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-b'), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 3 });
+            await expect(adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 4,
             })).resolves.toBeUndefined();
             const rows = await getSqliteDb().selectFrom('device_cursors').selectAll().where('workspace_id', '=', WORKSPACE_ID).execute();
@@ -2222,34 +2334,56 @@ describe('SqliteSyncGatewayAdapter', () => {
                 expect.objectContaining({ owner_user_id: 'user-b', last_seen_version: 3 }),
             ]));
             expect(rows.find(row => row.id === 'legacy')?.owner_user_id).toBeNull();
-            await expect(adapter.updateCursor(makeSessionEvent('user-b'), {
+            await expect(adapter.updateCursor(makeSessionEvent('user-b'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 2,
             })).rejects.toMatchObject({ statusCode: 409 });
         });
 
         it('rejects a cross-workspace cursor claim', async () => {
             setWorkspaceVersion(5, 'ws-other');
-            await expect(adapter.updateCursor(makeSessionEvent('user-a'), {
+            await expect(adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: 'ws-other' }, deviceId: DEVICE_A, version: 1,
             })).rejects.toMatchObject({ statusCode: 403 });
         });
     });
 
     describe('GC', () => {
+        it.each(['native', 'd1'])('collects only the age-and-ACK eligible version prefix on %s', async driver => {
+            if (driver === 'd1') await useD1TestDatabase();
+            await adapter.push(stubEvent, { ...makeBatch(Array.from({ length: 5 }, (_, i) => makeOp({ tableName: 'threads', pk: `prefix-${i}` }))), historyIncarnation: await readHistoryIncarnation() });
+            const db = getSqliteDb();
+            const collect = () => adapter.gcChangeLog(stubEvent, { scope: { workspaceId: WORKSPACE_ID }, retentionSeconds: 86400 });
+            const versions = async () => (await db.selectFrom('change_log').select('server_version').orderBy('server_version').execute()).map(row => row.server_version);
+            await sql`UPDATE change_log SET created_at = 0 WHERE server_version IN (1, 3, 5)`.execute(db);
+            await collect();
+            expect(await versions()).toEqual([2, 3, 4, 5]);
+            expect(await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 10 }))
+                .toMatchObject({ oldestRetainedVersion: 2, requiresSnapshot: true, nextCursor: 0 });
+            await sql`UPDATE change_log SET created_at = 0 WHERE server_version = 2`.execute(db);
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 2 });
+            await collect();
+            expect(await versions()).toEqual([3, 4, 5]);
+            await sql`DELETE FROM device_cursors`.execute(db);
+            await collect();
+            expect(await versions()).toEqual([4, 5]);
+            expect(await adapter.pull(stubEvent, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 3, limit: 10 }))
+                .toMatchObject({ oldestRetainedVersion: 4, requiresSnapshot: false });
+        });
+
         it('gcChangeLog deletes only old history acknowledged by every device', async () => {
             // Push some ops
             const ops = Array.from({ length: 5 }, (_, i) =>
                 makeOp({ tableName: 'threads', pk: `t-${i}` })
             );
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
 
             // Set device cursors — device A at 3, device B at 5
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_A,
                 version: 3,
             });
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_B,
                 version: 5,
@@ -2272,7 +2406,7 @@ describe('SqliteSyncGatewayAdapter', () => {
 
             expect(remaining.cnt).toBe(2);
 
-            const snapshot = await adapter.snapshot(stubEvent, {
+            const snapshot = await adapter.snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 pageSize: 10,
             });
@@ -2283,9 +2417,9 @@ describe('SqliteSyncGatewayAdapter', () => {
             const ops = Array.from({ length: 3 }, (_, i) =>
                 makeOp({ tableName: 'threads', pk: `t-${i}` })
             );
-            await adapter.push(stubEvent, makeBatch(ops));
+            await adapter.push(stubEvent, { ...makeBatch(ops), historyIncarnation: await readHistoryIncarnation() });
 
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_A,
                 version: 3,
@@ -2306,10 +2440,10 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
 
         it('gcChangeLog collects old history when no active device cursor exists', async () => {
-            await adapter.push(stubEvent, makeBatch([
+            await adapter.push(stubEvent, { ...makeBatch([
                 makeOp({ tableName: 'threads', pk: 'no-cursor-1' }),
                 makeOp({ tableName: 'threads', pk: 'no-cursor-2' }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             const raw = getRawDb();
             raw.prepare('UPDATE change_log SET created_at = 0 WHERE workspace_id = ?').run(WORKSPACE_ID);
 
@@ -2324,11 +2458,11 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
 
         it('expires a stale cursor instead of allowing it to pin old history forever', async () => {
-            await adapter.push(stubEvent, makeBatch([
+            await adapter.push(stubEvent, { ...makeBatch([
                 makeOp({ tableName: 'threads', pk: 'stale-cursor-1' }),
                 makeOp({ tableName: 'threads', pk: 'stale-cursor-2' }),
-            ]));
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            ]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID }, deviceId: DEVICE_A, version: 0,
             });
             const raw = getRawDb();
@@ -2352,7 +2486,7 @@ describe('SqliteSyncGatewayAdapter', () => {
         it('gcTombstones deletes old tombstones acknowledged by every device', async () => {
             // Create a delete to produce a tombstone
             const putOp = makeOp({ tableName: 'threads', pk: 't-1' });
-            await adapter.push(stubEvent, makeBatch([putOp]));
+            await adapter.push(stubEvent, { ...makeBatch([putOp]), historyIncarnation: await readHistoryIncarnation() });
 
             const delOp = makeOp({
                 tableName: 'threads',
@@ -2360,11 +2494,11 @@ describe('SqliteSyncGatewayAdapter', () => {
                 operation: 'delete',
                 stamp: { clock: 2, hlc: '2025-01-01T00:00:01.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() },
             });
-            await adapter.push(stubEvent, makeBatch([delOp]));
+            await adapter.push(stubEvent, { ...makeBatch([delOp]), historyIncarnation: await readHistoryIncarnation() });
 
             // Cursor is ahead and the tombstone is old, so the legacy collector
             // would have deleted it.
-            await adapter.updateCursor(makeSessionEvent('user-a'), {
+            await adapter.updateCursor(makeSessionEvent('user-a'), { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 deviceId: DEVICE_A,
                 version: 2,
@@ -2406,24 +2540,24 @@ describe('SqliteSyncGatewayAdapter', () => {
             if (runtime === 'd1') await useD1TestDatabase();
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');
-            await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'deleted-note' })]));
-            const peer = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 20 });
+            await adapter.push(alice, { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'deleted-note' })]), historyIncarnation: await readHistoryIncarnation() });
+            const peer = await adapter.pull(alice, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 0, limit: 20 });
             expect(peer.changes.map(change => change.pk)).toEqual(['deleted-note']);
-            await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'filtered-note' })]));
+            await adapter.push(bob, { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'filtered-note' })]), historyIncarnation: await readHistoryIncarnation() });
             const deletion = makeOp({ tableName: 'notifications', pk: 'deleted-note', operation: 'delete',
                 payload: { id: 'deleted-note', deleted: true },
                 stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } });
             if (payloadMode === 'absent') delete deletion.payload;
-            const result = await adapter.push(alice, makeBatch([deletion]));
+            const result = await adapter.push(alice, { ...makeBatch([deletion]), historyIncarnation: await readHistoryIncarnation() });
             expect(result.results[0]).toMatchObject({ success: true, applied: true, serverVersion: 3 });
-            const changes = await adapter.pull(alice, { scope: { workspaceId: WORKSPACE_ID }, cursor: peer.nextCursor, limit: 20 });
+            const changes = await adapter.pull(alice, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: peer.nextCursor, limit: 20 });
             expect(changes.changes).toEqual([expect.objectContaining({ tableName: 'notifications', pk: 'deleted-note', op: 'delete',
                 payload: expect.objectContaining({ user_id: 'user-alice' }) })]);
             expect(changes.nextCursor).toBe(3);
-            const foreign = await adapter.pull(bob, { scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 20 });
+            const foreign = await adapter.pull(bob, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, cursor: 2, limit: 20 });
             expect(foreign.changes).toEqual([]);
             expect(foreign.nextCursor).toBe(3);
-            const replay = await adapter.push(alice, makeBatch([deletion]));
+            const replay = await adapter.push(alice, { ...makeBatch([deletion]), historyIncarnation: await readHistoryIncarnation() });
             expect(replay.results[0]).toMatchObject({ success: true, replayed: true, serverVersion: 3 });
             expect(replay.serverVersion).toBe(3);
             // A lost acknowledgement can cross an upgrade. Earlier delete
@@ -2431,10 +2565,10 @@ describe('SqliteSyncGatewayAdapter', () => {
             const query = 'UPDATE change_log SET payload_json = ? WHERE op_id = ?';
             if (runtime === 'd1') await d1TestDatabase!.database.prepare(query).bind(JSON.stringify(deletion.payload) ?? null, deletion.stamp.opId).run();
             else getRawDb().prepare(query).run(JSON.stringify(deletion.payload) ?? null, deletion.stamp.opId);
-            const upgradedReplay = await adapter.push(alice, makeBatch([deletion]));
+            const upgradedReplay = await adapter.push(alice, { ...makeBatch([deletion]), historyIncarnation: await readHistoryIncarnation() });
             expect(upgradedReplay.results[0]).toMatchObject({ success: true, replayed: true, serverVersion: 3 });
             expect(upgradedReplay.serverVersion).toBe(3);
-            const foreignReplay = await adapter.push(bob, makeBatch([deletion]));
+            const foreignReplay = await adapter.push(bob, { ...makeBatch([deletion]), historyIncarnation: await readHistoryIncarnation() });
             expect(foreignReplay.results[0]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
         });
         // A denied concurrent write must neither consume a version nor leave
@@ -2447,30 +2581,30 @@ describe('SqliteSyncGatewayAdapter', () => {
             database.batch = async statements => {
                 if (!raced) {
                     raced = true;
-                    await adapter.push(makeSessionEvent('user-alice'), makeBatch([makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'private' } })]));
+                    await adapter.push(makeSessionEvent('user-alice'), { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'private' } })]), historyIncarnation: await readHistoryIncarnation() });
                 }
                 return batch(statements);
             };
-            const result = await adapter.push(makeSessionEvent('user-bob'), makeBatch([
+            const result = await adapter.push(makeSessionEvent('user-bob'), { ...makeBatch([
                 makeOp({ tableName: 'threads', pk: 'before' }),
                 makeOp({ tableName: 'notifications', pk: 'race', payload: { id: 'race', title: 'stolen' },
                     stamp: { clock: 10, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } }),
                 makeOp({ tableName: 'threads', pk: 'after' }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             expect(result.results[1]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
             expect(result.results[1]).not.toHaveProperty('winner');
             expect(result.results[1]).not.toHaveProperty('payload');
             expect(result.serverVersion).toBe(3);
             expect((await database.prepare('SELECT server_version FROM change_log ORDER BY server_version').all()).results)
                 .toEqual([{ server_version: 1 }, { server_version: 2 }, { server_version: 3 }]);
-            const deleted = await adapter.push(makeSessionEvent('user-bob'), makeBatch([
+            const deleted = await adapter.push(makeSessionEvent('user-bob'), { ...makeBatch([
                 makeOp({ tableName: 'threads', pk: 'after', operation: 'delete',
                     stamp: { clock: 2, hlc: '2025-01-02T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             expect(deleted.serverVersion).toBe(4);
             expect((await database.prepare('SELECT server_version FROM tombstones WHERE pk = ?').bind('after').all()).results)
                 .toEqual([{ server_version: 4 }]);
-            const alice = await adapter.snapshot(makeSessionEvent('user-alice'), { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
+            const alice = await adapter.snapshot(makeSessionEvent('user-alice'), { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
             expect(alice.items).toEqual([expect.objectContaining({ payload: expect.objectContaining({ title: 'private' }) })]);
         });
 
@@ -2480,8 +2614,8 @@ describe('SqliteSyncGatewayAdapter', () => {
             await useD1TestDatabase();
             const actor = makeSessionEvent('user-alice');
             const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
-            await adapter.push(actor, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))));
-            const first = await adapter[method](actor, request);
+            await adapter.push(actor, { ...makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))), historyIncarnation: await readHistoryIncarnation() });
+            const first = await adapter[method](actor, { ...request, historyIncarnation: await readHistoryIncarnation() });
             expect(first.nextPageToken).toBeTruthy();
             const database = d1TestDatabase!.database;
             await database.prepare('UPDATE sync_snapshots SET created_at = 0 WHERE id = ?').bind(first.snapshotId).run();
@@ -2497,7 +2631,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                         bound.all = async <T>() => {
                             if (!raced) {
                                 raced = true;
-                                for (let i = 0; i < 4; i++) await adapter[method](actor, request);
+                                for (let i = 0; i < 4; i++) await adapter[method](actor, { ...request, historyIncarnation: await readHistoryIncarnation() });
                             }
                             return all<T>();
                         };
@@ -2506,7 +2640,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 }
                 return statement;
             };
-            await expect(adapter[method](actor, { ...request, pageToken: first.nextPageToken! }))
+            await expect(adapter[method](actor, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: first.nextPageToken! }))
                 .rejects.toMatchObject({ statusCode: 410 });
             expect(raced).toBe(true);
         });
@@ -2517,23 +2651,23 @@ describe('SqliteSyncGatewayAdapter', () => {
             if (runtime === 'd1') await useD1TestDatabase();
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');
-            await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+            await adapter.push(alice, { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
                 payload: { id: 'owned', title: 'private' },
-                stamp: { clock: 5, hlc: '2025-01-05T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+                stamp: { clock: 5, hlc: '2025-01-05T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]), historyIncarnation: await readHistoryIncarnation() });
             for (const clock of [1, 10]) {
-                const result = await adapter.push(bob, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+                const result = await adapter.push(bob, { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
                     payload: { id: 'owned', title: 'stolen' },
-                    stamp: { clock, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } })]));
+                    stamp: { clock, hlc: '2025-01-10T00:00:00.000Z-0000', deviceId: DEVICE_B, opId: randomUUID() } })]), historyIncarnation: await readHistoryIncarnation() });
                 expect(result.results[0]).toMatchObject({ success: false, errorCode: 'UNAUTHORIZED' });
                 expect(result.results[0]).not.toHaveProperty('winner');
                 expect(result.results[0]).not.toHaveProperty('payload');
                 expect(result.serverVersion).toBe(1);
             }
-            const page = await adapter.snapshot(alice, { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
+            const page = await adapter.snapshot(alice, { historyIncarnation: await readHistoryIncarnation(), scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 10 });
             expect(page.items).toEqual([expect.objectContaining({ payload: expect.objectContaining({ title: 'private', user_id: 'user-alice' }) })]);
-            const ownUpdate = await adapter.push(alice, makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
+            const ownUpdate = await adapter.push(alice, { ...makeBatch([makeOp({ tableName: 'notifications', pk: 'owned',
                 payload: { id: 'owned', title: 'updated' },
-                stamp: { clock: 20, hlc: '2025-01-20T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]));
+                stamp: { clock: 20, hlc: '2025-01-20T00:00:00.000Z-0000', deviceId: DEVICE_A, opId: randomUUID() } })]), historyIncarnation: await readHistoryIncarnation() });
             expect(ownUpdate.results[0]).toMatchObject({ success: true, applied: true });
         });
 
@@ -2541,13 +2675,13 @@ describe('SqliteSyncGatewayAdapter', () => {
             if (runtime === 'd1') await useD1TestDatabase();
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');
-            await adapter.push(alice, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk, payload: { id: pk, title: 'private' } }))));
+            await adapter.push(alice, { ...makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk, payload: { id: pk, title: 'private' } }))), historyIncarnation: await readHistoryIncarnation() });
             for (const method of ['snapshot', 'backupSnapshot'] as const) {
                 const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
-                const first = await adapter[method](alice, request);
+                const first = await adapter[method](alice, { ...request, historyIncarnation: await readHistoryIncarnation() });
                 expect(first.nextPageToken).toBeTruthy();
-                await expect(adapter[method](bob, { ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 403 });
-                const next = await adapter[method](alice, { ...request, pageToken: first.nextPageToken! });
+                await expect(adapter[method](bob, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 403 });
+                const next = await adapter[method](alice, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: first.nextPageToken! });
                 expect(next.items).toEqual([expect.objectContaining({ pk: 'b' })]);
             }
         });
@@ -2558,20 +2692,20 @@ describe('SqliteSyncGatewayAdapter', () => {
             if (runtime === 'd1') await useD1TestDatabase();
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');
-            await adapter.push(alice, makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))));
+            await adapter.push(alice, { ...makeBatch(['a', 'b'].map(pk => makeOp({ tableName: 'notifications', pk }))), historyIncarnation: await readHistoryIncarnation() });
             const request = { scope: { workspaceId: WORKSPACE_ID }, tables: ['notifications'], pageSize: 1 };
-            const first = await adapter.snapshot(alice, request);
-            const bobFirst = await adapter.snapshot(bob, request);
+            const first = await adapter.snapshot(alice, { ...request, historyIncarnation: await readHistoryIncarnation() });
+            const bobFirst = await adapter.snapshot(bob, { ...request, historyIncarnation: await readHistoryIncarnation() });
             let last = first;
-            for (let i = 0; i < 7; i++) last = await adapter[i % 2 ? 'backupSnapshot' : 'snapshot'](alice, request);
+            for (let i = 0; i < 7; i++) last = await adapter[i % 2 ? 'backupSnapshot' : 'snapshot'](alice, { ...request, historyIncarnation: await readHistoryIncarnation() });
             const sql = 'SELECT count(*) AS count FROM sync_snapshots';
             const count = runtime === 'd1'
                 ? (await d1TestDatabase!.database.prepare(sql).all<{ count: number }>()).results![0]!.count
                 : (getRawDb().prepare(sql).get() as { count: number }).count;
             expect(count).toBeLessThanOrEqual(5);
-            await expect(adapter.snapshot(alice, { ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 410 });
+            await expect(adapter.snapshot(alice, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: first.nextPageToken! })).rejects.toMatchObject({ statusCode: 410 });
             expect(last.nextPageToken).toBeTruthy();
-            expect((await adapter.snapshot(alice, { ...request, pageToken: last.nextPageToken! })).items).toHaveLength(1);
+            expect((await adapter.snapshot(alice, { historyIncarnation: await readHistoryIncarnation(), ...request, pageToken: last.nextPageToken! })).items).toHaveLength(1);
             const retainedBob = runtime === 'd1'
                 ? (await d1TestDatabase!.database.prepare('SELECT id FROM sync_snapshots WHERE id = ?').bind(bobFirst.snapshotId).all()).results
                 : getRawDb().prepare('SELECT id FROM sync_snapshots WHERE id = ?').all(bobFirst.snapshotId);
@@ -2608,16 +2742,16 @@ describe('SqliteSyncGatewayAdapter', () => {
                 payload: { id: 'note-spoof', title: 'spoof', user_id: 'user-bob' },
             });
 
-            const alicePush = await adapter.push(alice, makeBatch([aliceNote]));
-            const bobPush = await adapter.push(bob, makeBatch([bobNote]));
-            const spoofPush = await adapter.push(alice, makeBatch([spoofed]));
-            const anonymous = await adapter.push(stubEvent, makeBatch([
+            const alicePush = await adapter.push(alice, { ...makeBatch([aliceNote]), historyIncarnation: await readHistoryIncarnation() });
+            const bobPush = await adapter.push(bob, { ...makeBatch([bobNote]), historyIncarnation: await readHistoryIncarnation() });
+            const spoofPush = await adapter.push(alice, { ...makeBatch([spoofed]), historyIncarnation: await readHistoryIncarnation() });
+            const anonymous = await adapter.push(stubEvent, { ...makeBatch([
                 makeOp({
                     tableName: 'notifications',
                     pk: 'note-anon',
                     payload: { id: 'note-anon', title: 'anon' },
                 }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
 
             expect(alicePush.results[0]?.success).toBe(true);
             expect(bobPush.results[0]?.success).toBe(true);
@@ -2630,12 +2764,12 @@ describe('SqliteSyncGatewayAdapter', () => {
                 errorCode: 'UNAUTHORIZED',
             });
 
-            const alicePull = await adapter.pull(alice, {
+            const alicePull = await adapter.pull(alice, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 50,
             });
-            const bobPull = await adapter.pull(bob, {
+            const bobPull = await adapter.pull(bob, { historyIncarnation: await readHistoryIncarnation(),
                 scope: { workspaceId: WORKSPACE_ID },
                 cursor: 0,
                 limit: 50,
@@ -2651,7 +2785,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                 const items: SnapshotItem[] = [];
                 let pageToken: string | undefined;
                 do {
-                    const page: SnapshotResponse = await adapter.snapshot(event, {
+                    const page: SnapshotResponse = await adapter.snapshot(event, { historyIncarnation: await readHistoryIncarnation(),
                         scope: { workspaceId: WORKSPACE_ID },
                         pageSize: 20,
                         pageToken,
@@ -2669,24 +2803,24 @@ describe('SqliteSyncGatewayAdapter', () => {
         it('rejects deleting another user notification without allocating a version', async () => {
             const alice = makeSessionEvent('user-alice');
             const bob = makeSessionEvent('user-bob');
-            await adapter.push(alice, makeBatch([
+            await adapter.push(alice, { ...makeBatch([
                 makeOp({
                     tableName: 'notifications',
                     pk: 'note-owned',
                     payload: { id: 'note-owned', title: 'mine' },
                 }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             const before = getRawDb()
                 .prepare('SELECT value FROM server_version_counter WHERE workspace_id = ?')
                 .get(WORKSPACE_ID) as { value: number };
 
-            const result = await adapter.push(bob, makeBatch([
+            const result = await adapter.push(bob, { ...makeBatch([
                 makeOp({
                     tableName: 'notifications',
                     pk: 'note-owned',
                     operation: 'delete',
                 }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             expect(result.results[0]).toMatchObject({
                 success: false,
                 errorCode: 'UNAUTHORIZED',
@@ -2712,7 +2846,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     opId,
                 },
             });
-            await adapter.push(stubEvent, makeBatch([original]));
+            await adapter.push(stubEvent, { ...makeBatch([original]), historyIncarnation: await readHistoryIncarnation() });
             const reused = makeOp({
                 tableName: 'threads',
                 pk: 't-fp-other',
@@ -2724,7 +2858,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     opId,
                 },
             });
-            const result = await adapter.push(stubEvent, makeBatch([reused]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([reused]), historyIncarnation: await readHistoryIncarnation() });
             expect(result.results[0]).toMatchObject({
                 success: false,
                 errorCode: 'CONFLICT',
@@ -2746,7 +2880,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     opId: winnerOpId,
                 },
             });
-            await adapter.push(stubEvent, makeBatch([winner]));
+            await adapter.push(stubEvent, { ...makeBatch([winner]), historyIncarnation: await readHistoryIncarnation() });
             const loser = makeOp({
                 tableName: 'threads',
                 pk: 't-lww',
@@ -2758,7 +2892,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     opId: loserOpId,
                 },
             });
-            const result = await adapter.push(stubEvent, makeBatch([loser]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([loser]), historyIncarnation: await readHistoryIncarnation() });
             expect(result.results[0]).toMatchObject({
                 success: true,
                 applied: false,
@@ -2772,10 +2906,10 @@ describe('SqliteSyncGatewayAdapter', () => {
         });
 
         it('rejects a stale put against an orphan tombstone', async () => {
-            await adapter.push(stubEvent, makeBatch([
+            await adapter.push(stubEvent, { ...makeBatch([
                 makeOp({ tableName: 'threads', pk: 't-orphan' }),
-            ]));
-            await adapter.push(stubEvent, makeBatch([
+            ]), historyIncarnation: await readHistoryIncarnation() });
+            await adapter.push(stubEvent, { ...makeBatch([
                 makeOp({
                     tableName: 'threads',
                     pk: 't-orphan',
@@ -2787,7 +2921,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                         opId: randomUUID(),
                     },
                 }),
-            ]));
+            ]), historyIncarnation: await readHistoryIncarnation() });
             getRawDb().prepare('DELETE FROM s_threads WHERE id = ?').run('t-orphan');
             const stale = makeOp({
                 tableName: 'threads',
@@ -2800,7 +2934,7 @@ describe('SqliteSyncGatewayAdapter', () => {
                     opId: randomUUID(),
                 },
             });
-            const result = await adapter.push(stubEvent, makeBatch([stale]));
+            const result = await adapter.push(stubEvent, { ...makeBatch([stale]), historyIncarnation: await readHistoryIncarnation() });
             expect(result.results[0]).toMatchObject({
                 success: true,
                 applied: false,

@@ -1,9 +1,16 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import syncProvenance from './test/fixtures/sync-v1/provenance.json';
 import { verifyDelegationHostFixture } from './test/support/delegation-host-fixture';
 import { hostContractAliases, hostFixtureRoot, verifyHostFixture } from './test/support/host-fixture';
 
 verifyHostFixture();
+for (const file of syncProvenance.files) {
+    const bytes = readFileSync(path.resolve('test/fixtures/sync-v1', file.path));
+    if (createHash('sha256').update(bytes).digest('hex') !== file.sha256) throw new Error(`Sync fixture drift: ${file.path}`);
+}
 // Explicit host lanes use live host bytes; standalone tests use the committed snapshot.
 export function createProviderTestConfig(hostRoot?: string) {
 const host = hostRoot ? path.resolve(hostRoot) : path.resolve('test/fixtures/host-next');
@@ -12,6 +19,10 @@ if (!hostRoot) verifyDelegationHostFixture(host);
 return defineConfig({
     resolve: {
         alias: [
+            { find: /^~~\/shared\/(posts\/workspace-item-capability|files\/file-capability)$/,
+              replacement: path.resolve(hostRoot || 'test/fixtures/sync-v1', 'shared/$1.ts') },
+            { find: /^~~\/shared\/sync\/(prepare-sync-write|schemas|types|table-metadata|local-only-kv)$/,
+              replacement: path.resolve(hostRoot || 'test/fixtures/sync-v1', 'shared/sync/$1.ts') },
             {
                 find: /^#sqlite-runtime\/(.*)$/,
                 replacement: path.resolve(process.env.OR3_SQLITE_ARTIFACT_ROOT || '.',

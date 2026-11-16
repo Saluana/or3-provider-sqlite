@@ -1,3 +1,4 @@
+import { readHistoryIncarnation } from '../server/sync/history-incarnation';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { H3Event } from 'h3';
 import type { Kysely } from 'kysely';
@@ -12,6 +13,8 @@ import * as m002 from '../server/db/migrations/002_sync_tables';
 import * as m003 from '../server/db/migrations/003_sync_hardening';
 import * as m004 from '../server/db/migrations/004_auth_invites';
 import * as m005 from '../server/db/migrations/005_admin_stores';
+import * as m035 from '../server/db/migrations/035_sync_unavailable_records';
+import { validSyncPayload } from '../../../test/support/sync-payload';
 import * as m006 from '../server/db/migrations/006_sync_snapshots';
 import { SqliteSyncGatewayAdapter } from '../server/sync/sqlite-sync-gateway-adapter';
 import { runMigrations } from '../server/db/migrate';
@@ -69,7 +72,7 @@ describe('SQLite sync snapshot migration', () => {
             'threads',
             'thread-live',
             'put',
-            JSON.stringify({ id: 'thread-live', title: 'legacy live' }),
+            JSON.stringify(validSyncPayload('threads','thread-live',{ id: 'thread-live', title: 'legacy live', clock:2 })),
             2,
             'legacy-hlc-live',
             'legacy-device',
@@ -84,7 +87,7 @@ describe('SQLite sync snapshot migration', () => {
         `).run(
             'thread-live',
             WORKSPACE_ID,
-            JSON.stringify({ id: 'thread-live', title: 'legacy live' }),
+            JSON.stringify(validSyncPayload('threads','thread-live',{ id: 'thread-live', title: 'legacy live', clock:2 })),
             2,
             'legacy-hlc-live',
             'legacy-device',
@@ -141,6 +144,7 @@ describe('SQLite sync snapshot migration', () => {
         );
 
         await m006.up(migrationDb);
+        await m035.up(migrationDb);
 
         expect(
             raw.prepare('SELECT op_id FROM s_threads WHERE workspace_id = ?')
@@ -154,7 +158,8 @@ describe('SQLite sync snapshot migration', () => {
             op_id: 'legacy-op-delete',
         });
 
-        const snapshot = await new SqliteSyncGatewayAdapter().snapshot(stubEvent, {
+        await (await import('../server/db/migrations/036_sync_history_incarnation')).up(migrationDb);
+        const snapshot = await new SqliteSyncGatewayAdapter().snapshot(stubEvent, { historyIncarnation: await readHistoryIncarnation(),
             scope: { workspaceId: WORKSPACE_ID },
             pageSize: 10,
         });
