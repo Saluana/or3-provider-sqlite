@@ -24,7 +24,7 @@ let history: string;
 let http: ReturnType<typeof toWebHandler> | undefined;
 async function hostHttp() {
     const host = process.env.OR3_PROJECT_HOST_ROOT!;
-    const mock = (path: string, factory: () => unknown) => vi.doMock(join(host,path),factory);
+    const mock = (path: string, factory: () => Record<string, unknown>) => vi.doMock(join(host,path),factory);
     mock('server/utils/security/cloud-mutation.ts', () => ({requireCloudMutation:()=>{}}));
     mock('server/auth/session.ts', () => ({resolveSessionContext:(request:H3Event)=>{
         const session={authenticated:true,user:{id:'owner'},workspace:{id:scope.workspaceId}};
@@ -115,7 +115,7 @@ describe.each(['native', 'd1', ...(process.env.OR3_PROJECT_HOST_ROOT ? ['host-ht
         const response=await push([op('healthy'),losing]);
         expect(response.results[0]).toMatchObject({success:true});
         expect(response.results[1]).toMatchObject({success:true,applied:false,winner:{kind:'delete',revision:{opId:existing.stamp.opId}}});
-        expect(response.results[1].payload).toBeUndefined();
+        expect(response.results[1]!.payload).toBeUndefined();
     });
     it('holds a replay whose authoritative winner is missing instead of fabricating success', async () => {
         const write = op('lost-winner'); await push([write]);

@@ -308,7 +308,8 @@ describe('SqliteSyncGatewayAdapter', () => {
                     ...Array.from({ length: 140 }, (_, index) => makeOp({ tableName: 'messages', pk: `canonical-${String(index).padStart(3, '0')}`,
                         payload: { id: `canonical-${String(index).padStart(3, '0')}`, thread_id: 'canonical-thread', index: Math.floor(index / 2),
                             ...(index % 2 ? { order_key: 'ordered' } : {}), role: 'assistant', clock: 1, data: { content: `evidence ${index}` } } }))];
-                await reader.push(stubEvent, makeBatch(rows));
+                const artifactHistory = await import('../../../dist/runtime/server/sync/history-incarnation.js');
+                await reader.push(stubEvent, { ...makeBatch(rows), historyIncarnation: await artifactHistory.readHistoryIncarnation() });
                 // Content history is independent from retained replication logs.
                 raw.exec('DELETE FROM change_log');
                 const before = await reader.readChatHistory(actor, { kind: 'thread', thread_id: 'canonical-thread' });
