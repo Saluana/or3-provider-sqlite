@@ -4,6 +4,17 @@ SQLite sync and workspace store provider for OR3 Chat. Provides a lightweight, s
 
 Requires **Node.js 24.22.1 or newer on the 24.x line**, matching OR3 Chat. Development and CI pin **24.22.1** in `.node-version`.
 
+## Release 0.0.31
+
+Requires an OR3 host with the matching sync contracts: [Saluana/or3-chat commit `2f34682144f8cef26f76248cebf2c62f4c1178f8`](https://github.com/Saluana/or3-chat/commit/2f34682144f8cef26f76248cebf2c62f4c1178f8) or a later commit on `or3-cloud` containing those contracts. Upgrade the host and provider together; do not activate this provider on an older host.
+
+- Validates final generic and background writes through the host's `prepareSyncWrite`, preserving atomic row/log writes and replay identity.
+- Retains unavailable-record evidence before advancing pull or snapshot coverage, with bounded inspect/export and validated repair at a fresh winning version. Push containment requires `stored-record-v1` so matching clients hold affected intents recoverably while healthy siblings proceed.
+- Adds persisted history incarnation `v1` fencing for pull, snapshot, push and ACK, and contiguous-prefix log GC. Recovery decisions run before stored payload reads or decode.
+- Adds atomic native migrations and resumable, validated historical migration handling for 034–036 (intent fingerprints, unavailable evidence and history incarnation). Migration 033 guards malformed payloads so their original bytes survive for evidence and repair.
+
+Keep a pre-upgrade database backup. These migrations are forward-only; rollback requires restoring the matching pre-upgrade snapshot. Native SQLite advertises history incarnation; D1 retains its explicit qualification boundary described below.
+
 ## What it provides
 
 - **AuthWorkspaceStore** (`sqlite`) — user identity mapping, workspace CRUD, role resolution
@@ -514,7 +525,7 @@ The existing authorized provider-admin action endpoint supports these workspace-
 - `sync.evidence-revalidate`: `{ id }` checks the retained entry against the current reader contract without mutating its original bytes.
 - `sync.evidence-repair`: `{ id, historyIncarnation, payload, operation?: 'put'|'delete' }` requires an explicit valid replacement. It publishes a fresh UUID, winning clock and server version using the normal writer transaction and atomically records the resolution. Changed canonical revisions are marked superseded; exhausted/untrustworthy clocks require explicit offline recovery, with original evidence retained. Current orphan tombstones can be repaired through the same transaction, with an assertion that no materialized winner appeared concurrently. Repair never replays obsolete evidence over a newer winner.
 
-Provider contract regressions run with `bun run test src/runtime/__tests__/sqlite-sync-hardening.test.ts`. Set `OR3_PROJECT_HOST_ROOT` to test live matched host sources with the ordinary provider config. The separate `test:host-integration` lane intentionally still enforces its older pinned delegation-host provenance; it must be qualified independently. The checked-in `test/fixtures/sync-v1/provenance.json` records the exact reviewed sync-contract bytes used by standalone tests and typechecking.
+Provider contract regressions run with `bun run test src/runtime/__tests__/sqlite-sync-hardening.test.ts`. Set `OR3_PROJECT_HOST_ROOT` to test live matched host sources with the ordinary provider config. The separate `test:host-integration` lane enforces the release's exact pinned host commit and fixture bytes, recorded in `test/fixtures/host-next.json`; it must be qualified independently. The checked-in `test/fixtures/sync-v1/provenance.json` records the exact reviewed sync-contract bytes used by standalone tests and typechecking.
 
 ### History incarnation (matched host contract v1)
 
@@ -530,7 +541,7 @@ The managed image uses the target-owned `/app/scripts/docker/sync-history-reset.
 
 New unavailable evidence deduplicates by `[incarnation, originalRevision]` with provenance in metadata. Legacy evidence remains unknown-origin and exportable. Rotation never resolves evidence. Repair requires both the supplied current identity and the evidence provenance to match; an old reference cannot publish or mark evidence superseded in a new history. D1 implements the runtime fences and passes the SQLite-backed D1 regression lane, but deliberately does **not** advertise history incarnation until its remote/offline lifecycle is separately qualified. Image profile/publication qualification, real managed lifecycle and browser-held-intent acceptance remain integration gates; this source change performs no release or deployment.
 
-Run `bun run test src/runtime/__tests__/sqlite-sync-incarnation.test.ts` for provider P0-5 regressions, and the ordinary full suite plus `type-check:host-contract` with `OR3_PROJECT_HOST_ROOT` pointing to the matched host. Standalone fixture provenance includes the exact H5 working-tree bytes and hashes; the independently pinned delegation fixture is unchanged.
+Run `bun run test src/runtime/__tests__/sqlite-sync-incarnation.test.ts` for provider P0-5 regressions, and the ordinary full suite plus `type-check:host-contract` with `OR3_PROJECT_HOST_ROOT` pointing to the matched host. Standalone sync fixture provenance includes the exact H5 working-tree bytes and hashes; the delegation fixture is refreshed from the release's pinned host commit.
 
 ### Push stored-record containment (`stored-record-v1`)
 
