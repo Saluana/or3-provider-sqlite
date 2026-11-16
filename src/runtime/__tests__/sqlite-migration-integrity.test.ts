@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { H3Event } from 'h3';
 import { sql, Migrator, type Migration, type Kysely } from 'kysely';
 import {
     _resetForTest,
@@ -96,7 +97,7 @@ describe('SQLite migration integrity boundaries', () => {
                 {name:'033_tool_result_operation_ids'},{name:'034_sync_intent_fingerprint'},{name:'035_sync_unavailable_records'},{name:'036_sync_history_incarnation'}]);
             const {SqliteSyncGatewayAdapter} = await import('../server/sync/sqlite-sync-gateway-adapter');
             const {readHistoryIncarnation} = await import('../server/sync/history-incarnation');
-            const page = await new SqliteSyncGatewayAdapter().pull({} as import('h3').H3Event,{scope:{workspaceId:'ws'},cursor:0,limit:10,historyIncarnation:await readHistoryIncarnation()});
+            const page = await new SqliteSyncGatewayAdapter().pull({} as H3Event,{scope:{workspaceId:'ws'},cursor:0,limit:10,historyIncarnation:await readHistoryIncarnation()});
             expect(page).toMatchObject({changes:[],nextCursor:1,unavailable:[{evidenceRef:expect.any(String)}]});
             expect((await sql`SELECT payload_json FROM sync_unavailable_records`.execute(db)).rows).toEqual([{payload_json:'{'}]);
             // The ledger owns no-rerun; do not delete or forge an entry.

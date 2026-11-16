@@ -537,3 +537,14 @@ Run `bun run test src/runtime/__tests__/sqlite-sync-incarnation.test.ts` for pro
 A matched client advertises `storedRecordCapability: 'stored-record-v1'` on push. An unreadable stored receipt, losing winner, missing replay winner or notification owner yields only that operation's `STORED_RECORD_UNAVAILABLE` failure, with `evidenceRef` and a bounded fixed `error` reason. The matching host must hold the exact intent recoverably, retain its evidence link and settle healthy siblings without retrying or counting an outage. Existing `unavailable-v1` is insufficient: older clients already send it without supporting push holds. An affected batch without the new capability receives structured HTTP 426 `OR3_SYNC_UPDATE_REQUIRED` / `requiredCapability: 'stored-record-v1'`.
 
 Stored payload/fingerprint/revision reads are bounded in SQL. Original bad bytes stay in `sync_unavailable_records` independently of source GC; a separate `source='push'` entry retains each rejected intent and its evidence link. Operations rejected during preflight consume no version or receipt. A hold never invents a replacement UUID or reports a successful replay; a D1 fault discovered after its atomic commit retains the uncertain committed intent for recovery. A valid winning write may replace an unreadable older payload only after preserving its original bytes. Database/evidence storage failures remain request failures. Inspect/export uses the existing `sync.evidence-*` admin actions; rejected intent is exportable, and repair must target the original stored evidence rather than replaying an intent entry. The committed sync fixture records the explicit S4 additive contract delta and original source hashes; live-host qualification uses the host's actual shared contract.
+
+### Local migration capacity measurement
+
+A disposable native SQLite qualification on macOS arm64 used 1,000,000 log rows, 200,000 canonical KV rows and 200,000 snapshot items (256-character values; 1% exact legacy tool IDs). Historical schema structure was independently checked against published 0.0.30 source. Seed WAL was checkpointed; ordinary WAL/autocheckpoint settings were retained. External 5 ms sampling measured each candidate's logical files:
+
+| Starting ledger | Pending migrations | Elapsed | Peak WAL | Peak DB + WAL + SHM + journal |
+| --- | --- | ---: | ---: | ---: |
+| 032 | 033–036 | 1.586 s | 180.18 MiB | 1,064.54 MiB |
+| 033 | 034–036 | 0.528 s | 72.44 MiB | 956.80 MiB |
+
+Both runs retained every log/canonical row, finished ledger 36 and invalidated the snapshot items. These sampled local measurements do not qualify production hardware, physical allocated space or remote D1 limits; plan additional space for source/rollback backups. Migration 033 preserves malformed payload bytes for subsequent unavailable-record handling and retains its original deterministic UUID mapping and ledger no-rerun behavior.
