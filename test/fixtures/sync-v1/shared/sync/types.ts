@@ -204,6 +204,7 @@ export interface SnapshotResponse {
  * Batch of operations to push to server
  */
 export interface PushBatch {
+    storedRecordCapability?: 'stored-record-v1';
     /** Batch identity, independent of operation fingerprints. Required by incarnation-v1. */
     historyIncarnation?: string | null;
     historyIncarnationCapability?: 'incarnation-v1';
@@ -217,7 +218,8 @@ export interface PushBatch {
 /**
  * Error codes for sync operations
  */
-export type SyncErrorCode = 
+export type SyncErrorCode =
+    | 'STORED_RECORD_UNAVAILABLE'
     | 'VALIDATION_ERROR'      // Schema validation failed
     | 'UNAUTHORIZED'          // Auth/permission denied
     | 'CONFLICT'              // Optimistic lock conflict
@@ -244,6 +246,7 @@ export interface PushResult {
         serverVersion?: number;
         error?: string;
         errorCode?: SyncErrorCode;
+        evidenceRef?: string;
         tableName?: string;
         operation?: 'put' | 'delete';
         payload?: unknown;

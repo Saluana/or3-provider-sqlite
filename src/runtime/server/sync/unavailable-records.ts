@@ -33,19 +33,27 @@ export type EvidenceSource = {
 };
 /** Original bytes travel only database-to-database, including oversized records. */
 export async function retainSqlEvidence(source: EvidenceSource, reason: string): Promise<string> {
-    const id = randomUUID();
-    await historyBatch([historyAssertion(source.historyIncarnation),{
+    await historyBatch([historyAssertion(source.historyIncarnation), evidenceInsert(source, reason)], source.historyIncarnation);
+    const lookup = evidenceLookup(source);
+    const [retained] = await syncRows<{ id: string }>(lookup.sql, ...lookup.parameters!);
+    if (!retained) throw new Error('Sync evidence source disappeared; coverage was not acknowledged');
+    return retained.id;
+}
+
+/** Shared SQL retention for synchronous native push transactions and D1 batches. */
+export function evidenceInsert(source: EvidenceSource, reason: string): D1SqlStatement {
+    return {
         sql: `INSERT OR IGNORE INTO sync_unavailable_records
             (id, workspace_id, source, locator, revision, payload_json, metadata_json, reason, status, created_at)
             SELECT ?, ?, ?, ?, json_array(?, ${source.revisionSql}), ${source.payload}, json_set(${source.metadata}, '$.historyIncarnation', ?), ?, 'unresolved', unixepoch()
             FROM ${source.table} WHERE ${source.where}`,
-        parameters: [id, source.workspaceId, source.source, source.locator, source.historyIncarnation, source.historyIncarnation, reason, ...source.parameters],
-    }],source.historyIncarnation);
-    const [retained] = await syncRows<{ id: string }>(`SELECT id FROM sync_unavailable_records
+        parameters: [randomUUID(), source.workspaceId, source.source, source.locator, source.historyIncarnation, source.historyIncarnation, reason, ...source.parameters],
+    };
+}
+export function evidenceLookup(source: EvidenceSource): D1SqlStatement {
+    return { sql: `SELECT id FROM sync_unavailable_records
         WHERE workspace_id = ? AND source = ? AND locator = ? AND revision = (SELECT json_array(?, ${source.revisionSql}) FROM ${source.table} WHERE ${source.where})`,
-    source.workspaceId, source.source, source.locator, source.historyIncarnation, ...source.parameters);
-    if (!retained) throw new Error('Sync evidence source disappeared; coverage was not acknowledged');
-    return retained.id;
+    parameters: [source.workspaceId, source.source, source.locator, source.historyIncarnation, ...source.parameters] };
 }
 
 /** Capture unknown notification owners only into privileged evidence, never a workspace marker. */

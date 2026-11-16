@@ -51,10 +51,12 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         expect((await adapter.push(event, { historyIncarnation: await readHistoryIncarnation(), scope, ops: [good] })).results[0]).toMatchObject({ success: true, serverVersion: 1 });
     });
     it('acknowledges a lost ACK from 0.0.30 before new normalization', async () => {
-        const legacy = op('legacy');
+        const legacy = op('legacy',{clock:1,deleted:false});
         await raw.prepare(`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
             VALUES (?, ?, 1, 'kv', ?, 'put', ?, 1, ?, 'test', ?, 1)`).run(randomUUID(),scope.workspaceId,legacy.pk,JSON.stringify(legacy.payload),legacy.stamp.hlc,legacy.stamp.opId);
         await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
+        await raw.prepare('INSERT INTO s_kv (id,workspace_id,data_json,clock,hlc,op_id,deleted,updated_at) VALUES (?,?,?,1,?,?,0,1)')
+            .run(legacy.pk,scope.workspaceId,JSON.stringify(legacy.payload),legacy.stamp.hlc,legacy.stamp.opId);
         expect((await adapter.push(event, { historyIncarnation: await readHistoryIncarnation(), scope, ops: [legacy] })).results[0]).toMatchObject({ success: true, serverVersion: 1 });
     });
     it('preserves exact legacy delete intent on lost-ACK replay', async () => {
@@ -62,6 +64,8 @@ describe.each(['native', 'd1'])('%s matched sync contract', driver => {
         await raw.prepare(`INSERT INTO change_log (id,workspace_id,server_version,table_name,pk,op,payload_json,clock,hlc,device_id,op_id,created_at)
             VALUES (?, ?, 1, 'kv', ?, 'delete', ?, 1, ?, 'test', ?, 1)`).run(randomUUID(),scope.workspaceId,legacy.pk,JSON.stringify(legacy.payload),legacy.stamp.hlc,legacy.stamp.opId);
         await raw.prepare('INSERT INTO server_version_counter VALUES (?,1)').run(scope.workspaceId);
+        await raw.prepare('INSERT INTO s_kv (id,workspace_id,data_json,clock,hlc,op_id,deleted,updated_at) VALUES (?,?,?,1,?,?,1,1)')
+            .run(legacy.pk,scope.workspaceId,JSON.stringify(legacy.payload),legacy.stamp.hlc,legacy.stamp.opId);
         expect((await adapter.push(event,{ historyIncarnation: await readHistoryIncarnation(),scope,ops:[legacy]})).results[0]).toMatchObject({success:true,serverVersion:1});
         const fresh = {...legacy,id:randomUUID(),pk:'fresh',stamp:{...legacy.stamp,opId:randomUUID()}};
         expect((await adapter.push(event,{ historyIncarnation: await readHistoryIncarnation(),scope,ops:[fresh]})).results[0]?.success).toBe(true);

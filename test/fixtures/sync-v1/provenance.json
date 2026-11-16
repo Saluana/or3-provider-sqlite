@@ -39,7 +39,8 @@
     },
     {
       "path": "shared/sync/schemas.ts",
-      "sha256": "02120d62cbe37b35ceb9807f605419dbab6a0ed2cc4aeec582de68fe5d2d5aaf"
+      "sha256": "afab6856161b7ca4afb87f0831dbf1ab03237afddd97d5242b1c9c98f4ea22ef",
+      "source_sha256": "02120d62cbe37b35ceb9807f605419dbab6a0ed2cc4aeec582de68fe5d2d5aaf"
     },
     {
       "path": "shared/sync/table-metadata.ts",
@@ -47,12 +48,14 @@
     },
     {
       "path": "shared/sync/types.ts",
-      "sha256": "6c25487b98e660e51cd0be606c3de27655b50ec40622a9c4d00acaf079723af5"
+      "sha256": "e226d8fc831f7e53f6ef470208093a5d183cefd40ee2e0bbdfc16368c5b6af47",
+      "source_sha256": "6c25487b98e660e51cd0be606c3de27655b50ec40622a9c4d00acaf079723af5"
     },
     {
       "path": "shared/titles/title.ts",
       "sha256": "c4da85b658ccdb48e4f2e629c5f043140d78e50a3996f359738f7505bcf66b77"
     }
   ],
-  "source_working_tree": "H5 incarnation contract, read-only snapshot (uncommitted)"
+  "source_working_tree": "H5 incarnation contract, read-only snapshot (uncommitted)",
+  "s4_contract_delta": "User-approved stored-record-v1 push capability + STORED_RECORD_UNAVAILABLE/evidenceRef; host adoption tracked in impl-S4.md. Original host hashes retained per entry."
 }

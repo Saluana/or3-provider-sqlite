@@ -19,6 +19,8 @@ if (!hostRoot) verifyDelegationHostFixture(host);
 return defineConfig({
     resolve: {
         alias: [
+            { find: /^~~\/shared\/(posts\/workspace-item-capability|files\/file-capability)$/,
+              replacement: path.resolve(hostRoot || 'test/fixtures/sync-v1', 'shared/$1.ts') },
             { find: /^~~\/shared\/sync\/(prepare-sync-write|schemas|types|table-metadata|local-only-kv)$/,
               replacement: path.resolve(hostRoot || 'test/fixtures/sync-v1', 'shared/sync/$1.ts') },
             {

@@ -1,4 +1,4 @@
-import { readHistoryIncarnation, validateExpectedHistory, validHistoryIncarnation, historyChanged, historyAssertion } from './history-incarnation';
+import { readHistoryIncarnation, validateExpectedHistory, validHistoryIncarnation, historyChanged, historyAssertion, historyBatch } from './history-incarnation';
 import { maintainEvidence, repairAssertion, repairResolution, type RepairGuard } from './evidence-maintenance';
 import { SqliteExternalStorageGenerationUploadCoordinator } from '../storage/sqlite-generation-upload-coordinator';
 import { backgroundFinalizationFingerprint, stableJson } from './background-history-fingerprint';
@@ -63,7 +63,7 @@ import { SYNCED_TABLE_MAP, ALLOWED_SYNC_TABLES } from '../db/schema';
 import { emitWebhookSystemHook } from '~~/server/utils/webhooks/runtime';
 import { incomingRevisionWins } from '~~/shared/sync/revision';
 import { sanitizePayloadForSync } from '~~/shared/sync/sanitize';
-import { boundedSyncPayload, boundedSyncMetadata, syncMetadataBytes, SYNC_METADATA_BYTES, notificationOwnerSql, syncRows, retainSqlEvidence, unknownNotificationEvidence, type EvidenceSource } from './unavailable-records';
+import { boundedSyncPayload, boundedSyncMetadata, syncMetadataBytes, SYNC_METADATA_BYTES, notificationOwnerSql, syncRows, retainSqlEvidence, unknownNotificationEvidence, type EvidenceSource, evidenceInsert, evidenceLookup } from './unavailable-records';
 import { MAX_SYNC_SNAPSHOT_TOKEN_LENGTH, SyncChangeSchema, SnapshotItemSchema, TABLE_PAYLOAD_SCHEMAS, isLosslessSyncIdentifier, PullResponseSchema, SnapshotResponseSchema, compareSyncTuple, normalizeWirePayloadForTable } from '~~/shared/sync/schemas';
 import { prepareSyncWrite, nextSyncClock } from '~~/shared/sync/prepare-sync-write';
 import { readRequestUsage } from '~~/shared/chat/compaction';
@@ -377,26 +377,6 @@ function prepareFinalOperation(op: PendingOp): PendingOp {
     return { ...op, ...prepareSyncWrite({ ...op, payload }) };
 }
 
-function changeLogFingerprint(row: {
-    table_name: string;
-    op: string;
-    pk: string;
-    payload_json: string | null;
-    intent_fingerprint?: string | null;
-    clock: number;
-    hlc: string;
-    device_id: string;
-}): string {
-    return stableJson({
-        tableName: row.table_name,
-        operation: row.op,
-        pk: row.pk,
-        payload: fingerprintPayload(row.table_name, row.op, row.payload_json ? JSON.parse(row.payload_json) : undefined),
-        clock: row.clock,
-        hlc: row.hlc,
-        deviceId: row.device_id,
-    });
-}
 
 function notificationPayloadUserId(payload: unknown): string | undefined {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -465,8 +445,10 @@ function workspaceItemCapabilityAssertion(op: PendingOp, workspaceId: string): D
     return {
         sql: `SELECT json_extract('{}', CASE WHEN EXISTS (
             SELECT 1 FROM (
-                SELECT data_json, ${decoded} AS metadata FROM "${SYNCED_TABLE_MAP[op.tableName]}"
-                WHERE workspace_id = ? AND id = ?
+                SELECT data_json, ${decoded} AS metadata FROM (
+                    SELECT CASE WHEN json_valid(data_json) AND length(cast(data_json AS blob)) <= ${MAX_SYNC_PAYLOAD_BYTES} THEN data_json ELSE '{}' END AS data_json
+                    FROM "${SYNCED_TABLE_MAP[op.tableName]}" WHERE workspace_id = ? AND id = ?
+                )
             ) WHERE ${semantics}
         ) THEN '${WORKSPACE_ITEM_UPDATE_REQUIRED}' ELSE '$' END)`,
         parameters: [workspaceId, op.pk],
@@ -855,6 +837,7 @@ type MaterializedWinnerRow = {
     data_json: string;
     deleted: number;
     updated_at: number;
+    payload_bytes?: number;
 };
 
 type TombstoneWinnerRow = {
@@ -864,34 +847,116 @@ type TombstoneWinnerRow = {
     deleted_at: number;
 };
 
+class StoredRecordUnavailable extends Error {
+    constructor(readonly source: Omit<EvidenceSource, 'historyIncarnation'>, readonly reason: string, readonly revision?: {clock:number;hlc:string;opId:string}) {
+        super(reason);
+    }
+}
+function storedCanonicalSource(workspaceId: string, tableName: string, pk: string): Omit<EvidenceSource, 'historyIncarnation'> {
+    // tableName comes from the fixed synced-table allowlist.
+    return { workspaceId, source: 'canonical', locator: JSON.stringify([tableName, pk]),
+        table: SYNCED_TABLE_MAP[tableName]!, where: 'workspace_id=? AND id=?', parameters: [workspaceId, pk],
+        revisionSql: 'json_array(clock,hlc,op_id,deleted)', payload: 'data_json',
+        metadata: `json_object('table_name','${tableName}','pk',id,'clock',clock,'hlc',hlc,'op_id',op_id,'deleted',deleted)` };
+}
+const WINNER_COLUMNS = `${boundedSyncPayload('data_json')} AS data_json,
+    ${['clock','hlc','op_id','deleted','updated_at'].map(c => `${boundedSyncMetadata(c)} AS ${c}`).join(',')},
+    length(cast(data_json AS blob)) AS payload_bytes`;
+const TOMBSTONE_COLUMNS = ['clock','hlc','op_id','deleted_at'].map(c => `${boundedSyncMetadata(c)} AS ${c}`).join(',');
 function materializedWinner(
     row: MaterializedWinnerRow | undefined,
-    tombstone: TombstoneWinnerRow | undefined
+    tombstone: TombstoneWinnerRow | undefined,
+    workspaceId: string, tableName: string, pk: string
 ): PushWinner | undefined {
-    if (
-        tombstone &&
-        (!row || incomingWinsRevision(
-            { clock: tombstone.clock, hlc: tombstone.hlc, opId: tombstone.op_id },
-            row
-        ))
-    ) {
-        return {
-            kind: 'delete',
-            revision: { clock: tombstone.clock, hlc: tombstone.hlc, opId: tombstone.op_id },
-            serverDeletedAt: tombstone.deleted_at,
-        };
+    const source = storedCanonicalSource(workspaceId, tableName, pk);
+    const revisionValid = (value: MaterializedWinnerRow | TombstoneWinnerRow) =>
+        SnapshotItemSchema.safeParse({kind:'tombstone',tableName,pk,
+            revision:{clock:value.clock,hlc:value.hlc,opId:value.op_id},serverDeletedAt:0}).success && Number.isSafeInteger(value.clock);
+    if (row && (!revisionValid(row) || ![0,1].includes(row.deleted))) throw new StoredRecordUnavailable(source, 'invalid_stored_revision');
+    if (tombstone && (!revisionValid(tombstone) || !Number.isSafeInteger(tombstone.deleted_at) || tombstone.deleted_at < 0)) {
+        throw new StoredRecordUnavailable({workspaceId,source:'canonical',locator:JSON.stringify([tableName,pk,'tombstone']),
+            table:'tombstones',where:'workspace_id=? AND table_name=? AND pk=?',parameters:[workspaceId,tableName,pk],
+            revisionSql:'json_array(clock,hlc,op_id)',payload:'NULL',
+            metadata:"json_object('table_name',table_name,'pk',pk,'clock',clock,'hlc',hlc,'op_id',op_id,'deleted_at',deleted_at)"}, 'invalid_stored_revision');
+    }
+    if (tombstone && (!row || incomingWinsRevision({clock:tombstone.clock,hlc:tombstone.hlc,opId:tombstone.op_id},row))) {
+        return {kind:'delete',revision:{clock:tombstone.clock,hlc:tombstone.hlc,opId:tombstone.op_id},serverDeletedAt:tombstone.deleted_at};
     }
     if (!row) return undefined;
-    const revision = { clock: row.clock, hlc: row.hlc, opId: row.op_id };
-    return row.deleted
-        ? {
-              kind: 'delete',
-              revision,
-              serverDeletedAt: tombstone?.op_id === row.op_id
-                  ? tombstone.deleted_at
-                  : row.updated_at,
-          }
-        : { kind: 'put', payload: JSON.parse(row.data_json), revision };
+    const revision = {clock:row.clock,hlc:row.hlc,opId:row.op_id};
+    if (row.deleted) {
+        if (!Number.isSafeInteger(row.updated_at) || row.updated_at < 0) throw new StoredRecordUnavailable(source,'invalid_stored_revision');
+        return {kind:'delete',revision,serverDeletedAt:tombstone?.op_id===row.op_id?tombstone.deleted_at:row.updated_at};
+    }
+    if (row.payload_bytes! > MAX_SYNC_PAYLOAD_BYTES) throw new StoredRecordUnavailable(source, 'payload_oversized', revision);
+    let payload: unknown;
+    try { payload = JSON.parse(row.data_json); }
+    catch { throw new StoredRecordUnavailable(source, 'invalid_json', revision); }
+    if (!validReadPayload(tableName,pk,payload,row.clock,row.hlc)) throw new StoredRecordUnavailable(source,'invalid_stored_payload',revision);
+    return {kind:'put',payload:payload as Record<string,unknown>,revision};
+}
+
+const RECEIPT_COLUMNS = `${boundedSyncMetadata('id')} AS id,op_id,server_version,workspace_id,
+    ${['table_name','pk','op','clock','hlc','device_id'].map(c => `${boundedSyncMetadata(c)} AS ${c}`).join(',')},
+    ${boundedSyncPayload('payload_json')} AS payload_json,length(cast(payload_json AS blob)) AS payload_bytes,
+    ${boundedSyncMetadata('intent_fingerprint')} AS intent_fingerprint,length(cast(intent_fingerprint AS blob)) AS fingerprint_bytes`;
+type StoredReceipt = {id:string;op_id:string;workspace_id:string;server_version:number;payload_bytes:number;fingerprint_bytes:number;table_name:string;pk:string;op:string;payload_json:string|null;intent_fingerprint:string|null;clock:number;hlc:string;device_id:string};
+function storedReceiptSource(row: StoredReceipt): Omit<EvidenceSource,'historyIncarnation'> {
+    return {workspaceId:row.workspace_id,source:'pull',locator:row.id || row.op_id,
+        table:'change_log',where:'op_id=?',parameters:[row.op_id],revisionSql:'cast(server_version AS text)',payload:'payload_json',
+        metadata:"json_object('table_name',table_name,'pk',pk,'op',op,'clock',clock,'hlc',hlc,'device_id',device_id,'op_id',op_id,'server_version',server_version,'intent_fingerprint',intent_fingerprint)"};
+}
+function receiptFingerprint(row: StoredReceipt): string {
+    const source = storedReceiptSource(row);
+    if (row.fingerprint_bytes > SYNC_METADATA_BYTES || row.payload_bytes > MAX_SYNC_PAYLOAD_BYTES) throw new StoredRecordUnavailable(source,'stored_receipt_oversized');
+    // Receipts with persisted fingerprints need no payload normalization, but
+    // a corrupted stored payload still cannot be certified as a successful replay.
+    let payload: unknown;
+    try {
+        payload = row.payload_json != null ? JSON.parse(row.payload_json) : undefined;
+    } catch { throw new StoredRecordUnavailable(source,'invalid_json'); }
+    if (!Number.isSafeInteger(row.server_version) || row.server_version < 1 ||
+        !SyncChangeSchema.safeParse({tableName:row.table_name,pk:row.pk,op:row.op,
+            payload,
+            stamp:{clock:row.clock,hlc:row.hlc,opId:row.op_id,deviceId:row.device_id},serverVersion:row.server_version}).success) {
+        throw new StoredRecordUnavailable(source,'invalid_stored_receipt');
+    }
+    if (row.op === 'put' && !validReadPayload(row.table_name,row.pk,payload,row.clock,row.hlc)) throw new StoredRecordUnavailable(source,'invalid_stored_receipt');
+    return row.intent_fingerprint ?? stableJson({tableName:row.table_name,operation:row.op,pk:row.pk,
+        payload:fingerprintPayload(row.table_name,row.op,payload),clock:row.clock,hlc:row.hlc,deviceId:row.device_id});
+}
+function storedRecordCapability(capability: PushBatch['storedRecordCapability']): void {
+    if (capability !== 'stored-record-v1') throw createError({statusCode:426,statusMessage:'Update OR3 Chat to recover unavailable stored records',
+        data:{code:'OR3_SYNC_UPDATE_REQUIRED',requiredCapability:'stored-record-v1'}});
+}
+function rejectedIntent(op: PendingOp, source: EvidenceSource): D1SqlStatement {
+    const lookup = evidenceLookup(source);
+    return {sql:`INSERT OR IGNORE INTO sync_unavailable_records
+        (id,workspace_id,source,locator,revision,payload_json,metadata_json,reason,status,created_at)
+        SELECT ?,?,'push',?,json_array(?,?),?,json_object('historyIncarnation',?,'evidenceRef',id), 'stored_record_unavailable','unresolved',unixepoch()
+        FROM (${lookup.sql})`, parameters:[uid(),source.workspaceId,op.stamp.opId,source.historyIncarnation,operationFingerprint(op),JSON.stringify(op),source.historyIncarnation,...lookup.parameters!]};
+}
+function unavailableResult(op: PendingOp, error: StoredRecordUnavailable, evidenceRef: string): PushResult['results'][number] {
+    return {opId:op.stamp.opId,success:false,errorCode:'STORED_RECORD_UNAVAILABLE',error:error.reason,evidenceRef};
+}
+function retainPushFailureNative(op: PendingOp, error: StoredRecordUnavailable, input: PushBatch): PushResult['results'][number] {
+    storedRecordCapability(input.storedRecordCapability);
+    const source = {...error.source,historyIncarnation:input.historyIncarnation as string};
+    const raw = getRawDb();
+    for (const statement of [evidenceInsert(source,error.reason),rejectedIntent(op,source)]) raw.prepare(statement.sql).run(...statement.parameters!);
+    const lookup = evidenceLookup(source);
+    const row = raw.prepare(lookup.sql).get(...lookup.parameters!) as {id:string}|undefined;
+    if (!row) throw new Error('Push evidence source disappeared');
+    return unavailableResult(op,error,row.id);
+}
+async function retainPushFailureD1(op: PendingOp, error: StoredRecordUnavailable, historyIncarnation: string, capability: PushBatch['storedRecordCapability']): Promise<PushResult['results'][number]> {
+    storedRecordCapability(capability);
+    const source = {...error.source,historyIncarnation};
+    await historyBatch([historyAssertion(historyIncarnation),evidenceInsert(source,error.reason),rejectedIntent(op,source)],historyIncarnation);
+    const lookup = evidenceLookup(source);
+    const [row] = await d1All<{id:string}>(lookup.sql,...lookup.parameters!);
+    if (!row) throw new Error('Push evidence source disappeared');
+    return unavailableResult(op,error,row.id);
 }
 
 function currentWinnerNative(
@@ -903,14 +968,14 @@ function currentWinnerNative(
     const materializedTable = SYNCED_TABLE_MAP[tableName];
     if (!materializedTable) return undefined;
     const row = raw.prepare(
-        `SELECT data_json, deleted, clock, hlc, op_id, updated_at
+        `SELECT ${WINNER_COLUMNS}
          FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
     ).get(pk, workspaceId) as MaterializedWinnerRow | undefined;
     const tombstone = raw.prepare(
-        `SELECT clock, hlc, op_id, deleted_at FROM tombstones
+        `SELECT ${TOMBSTONE_COLUMNS} FROM tombstones
          WHERE workspace_id = ? AND table_name = ? AND pk = ?`
     ).get(workspaceId, tableName, pk) as TombstoneWinnerRow | undefined;
-    return materializedWinner(row, tombstone);
+    return materializedWinner(row, tombstone, workspaceId, tableName, pk);
 }
 
 async function currentWinnerD1(
@@ -922,22 +987,22 @@ async function currentWinnerD1(
     const materializedTable = SYNCED_TABLE_MAP[tableName];
     if (!materializedTable) return undefined;
     const [row] = await d1All<MaterializedWinnerRow>(
-        `SELECT data_json, deleted, clock, hlc, op_id, updated_at
+        `SELECT ${WINNER_COLUMNS}
          FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
         pk,
         workspaceId
     );
-    if (tableName === 'notifications' && row && notificationPayloadUserId(JSON.parse(row.data_json)) !== userId) {
-        return undefined;
-    }
+
     const [tombstone] = await d1All<TombstoneWinnerRow>(
-        `SELECT clock, hlc, op_id, deleted_at FROM tombstones
+        `SELECT ${TOMBSTONE_COLUMNS} FROM tombstones
          WHERE workspace_id = ? AND table_name = ? AND pk = ?`,
         workspaceId,
         tableName,
         pk
     );
-    return materializedWinner(row, tombstone);
+    const winner = materializedWinner(row,tombstone,workspaceId,tableName,pk);
+    if (tableName === 'notifications' && winner?.kind === 'put' && notificationPayloadUserId(winner.payload) !== userId) return undefined;
+    return winner;
 }
 
 export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
@@ -1995,6 +2060,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 indicesByOpId,
                 userId,
                 workspaceItemCapability: input.workspaceItemCapability,
+                storedRecordCapability: input.storedRecordCapability,
                 historyIncarnation,
                 repair,
             });
@@ -2018,76 +2084,53 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 const assertion = repairAssertion(repair);
                 raw.prepare(assertion.sql).get(...assertion.parameters ?? []);
             }
+            const existingOps = new Map<string, StoredReceipt & {fingerprint:string}>();
+            const failedBeforeAlloc = new Set<string>();
+            for (const op of uniqueOps) {
+                try {
+                    const receipt = raw.prepare(`SELECT ${RECEIPT_COLUMNS} FROM change_log WHERE op_id=?`).get(op.stamp.opId) as StoredReceipt|undefined;
+                    if (receipt) {
+                        const fingerprint = receipt.workspace_id === workspaceId ? receiptFingerprint(receipt) : '';
+                        existingOps.set(op.stamp.opId,{...receipt,fingerprint});
+                        if (receipt.workspace_id !== workspaceId) continue;
+                    }
+                    if (receipt && existingOps.get(op.stamp.opId)!.fingerprint !== operationFingerprint(op)) continue;
+                    if (!repair && !currentWinnerNative(raw,workspaceId,op.tableName,op.pk) && receipt) throw new StoredRecordUnavailable(storedReceiptSource(receipt),'stored_winner_missing');
+                } catch (error) {
+                    if (!(error instanceof StoredRecordUnavailable)) throw error;
+                    if (error.revision && op.tableName !== 'notifications' && incomingWinsRevision(op.stamp,error.revision)) {
+                        const statement = evidenceInsert({...error.source,historyIncarnation},error.reason);
+                        raw.prepare(statement.sql).run(...statement.parameters!);
+                        continue;
+                    }
+                    uniqueResults.push(retainPushFailureNative(op,error,input)); failedBeforeAlloc.add(op.stamp.opId);
+                }
+            }
             // Admission observes canonical state under the same write lock as LWW.
             if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
                 for (const op of uniqueOps) {
+                    if (failedBeforeAlloc.has(op.stamp.opId)) continue;
                     const table = SYNCED_TABLE_MAP[op.tableName];
                     if (!table || !['posts', 'projects'].includes(op.tableName)) continue;
-                    const canonical = raw.prepare('SELECT data_json FROM ' + table + ' WHERE id = ? AND workspace_id = ?')
+                    const canonical = raw.prepare(`SELECT CASE WHEN json_valid(data_json) THEN ${boundedSyncPayload('data_json')} END AS data_json FROM ${table} WHERE id = ? AND workspace_id = ?`)
                         .get(op.pk, workspaceId) as { data_json: string } | undefined;
                     if (hasWorkspaceItemSemantics(op.tableName, op.payload)
-                        || hasWorkspaceItemSemantics(op.tableName, canonical ? JSON.parse(canonical.data_json) : undefined)) {
+                        || hasWorkspaceItemSemantics(op.tableName, canonical?.data_json ? JSON.parse(canonical.data_json) : undefined)) {
                         throw workspaceItemUpdateRequired();
                     }
                 }
             }
-            // Check for existing op_ids (idempotency)
-            const opIds = uniqueOps.map((o) => o.stamp.opId);
-            const existingOps = new Map<string, {
-                server_version: number;
-                workspace_id: string;
-                fingerprint: string;
-                op_id: string;
-            }>();
-
-            // Query in chunks to avoid SQLite variable limits
-            const chunkSize = 500;
-            for (let i = 0; i < opIds.length; i += chunkSize) {
-                const chunk = opIds.slice(i, i + chunkSize);
-                const placeholders = chunk.map(() => '?').join(',');
-                const rows = raw
-                    .prepare(
-                        `SELECT op_id, server_version, workspace_id, table_name, pk, op,
-                                payload_json, clock, hlc, device_id, intent_fingerprint
-                         FROM change_log WHERE op_id IN (${placeholders})`
-                    )
-                    .all(...chunk) as Array<{
-                        op_id: string;
-                        server_version: number;
-                        workspace_id: string;
-                        table_name: string;
-                        pk: string;
-                        op: string;
-                        payload_json: string | null;
-                        intent_fingerprint?: string | null;
-                        clock: number;
-                        hlc: string;
-                        device_id: string;
-                    }>;
-
-                for (const row of rows) {
-                    existingOps.set(row.op_id, {
-                        server_version: row.server_version,
-                        workspace_id: row.workspace_id,
-                        fingerprint: row.intent_fingerprint ?? changeLogFingerprint(row),
-                        op_id: row.op_id,
-                    });
-                }
-            }
-
-            const failedBeforeAlloc = new Set<string>();
             for (const op of uniqueOps) {
+                if (failedBeforeAlloc.has(op.stamp.opId)) continue;
                 if (op.tableName !== 'notifications') continue;
                 const materializedTable = SYNCED_TABLE_MAP[op.tableName];
                 if (!materializedTable) continue;
                 const owned = raw
                     .prepare(
-                        `SELECT data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+                        `SELECT ${notificationOwnerSql('data_json')} AS owner FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
                     )
-                    .get(op.pk, workspaceId) as { data_json: string } | undefined;
-                const owner = owned
-                    ? notificationPayloadUserId(JSON.parse(owned.data_json))
-                    : undefined;
+                    .get(op.pk, workspaceId) as { owner: string | null } | undefined;
+                const owner = owned?.owner;
                 if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                     failedBeforeAlloc.add(op.stamp.opId);
                     uniqueResults.push({
@@ -2217,26 +2260,6 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
                 const pkValue = op.pk;
 
-                if (op.tableName === 'notifications' && op.operation === 'delete') {
-                    const owned = raw
-                        .prepare(
-                            `SELECT data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
-                        )
-                        .get(pkValue, workspaceId) as { data_json: string } | undefined;
-                    const owner = owned
-                        ? notificationPayloadUserId(JSON.parse(owned.data_json))
-                        : undefined;
-                    if (!owned || owner !== userId) {
-                        uniqueResults.push({
-                            opId,
-                            success: false,
-                            error: 'Forbidden: notification owner mismatch',
-                            errorCode: 'UNAUTHORIZED',
-                        });
-                        continue;
-                    }
-                }
-
                 // Write change_log
                 const payloadJson =
                     op.payload != null ? JSON.stringify(op.payload) : null;
@@ -2269,10 +2292,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 if (op.operation === 'put') {
                     const existing = raw
                         .prepare(
-                            `SELECT clock, hlc, op_id, data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+                            `SELECT clock, hlc, op_id, deleted, ${boundedSyncPayload('data_json')} AS data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
                         )
                         .get(pkValue, workspaceId) as
-                        | { clock: number; hlc: string; op_id: string; data_json: string }
+                        | { clock: number; hlc: string; op_id: string; data_json: string; deleted: number }
                         | undefined;
                     const tombstone = !existing
                         ? raw.prepare(
@@ -2322,7 +2345,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         );
                         applied = true;
                     } else {
-                        winnerPayload = JSON.parse(existing.data_json);
+                        winnerPayload = existing.deleted ? undefined : JSON.parse(existing.data_json);
                     }
 
                     const emission = resolveHookEmission({
@@ -2349,10 +2372,10 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                 } else if (op.operation === 'delete') {
                     const existing = raw
                         .prepare(
-                            `SELECT clock, hlc, op_id, data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
+                            `SELECT clock, hlc, op_id, deleted, ${boundedSyncPayload('data_json')} AS data_json FROM ${materializedTable} WHERE id = ? AND workspace_id = ?`
                         )
                         .get(pkValue, workspaceId) as
-                        | { clock: number; hlc: string; op_id: string; data_json: string }
+                        | { clock: number; hlc: string; op_id: string; data_json: string; deleted: number }
                         | undefined;
                     let applied = false;
 
@@ -2429,7 +2452,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         applied,
                         ...(applied || !existing
                             ? {}
-                            : { payload: JSON.parse(existing.data_json) }),
+                            : { payload: existing.deleted ? undefined : JSON.parse(existing.data_json) }),
                         ...(applied ? {} : {
                             winner: currentWinnerNative(raw, workspaceId, op.tableName, pkValue),
                         }),
@@ -3363,49 +3386,37 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         indicesByOpId: Map<string, number[]>;
         userId: string | undefined;
         workspaceItemCapability: PushBatch['workspaceItemCapability'];
+        storedRecordCapability: PushBatch['storedRecordCapability'];
         historyIncarnation: string;
         repair?: RepairGuard;
     }): Promise<PushResult> {
         const { workspaceId, uniqueOps, resultSlots, indicesByOpId, userId, historyIncarnation } = input;
-        const existingOps = new Map<string, {
-            server_version: number;
-            workspace_id: string;
-            fingerprint: string;
-        }>();
-        const opIds = uniqueOps.map((op) => op.stamp.opId);
-        for (let offset = 0; offset < opIds.length; offset += 500) {
-            const chunk = opIds.slice(offset, offset + 500);
-            if (chunk.length === 0) continue;
-            const placeholders = chunk.map(() => '?').join(',');
-            const rows = await d1All<{
-                op_id: string;
-                server_version: number;
-                workspace_id: string;
-                table_name: string;
-                pk: string;
-                op: string;
-                payload_json: string | null;
-                intent_fingerprint?: string | null;
-                clock: number;
-                hlc: string;
-                device_id: string;
-            }>(
-                `SELECT op_id, server_version, workspace_id, table_name, pk, op,
-                        payload_json, clock, hlc, device_id, intent_fingerprint
-                 FROM change_log WHERE op_id IN (${placeholders})`,
-                ...chunk
-            );
-            for (const row of rows) {
-                existingOps.set(row.op_id, {
-                    server_version: row.server_version,
-                    workspace_id: row.workspace_id,
-                    fingerprint: row.intent_fingerprint ?? changeLogFingerprint(row),
-                });
-            }
-        }
-
+        const originalOps = new Map(uniqueOps.map(op => [op.stamp.opId,{...op}]));
+        const existingOps = new Map<string, StoredReceipt & {fingerprint:string}>();
         const rejected = new Set<string>();
         for (const op of uniqueOps) {
+            try {
+                const [receipt] = await d1All<StoredReceipt>(`SELECT ${RECEIPT_COLUMNS} FROM change_log WHERE op_id=?`,op.stamp.opId);
+                if (receipt) {
+                    const fingerprint = receipt.workspace_id === workspaceId ? receiptFingerprint(receipt) : '';
+                    existingOps.set(op.stamp.opId,{...receipt,fingerprint});
+                    if (receipt.workspace_id !== workspaceId) continue;
+                }
+                if (receipt && existingOps.get(op.stamp.opId)!.fingerprint !== operationFingerprint(op)) continue;
+                if (!input.repair && !await currentWinnerD1(workspaceId,op.tableName,op.pk,userId) && receipt && op.tableName !== 'notifications') throw new StoredRecordUnavailable(storedReceiptSource(receipt),'stored_winner_missing');
+            } catch (error) {
+                if (!(error instanceof StoredRecordUnavailable)) throw error;
+                if (error.revision && op.tableName !== 'notifications' && incomingWinsRevision(op.stamp,error.revision)) {
+                    await historyBatch([historyAssertion(historyIncarnation),evidenceInsert({...error.source,historyIncarnation},error.reason)],historyIncarnation);
+                    continue;
+                }
+                const result = await retainPushFailureD1(originalOps.get(op.stamp.opId)!,error,historyIncarnation,input.storedRecordCapability);
+                rejected.add(op.stamp.opId);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = result;
+            }
+        }
+        for (const op of uniqueOps) {
+            if (rejected.has(op.stamp.opId)) continue;
             const existing = existingOps.get(op.stamp.opId);
             if (!existing) continue;
             if (
@@ -3429,14 +3440,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (rejected.has(op.stamp.opId)) continue;
             const materializedTable = SYNCED_TABLE_MAP[op.tableName];
             if (!materializedTable) continue;
-            const [owned] = await d1All<{ data_json: string }>(
-                `SELECT data_json FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
+            const [owned] = await d1All<{ owner: string | null }>(
+                `SELECT ${notificationOwnerSql('data_json')} AS owner FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
                 op.pk,
                 workspaceId
             );
-            const owner = owned
-                ? notificationPayloadUserId(JSON.parse(owned.data_json))
-                : undefined;
+            const owner = owned?.owner;
+            if (owned && !owner) {
+                const result = await retainPushFailureD1(originalOps.get(op.stamp.opId)!,new StoredRecordUnavailable(storedCanonicalSource(workspaceId,op.tableName,op.pk),'notification_owner_unavailable'),historyIncarnation,input.storedRecordCapability);
+                rejected.add(op.stamp.opId);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = result;
+                continue;
+            }
             if ((owned && owner !== userId) || (!owned && op.operation === 'delete')) {
                 rejected.add(op.stamp.opId);
                 for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
@@ -3524,7 +3539,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         if (input.repair) statements.push(repairAssertion(input.repair));
         if (input.workspaceItemCapability !== WORKSPACE_ITEM_CAPABILITY) {
             for (const op of uniqueOps) {
-                if (!['posts', 'projects'].includes(op.tableName)) continue;
+                if (rejected.has(op.stamp.opId) || !['posts', 'projects'].includes(op.tableName)) continue;
                 if (hasWorkspaceItemSemantics(op.tableName, op.payload)) {
                     throw workspaceItemUpdateRequired();
                 }
@@ -3571,7 +3586,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 ${op.tableName === 'notifications' ? `WHERE NOT EXISTS (
                     SELECT 1 FROM s_notifications WHERE id = ? AND workspace_id = ?
-                    AND json_extract(data_json, '$.user_id') IS NOT ?
+                    AND ${notificationOwnerSql('data_json')} IS NOT ?
                 )` : ''}`,
                 parameters: [
                     uid(),
@@ -3617,7 +3632,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         deleted = 0,
                         updated_at = excluded.updated_at
                     WHERE ${lwwExcludedWins(`"${materializedTable}"`)}
-                    ${op.tableName === 'notifications' ? `AND json_extract("${materializedTable}".data_json, '$.user_id') = json_extract(excluded.data_json, '$.user_id')` : ''}`,
+                    ${op.tableName === 'notifications' ? `AND ${notificationOwnerSql(`"${materializedTable}".data_json`)} = json_extract(excluded.data_json, '$.user_id')` : ''}`,
                     parameters: [
                         op.pk,
                         workspaceId,
@@ -3643,7 +3658,8 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op_id = excluded.op_id,
                         deleted = 1,
                         updated_at = excluded.updated_at
-                    WHERE ${lwwExcludedWins(`"${materializedTable}"`)}`,
+                    WHERE ${lwwExcludedWins(`"${materializedTable}"`)}
+                    ${op.tableName === 'notifications' ? 'AND EXISTS (SELECT 1 FROM change_log WHERE op_id=?)' : ''}`,
                     parameters: [
                         op.pk,
                         workspaceId,
@@ -3653,17 +3669,18 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op.stamp.opId,
                         now,
                         now,
+                        ...(op.tableName === 'notifications' ? [op.stamp.opId] : []),
                     ],
                 });
                 statements.push({
                     sql: `INSERT INTO tombstones (
                         id, workspace_id, table_name, pk, deleted_at, clock,
                         hlc, op_id, server_version, created_at
-                    ) VALUES (
+                    ) SELECT
                         ?, ?, ?, ?, ?, ?, ?, ?,
                         (SELECT value FROM server_version_counter WHERE workspace_id = ?),
                         ?
-                    )
+                    WHERE ${op.tableName === 'notifications' ? 'EXISTS (SELECT 1 FROM change_log WHERE op_id=?)' : '1'}
                     ON CONFLICT(workspace_id, table_name, pk) DO UPDATE SET
                         deleted_at = excluded.deleted_at,
                         clock = excluded.clock,
@@ -3682,6 +3699,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         op.stamp.opId,
                         workspaceId,
                         now,
+                        ...(op.tableName === 'notifications' ? [op.stamp.opId] : []),
                     ],
                 });
             }
@@ -3724,6 +3742,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             );
             finalServerVersion = counter?.value ?? 0;
         }
+        const opIds = uniqueOps.filter(op => !rejected.has(op.stamp.opId)).map(op => op.stamp.opId);
         const resolvedOps = new Map<string, number>();
         for (let offset = 0; offset < opIds.length; offset += 500) {
             const chunk = opIds.slice(offset, offset + 500);
@@ -3739,81 +3758,75 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const emissions: HookEmission[] = [];
         for (const op of uniqueOps) {
             if (rejected.has(op.stamp.opId)) continue;
-            if (op.tableName === 'notifications') {
-                const [owned] = await d1All<{ data_json: string }>(
-                    'SELECT data_json FROM s_notifications WHERE id = ? AND workspace_id = ?', op.pk, workspaceId
-                );
-                if (owned && notificationPayloadUserId(JSON.parse(owned.data_json)) !== userId) {
+            try {
+                const winner = await currentWinnerD1(workspaceId,op.tableName,op.pk,userId);
+                if (op.tableName === 'notifications') {
+                    const [owned] = await d1All<{ owner: string | null }>(
+                        `SELECT ${notificationOwnerSql('data_json')} AS owner FROM s_notifications WHERE id = ? AND workspace_id = ?`, op.pk, workspaceId
+                    );
+                    if (owned && !owned.owner) throw new StoredRecordUnavailable(storedCanonicalSource(workspaceId,op.tableName,op.pk),'notification_owner_unavailable');
+                    if (owned && owned.owner !== userId) {
+                        for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
+                            resultSlots[index] = { opId: op.stamp.opId, success: false, error: 'Forbidden: notification owner mismatch', errorCode: 'UNAUTHORIZED' };
+                        }
+                        continue;
+                    }
+                }
+                const existing = existingOps.get(op.stamp.opId);
+                if (existing) {
+                    if (!winner) throw new StoredRecordUnavailable(storedReceiptSource(existing),'stored_winner_missing');
+                    const applied = winner?.revision.opId === op.stamp.opId;
+                    const result: PushResult['results'][number] = {
+                        opId: op.stamp.opId,
+                        success: true,
+                        serverVersion: existing.server_version,
+                        replayed: true,
+                        applied,
+                        ...(applied ? {} : { winner }),
+                    };
                     for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
-                        resultSlots[index] = { opId: op.stamp.opId, success: false, error: 'Forbidden: notification owner mismatch', errorCode: 'UNAUTHORIZED' };
+                        resultSlots[index] = result;
                     }
                     continue;
                 }
-            }
-            const existing = existingOps.get(op.stamp.opId);
-            if (existing) {
-                const winner = await currentWinnerD1(workspaceId, op.tableName, op.pk, userId);
-                const applied = winner?.revision.opId === op.stamp.opId;
+                const serverVersion = resolvedOps.get(op.stamp.opId);
+                if (serverVersion === undefined) {
+                    throw new Error(`D1 failed to resolve sync operation ${op.stamp.opId}.`);
+                }
+                const skipApply = skipMaterialize.has(op.stamp.opId);
+                const materializedResult = batchResults[materializedStatementIndex.get(op.stamp.opId) ?? -1];
+                const applied = !skipApply && (materializedResult?.meta?.changes ?? 0) > 0;
+                const winnerPayload = winner?.kind === 'put' ? winner.payload : undefined;
                 const result: PushResult['results'][number] = {
                     opId: op.stamp.opId,
                     success: true,
-                    serverVersion: existing.server_version,
-                    replayed: true,
+                    serverVersion,
                     applied,
-                    ...(applied ? {} : { winner }),
+                    ...(applied ? {} : { payload: winnerPayload }),
+                    ...(applied ? {} : {
+                        winner,
+                    }),
                 };
                 for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
                     resultSlots[index] = result;
                 }
-                continue;
-            }
-            const serverVersion = resolvedOps.get(op.stamp.opId);
-            if (serverVersion === undefined) {
-                throw new Error(`D1 failed to resolve sync operation ${op.stamp.opId}.`);
-            }
-            const skipApply = skipMaterialize.has(op.stamp.opId);
-            const materializedResult = batchResults[materializedStatementIndex.get(op.stamp.opId) ?? -1];
-            const applied = !skipApply && (materializedResult?.meta?.changes ?? 0) > 0;
-            let winnerPayload: unknown;
-            if (!applied && !skipApply) {
-                const materializedTable = SYNCED_TABLE_MAP[op.tableName];
-                if (materializedTable) {
-                    const [winner] = await d1All<{ data_json: string }>(
-                        `SELECT data_json FROM "${materializedTable}" WHERE id = ? AND workspace_id = ?`,
-                        op.pk,
-                        workspaceId
-                    );
-                    if (winner?.data_json) {
-                        const payload = JSON.parse(winner.data_json);
-                        if (op.tableName !== 'notifications' || notificationPayloadUserId(payload) === userId) winnerPayload = payload;
-                    }
-                }
-            }
-            const result: PushResult['results'][number] = {
-                opId: op.stamp.opId,
-                success: true,
-                serverVersion,
-                applied,
-                ...(applied ? {} : { payload: winnerPayload }),
-                ...(applied ? {} : {
-                    winner: await currentWinnerD1(workspaceId, op.tableName, op.pk, userId),
-                }),
-            };
-            for (const index of indicesByOpId.get(op.stamp.opId) ?? []) {
-                resultSlots[index] = result;
-            }
 
-            if (applied) {
-                const emission = resolveHookEmission({
-                    op,
-                    workspaceId,
-                    now,
-                    userId,
-                    wasExisting:
-                        materializedWasExisting.get(op.stamp.opId) ?? false,
-                    applied: true,
-                });
-                if (emission) emissions.push(emission);
+                if (applied) {
+                    const emission = resolveHookEmission({
+                        op,
+                        workspaceId,
+                        now,
+                        userId,
+                        wasExisting:
+                            materializedWasExisting.get(op.stamp.opId) ?? false,
+                        applied: true,
+                    });
+                    if (emission) emissions.push(emission);
+                }
+            } catch (error) {
+                if (!(error instanceof StoredRecordUnavailable)) throw error;
+                const result = await retainPushFailureD1(originalOps.get(op.stamp.opId)!,error,historyIncarnation,input.storedRecordCapability);
+                for (const index of indicesByOpId.get(op.stamp.opId) ?? []) resultSlots[index] = result;
             }
         }
 
