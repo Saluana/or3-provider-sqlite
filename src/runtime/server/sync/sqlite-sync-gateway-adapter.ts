@@ -1,3 +1,4 @@
+import { EXPLORER_CAPABILITY, explorerMutationIdentity, explorerIdentityMatches, hasExplorerSemantics } from './explorer-contract';
 import { readHistoryIncarnation, validateExpectedHistory, validHistoryIncarnation, historyChanged, historyAssertion, historyBatch } from './history-incarnation';
 import { maintainEvidence, repairAssertion, repairResolution, type RepairGuard } from './evidence-maintenance';
 import { SqliteExternalStorageGenerationUploadCoordinator } from '../storage/sqlite-generation-upload-coordinator';
@@ -72,6 +73,8 @@ import { validateCanonicalChatQuery, encodeCanonicalChatSeek, parseCanonicalChat
 import type { CanonicalHistoryRecord } from '~~/shared/chat/background-history';
 import { computePullRetention } from './history-gc-policy';
 import { resolveCanonicalProjectOwnership } from './canonical-project-ownership';
+
+type ExplorerRequest<T> = T & { explorerCapability?: typeof EXPLORER_CAPABILITY };
 
 const DEFAULT_PULL_LIMIT = 100;
 const MAX_PULL_LIMIT = 1000;
@@ -405,6 +408,16 @@ function scopeNotificationWrite(
 }
 
 const WORKSPACE_ITEM_UPDATE_REQUIRED = 'OR3_WORKSPACE_ITEM_UPDATE_REQUIRED';
+
+function assertExplorerPage(capability: unknown, ...pages: ReadonlyArray<
+    readonly { tableName: string; pk: string; payload?: unknown }[]
+>) {
+    if (capability !== EXPLORER_CAPABILITY && pages.some(page => page.some(row =>
+        hasExplorerSemantics(row.tableName, row.pk, row.payload)))) {
+        throw createError({ statusCode: 426, statusMessage: 'Update OR3 Chat to sync workspace folders',
+            data: { code: 'OR3_EXPLORER_UPDATE_REQUIRED', requiredCapability: EXPLORER_CAPABILITY } });
+    }
+}
 
 function workspaceItemUpdateRequired() {
     return createError({
@@ -939,7 +952,7 @@ function rejectedIntent(op: PendingOp, source: EvidenceSource): D1SqlStatement {
 function unavailableResult(op: PendingOp, error: StoredRecordUnavailable, evidenceRef: string): PushResult['results'][number] {
     return {opId:op.stamp.opId,success:false,errorCode:'STORED_RECORD_UNAVAILABLE',error:error.reason,evidenceRef};
 }
-function retainPushFailureNative(op: PendingOp, error: StoredRecordUnavailable, input: PushBatch): PushResult['results'][number] {
+function retainPushFailureNative(op: PendingOp, error: StoredRecordUnavailable, input: ExplorerRequest<PushBatch>): PushResult['results'][number] {
     storedRecordCapability(input.storedRecordCapability);
     const source = {...error.source,historyIncarnation:input.historyIncarnation as string};
     const raw = getRawDb();
@@ -1090,6 +1103,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                   canonicalChatHistory: 'v1',
                   projectOwnership: 'v1',
                   workspaceItems: 'v1',
+                  explorer: EXPLORER_CAPABILITY,
                   retainedStorageMetadata: 'v1',
                   atomicUploadQuota: 'retained-v1',
               } as const);
@@ -1984,7 +1998,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         };
     }
 
-    async push(event: H3Event, input: PushBatch, repair?: RepairGuard): Promise<PushResult> {
+    async push(event: H3Event, input: ExplorerRequest<PushBatch>, repair?: RepairGuard): Promise<PushResult> {
         const { scope, ops } = input;
         const workspaceId = scope.workspaceId;
         await assertWorkspaceScopeAuthorized(event, workspaceId);
@@ -2052,6 +2066,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         }
 
         if (isD1Driver()) {
+            if (uniqueOps.some(op => hasExplorerSemantics(op.tableName, op.pk, op.payload))) {
+                throw createError({ statusCode: 503, statusMessage: 'Workspace folders are unavailable on this provider' });
+            }
             return this.pushInD1({
                 event,
                 workspaceId,
@@ -2083,6 +2100,25 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             if (repair) {
                 const assertion = repairAssertion(repair);
                 raw.prepare(assertion.sql).get(...assertion.parameters ?? []);
+            }
+            for (const op of uniqueOps) {
+                if (op.tableName !== 'posts') continue;
+                const canonical = raw.prepare(`SELECT CASE WHEN json_valid(data_json) THEN ${boundedSyncPayload('data_json')} END AS data_json
+                    FROM s_posts WHERE id = ? AND workspace_id = ?`).get(op.pk, workspaceId) as { data_json: string | null } | undefined;
+                const stored: unknown = canonical?.data_json ? JSON.parse(canonical.data_json) : undefined;
+                if (!hasExplorerSemantics(op.tableName, op.pk, op.payload) && !hasExplorerSemantics(op.tableName, op.pk, stored)) continue;
+                assertExplorerPage(input.explorerCapability, [op], [{ tableName: op.tableName, pk: op.pk, payload: stored }]);
+                const member = raw.prepare(`SELECT m.role FROM workspace_members m JOIN workspaces w ON w.id = m.workspace_id
+                    WHERE m.workspace_id = ? AND m.user_id = ? AND COALESCE(w.deleted, 0) = 0`)
+                    .get(workspaceId, userId ?? '') as { role: string } | undefined;
+                if (member?.role !== 'owner' && member?.role !== 'editor') {
+                    throw createError({ statusCode: 403, statusMessage: 'Workspace write permission required' });
+                }
+                const identity = explorerMutationIdentity(op.tableName, op.pk, op.operation, op.payload, stored);
+                if ((canonical && stored === undefined) || !identity.valid || [identity.incoming, identity.existing].some(value =>
+                    value && !explorerIdentityMatches(op.pk, value, value.hashInput && createHash('sha256').update(value.hashInput).digest('hex')))) {
+                    throw createError({ statusCode: 400, statusMessage: 'Invalid workspace folder record' });
+                }
             }
             const existingOps = new Map<string, StoredReceipt & {fingerprint:string}>();
             const failedBeforeAlloc = new Set<string>();
@@ -2495,7 +2531,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         };
     }
 
-    async pull(event: H3Event, input: PullRequest): Promise<PullResponse> {
+    async pull(event: H3Event, input: ExplorerRequest<PullRequest>): Promise<PullResponse> {
         const db = this.db;
         const { scope, cursor, limit, tables } = input;
         await assertWorkspaceScopeAuthorized(event, scope.workspaceId);
@@ -2598,6 +2634,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             itemBytes += bytes;
             scanned++; nextCursor = row.server_version;
         }
+        assertExplorerPage(input.explorerCapability, changes, unavailable);
         return PullResponseSchema.parse({ historyIncarnation, changes, ...(unavailable.length ? { unavailable } : {}),
             nextCursor, hasMore: sizes.length > scanned, ...retention });
     }
@@ -2640,15 +2677,15 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
     async maintainUnavailableRecords(event: H3Event, workspaceId: string, action: string, input: Record<string, unknown>): Promise<Record<string, unknown>> {
         await assertWorkspaceScopeAuthorized(event,workspaceId);
         return maintainEvidence(event,workspaceId,action,input,(event,op,guard) => this.push(event,
-            {scope:{workspaceId},ops:[op],historyIncarnation:guard.historyIncarnation,workspaceItemCapability:WORKSPACE_ITEM_CAPABILITY},guard),validReadPayload);
+            {scope:{workspaceId},ops:[op],historyIncarnation:guard.historyIncarnation,workspaceItemCapability:WORKSPACE_ITEM_CAPABILITY,explorerCapability:EXPLORER_CAPABILITY},guard),validReadPayload);
     }
 
-    async snapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+    async snapshot(event: H3Event, input: ExplorerRequest<SnapshotRequest>): Promise<SnapshotResponse> {
         return this.captureSnapshot(event, input, false);
     }
 
     /** Archives retain full Trash metadata; normal sync still emits tombstones. */
-    async backupSnapshot(event: H3Event, input: SnapshotRequest): Promise<SnapshotResponse> {
+    async backupSnapshot(event: H3Event, input: ExplorerRequest<SnapshotRequest>): Promise<SnapshotResponse> {
         // Server exports discover their first history; every later page stays
         // bound to that capture rather than adopting the current database.
         const historyIncarnation = input.historyIncarnation === undefined
@@ -2659,7 +2696,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     private async captureSnapshot(
         event: H3Event,
-        input: SnapshotRequest,
+        input: ExplorerRequest<SnapshotRequest>,
         retainedFiles: boolean
     ): Promise<SnapshotResponse> {
         const workspaceId = input.scope.workspaceId;
@@ -2670,7 +2707,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
         const pageSize = resolveSnapshotPageSize(input.pageSize);
         const snapshotUserId = resolveSessionUserId(event);
         if (isD1Driver()) {
-            return this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles, historyIncarnation);
+            const page = await this.snapshotInD1(workspaceId, input, pageSize, snapshotUserId, retainedFiles, historyIncarnation);
+            assertExplorerPage(input.explorerCapability, page.items, page.unavailable ?? []);
+            return page;
         }
         const raw = getRawDb();
         const now = nowEpoch();
@@ -2802,14 +2841,23 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                         'materialized.data_json',
                         snapshotUserId
                     );
+                    const retainDeleted = retainedFiles && tableName === 'file_meta' ? '1'
+                        : tableName === 'posts' ? `CASE WHEN json_valid(materialized.data_json) THEN
+                            COALESCE(json_extract(materialized.data_json, '$.post_type'), json_extract(materialized.data_json, '$.postType'))
+                                IN ('or3:explorer-folder', 'or3:explorer-placement') ELSE 0 END` : '0';
                     raw.prepare(`
                         INSERT INTO sync_snapshot_items (
                             snapshot_id, table_name, pk, kind, payload_json,
                             clock, hlc, op_id, server_deleted_at, source_payload_json
                         )
                         SELECT
-                            ?, ?, materialized.id, '${retainedFiles && tableName === 'file_meta' ? 'row' : 'tombstone'}',
-                            ${retainedFiles && tableName === 'file_meta' ? "CASE WHEN length(cast(materialized.data_json AS blob)) <= 262144 AND json_valid(materialized.data_json) THEN json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock, '$.hlc', materialized.hlc, '$.op_id', materialized.op_id, '$.updated_at', materialized.updated_at) ELSE materialized.data_json END" : 'NULL'},
+                            ?, ?, materialized.id, CASE WHEN ${retainDeleted} THEN 'row' ELSE 'tombstone' END,
+                            CASE WHEN ${retainDeleted} THEN
+                                CASE WHEN length(cast(materialized.data_json AS blob)) <= 262144 AND json_valid(materialized.data_json)
+                                    THEN json_set(materialized.data_json, '$.deleted', json('true'), '$.clock', materialized.clock,
+                                        '$.hlc', materialized.hlc, '$.op_id', materialized.op_id, '$.updated_at', materialized.updated_at)
+                                    ELSE materialized.data_json END
+                                ELSE NULL END,
                             materialized.clock,
                             CASE
                                 WHEN materialized.hlc <> '' THEN materialized.hlc
@@ -2832,7 +2880,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
                                 materialized.created_at,
                                 0
                             )),
-                            ${retainedFiles && tableName === 'file_meta' ? 'materialized.data_json' : 'NULL'}
+                            CASE WHEN ${retainDeleted} THEN materialized.data_json ELSE NULL END
                         FROM "${materializedTable}" AS materialized
                         WHERE materialized.workspace_id = ? AND materialized.deleted <> 0${deletedOwner.sql}
                     `).run(snapshotId, tableName, tableName, workspaceId, ...deletedOwner.params);
@@ -2891,7 +2939,9 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
             CASE WHEN table_name = 'notifications' AND kind = 'row' THEN ${notificationOwnerSql('payload_json')} END AS notification_owner,
             ${boundedSyncMetadata('clock',SNAPSHOT_METADATA_BYTES)} AS clock, ${boundedSyncMetadata('hlc',SNAPSHOT_METADATA_BYTES)} AS hlc, ${boundedSyncMetadata('op_id',SNAPSHOT_METADATA_BYTES)} AS op_id, ${boundedSyncMetadata('server_deleted_at',SNAPSHOT_METADATA_BYTES)} AS server_deleted_at ${selection.clause}`)
             .all(...selection.parameters, selected) as SnapshotItemRow[] : [];
-        return buildSnapshotPage(header, rows, pageSize, sizes.length, historyIncarnation, after, snapshotUserId);
+        const page = await buildSnapshotPage(header, rows, pageSize, sizes.length, historyIncarnation, after, snapshotUserId);
+        assertExplorerPage(input.explorerCapability, page.items, page.unavailable ?? []);
+        return page;
     }
 
     async updateCursor(
@@ -3115,7 +3165,7 @@ export class SqliteSyncGatewayAdapter implements SyncGatewayAdapter {
 
     private async snapshotInD1(
         workspaceId: string,
-        input: SnapshotRequest,
+        input: ExplorerRequest<SnapshotRequest>,
         pageSize: number,
         snapshotUserId: string | undefined,
         retainedFiles: boolean,

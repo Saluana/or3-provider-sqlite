@@ -6,7 +6,7 @@ import { validSyncPayload } from '../../../test/support/sync-payload';
  * Covers push idempotency, LWW, pull pagination, cursor updates, and GC safety.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -699,6 +699,57 @@ describe('SqliteSyncGatewayAdapter', () => {
         expect((await database.prepare('SELECT value FROM server_version_counter').all()).results).toEqual([{ value: 2 }]);
         expect((await database.prepare('SELECT count(*) AS total FROM change_log').all()).results).toEqual([{ total: 2 }]);
         expect((await database.prepare('SELECT id FROM s_threads').all()).results).toEqual([]);
+    });
+
+    it('fences Explorer writes, retained deletes and backup pages by capability and role', async () => {
+        const raw = getRawDb();
+        raw.prepare('INSERT INTO workspaces (id, name, owner_user_id) VALUES (?, ?, ?)').run(WORKSPACE_ID, 'Explorer', 'owner');
+        for (const role of ['owner', 'viewer']) {
+            raw.prepare('INSERT INTO workspace_members (id, workspace_id, user_id, role) VALUES (?, ?, ?, ?)')
+                .run(role + '-member', WORKSPACE_ID, role, role);
+        }
+        const owner = makeSessionEvent('owner');
+        const reader = makeSessionEvent('viewer');
+        const id = 'explorer-folder-' + randomUUID();
+        const scope = { workspaceId: WORKSPACE_ID };
+        const historyIncarnation = await readHistoryIncarnation();
+        const opener = { scope, historyIncarnation, explorerCapability: 'v1' as const };
+        const files = { kind: 'files' };
+        const put = makeOp({ tableName: 'posts', pk: id, payload: { id, title: '["files"]', post_type: 'or3:explorer-folder',
+            content: JSON.stringify({ version: 1, scope: files, parent_id: null, name: 'Research' }) } });
+        const update = (payload: Record<string, unknown>) =>
+            makeOp({ tableName: 'posts', pk: id, payload, stamp: { ...put.stamp, clock: 2, opId: randomUUID() } });
+        expect(adapter.capabilities).toMatchObject({ explorer: 'v1' });
+        await expect(adapter.push(owner, { scope, historyIncarnation, ops: [put] })).rejects.toMatchObject({ statusCode: 426 });
+        await expect(adapter.push(reader, { ...opener, ops: [put] })).rejects.toMatchObject({ statusCode: 403 });
+        const saved = await adapter.push(owner, { ...opener, ops: [put] });
+        expect(saved.results[0]).toMatchObject({ success: true, serverVersion: 1 });
+        const changedScope = update({ ...(put.payload as object), title: '["project","a"]',
+            content: JSON.stringify({ version: 1, scope: { kind: 'project', project_id: 'a' }, parent_id: null, name: 'Research' }) });
+        await expect(adapter.push(owner, { ...opener, ops: [changedScope] })).rejects.toMatchObject({ statusCode: 400 });
+        await expect(adapter.push(owner, { ...opener, ops: [update({ id, title: 'Ordinary document' })] })).rejects.toMatchObject({ statusCode: 400 });
+        const pull = { scope, historyIncarnation, cursor: 0, limit: 10 };
+        await expect(adapter.pull(owner, pull)).rejects.toMatchObject({ statusCode: 426 });
+        await expect(adapter.snapshot(owner, { scope, historyIncarnation, pageSize: 10 })).rejects.toMatchObject({ statusCode: 426 });
+        expect(await adapter.pull(owner, { ...opener, cursor: 0, limit: 10 })).toMatchObject({ nextCursor: 1 });
+        const item = { kind: 'document', item_id: 'doc' };
+        const digest = createHash('sha256').update(JSON.stringify(['["files"]', item.kind, item.item_id])).digest('hex');
+        const placement = 'explorer-placement-' + digest;
+        const place = makeOp({ tableName: 'posts', pk: placement, payload: { id: placement, post_type: 'or3:explorer-placement', title: '["files"]',
+            content: JSON.stringify({ version: 1, scope: files, item, parent_id: id }) } });
+        expect((await adapter.push(owner, { ...opener, ops: [place] })).results[0]).toMatchObject({ success: true, serverVersion: 2 });
+        const hidden = { ...update(put.payload as Record<string, unknown>), operation: 'delete' as const };
+        expect((await adapter.push(owner, { ...opener, ops: [hidden] })).results[0]).toMatchObject({ success: true, serverVersion: 3 });
+        await expect(adapter.pull(owner, { ...pull, cursor: 2 })).rejects.toMatchObject({ statusCode: 426 });
+        const backup = await adapter.backupSnapshot(owner, { ...opener, pageSize: 100 });
+        expect(backup.items).toEqual(expect.arrayContaining([
+            expect.objectContaining({ pk: id, kind: 'row', payload: expect.objectContaining({ deleted: true }) }),
+            expect.objectContaining({ pk: placement, kind: 'row' }),
+        ]));
+        await useD1TestDatabase();
+        expect(adapter.capabilities).not.toHaveProperty('explorer');
+        await expect(adapter.push(owner, { ...opener, historyIncarnation: await readHistoryIncarnation(), ops: [put] }))
+            .rejects.toMatchObject({ statusCode: 503 });
     });
 
     it('executes the shared bootstrap and revision contract', async () => {

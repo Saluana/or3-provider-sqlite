@@ -559,3 +559,13 @@ A disposable native SQLite qualification on macOS arm64 used 1,000,000 log rows,
 | 033 | 034–036 | 0.528 s | 72.44 MiB | 956.80 MiB |
 
 Both runs retained every log/canonical row, finished ledger 36 and invalidated the snapshot items. These sampled local measurements do not qualify production hardware, physical allocated space or remote D1 limits; plan additional space for source/rollback backups. Migration 033 preserves malformed payload bytes for subsequent unavailable-record handling and retains its original deterministic UUID mapping and ledger no-rerun behavior.
+
+## Workspace folder compatibility
+
+The native SQLite sync gateway advertises Explorer v1. It validates folder and
+placement writes against canonical identity, workspace membership, and editor
+permissions inside the write transaction. Supply `explorerCapability: 'v1'` on
+sync push, pull, snapshot, and backup requests. Older clients receive HTTP 426
+before a page containing folder history is returned. The D1 adapter leaves
+Explorer unavailable. Host-side folder UI and local IndexedDB migration live
+in `or3-chat`.
